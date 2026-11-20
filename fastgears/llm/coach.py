@@ -29,11 +29,13 @@ Escalate with the danger: info = friendly, warning = firm, alert = urgent impera
 Suggest a concrete action when useful (eyes on the road, put the phone away, take a break
 at the next rest area, open a window, talk to the passenger). Pulse readings with trust
 'unreliable' must be ignored.
+A discomfort_grimace event describes facial movement only. Keep any check-in neutral.
 Reply ONLY with JSON: {{"message": "...", "severity": "info|warning|alert", "reason": "<3-6 words>"}}"""
 
 CHAT_PROMPT = """You are FastGears, an in-car co-pilot talking with the driver or a passenger, in {language}.
 You see the live driver-monitoring state below. Answer in at most 2 short sentences, safety first.
-If the driver seems drowsy or distracted, gently say so. Plain text, no markdown."""
+If the driver seems drowsy or distracted, gently say so. Treat discomfort_grimace as a description of
+facial movement only. Never diagnose medical conditions. Plain text, no markdown."""
 
 
 class LLMClient(Protocol):
@@ -127,6 +129,9 @@ def compact_state(state: dict) -> dict:
     trust = (p.get("trust") or {}).get("label")
     if p.get("bpm") and trust != "unreliable":
         out["pulse_bpm"], out["pulse_trust"] = p["bpm"], trust
+    event = (state.get("discomfort") or {}).get("event")
+    if event:
+        out["discomfort_grimace"] = {k: event[k] for k in ("duration_ms", "evidence", "coverage")}
     out["driving_minutes"] = round(state.get("uptime_s", 0) / 60, 1)
     return out
 
@@ -163,6 +168,7 @@ class Coach:
         self._last_local = {}
         self._last_level = "ok"
         self._last_key = None
+        self._last_discomfort_id = None
         self.llm_errors = 0
         self.last_latency_ms: int | None = None
         threading.Thread(target=self._worker, name="coach", daemon=True).start()
@@ -191,6 +197,13 @@ class Coach:
         changed = key != self._last_key or level != self._last_level
         due = now - self._last_llm >= (self.min_interval_s if changed and level != "ok" else self.summary_every_s)
         self._last_key, self._last_level = key, level
+        event = (state.get("discomfort") or {}).get("event")
+        if event and event["id"] != self._last_discomfort_id and now - self._last_llm >= self.min_interval_s:
+            self._last_discomfort_id = event["id"]
+            if loc is None:
+                loc = {"message": "Are you comfortable? If needed, take a break when safe.",
+                       "severity": "info", "reason": "facial movement"}
+            due = True
         if due:
             self._last_llm = now
             self._submit(("react", compact_state(state), loc))

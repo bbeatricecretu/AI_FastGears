@@ -95,6 +95,20 @@
       </div>
     </div>
     <div class="card">
+      <h2>Gesturi faciale</h2>
+      <p id="gesture-status" role="status">Se așteaptă datele camerei</p>
+      <div class="grid">
+        <div class="m" id="gesture-au4"><small>Sprâncene coborâte</small><span>–</span></div>
+        <div class="m" id="gesture-au6"><small>Obraji ridicați</small><span>–</span></div>
+        <div class="m" id="gesture-au7"><small>Pleoape strânse</small><span>–</span></div>
+        <div class="m" id="gesture-au9"><small>Nas încrețit</small><span>–</span></div>
+        <div class="m" id="gesture-au10"><small>Buza superioară ridicată</small><span>–</span></div>
+        <div class="m" id="gesture-au43"><small>Închidere bilaterală</small><span>–</span></div>
+        <div class="m" id="gesture-au25_27"><small>Gură deschisă</small><span>–</span></div>
+      </div>
+      <p id="gesture-last" hidden></p>
+    </div>
+    <div class="card">
       <h2>Co-pilot</h2>
       <div id="feed"></div>
       <form id="chat">
@@ -162,9 +176,40 @@ function onState(s) {
   set('m-pulse', p.bpm ? p.bpm + ' bpm' : (p.window_s ? `measuring ${p.window_s}s` : '–'));
   set('m-trust', trust.label ? `${trust.label} ${trust.score}` : '–', trust.label === 'unreliable');
   set('m-face', a.face_present ? 'yes' : 'no', !a.face_present);
+  renderGestures(s.discomfort || {});
   const now = Date.now() / 1000;
   hist.push({ t: now, drow, dist, bpm: trust.label && trust.label !== 'unreliable' ? p.bpm : null });
   while (hist.length && now - hist[0].t > 120) hist.shift();
+}
+
+const gestureNames = {au4: 'sprâncene', au7: 'pleoape strânse', au9: 'nas', au10: 'buza superioară'};
+const gestureReasons = {
+  calibrating: 'Se calibrează', missing_signal: 'Semnal lipsă', no_neutral_reference: 'Reper lipsă',
+  region_out_of_frame: 'În afara cadrului', face_pose_or_scale: 'Poziție sau distanță',
+  face_not_visible: 'Față indisponibilă', no_camera_frame: 'Cameră indisponibilă',
+  face_model_unavailable: 'Model indisponibil',
+};
+
+function renderGestures(g) {
+  const markers = g.markers || {};
+  for (const id of ['au4', 'au6', 'au7', 'au9', 'au10', 'au43', 'au25_27']) {
+    const marker = markers[id];
+    const value = marker?.available
+      ? marker.unit === 'closure_fraction' ? `${Math.round(marker.value * 100)}%` : marker.value.toFixed(2)
+      : gestureReasons[marker?.reason] || '–';
+    set(`gesture-${id}`, value, marker?.active);
+  }
+  const event = g.event;
+  const unavailable = ['no_camera_frame', 'face_model_unavailable', 'face_not_visible'].includes(markers.au43?.reason);
+  const status = event ? `Grimasă compatibilă cu disconfort · ${event.duration_ms} ms · ${event.evidence.map(id => gestureNames[id]).join(', ')}`
+    : unavailable ? gestureReasons[markers.au43.reason]
+    : !g.calibrated ? `Ține fața relaxată și ochii deschiși pentru calibrare (${(g.calibration_s || 0).toFixed(1)} s valide)`
+    : !g.observable ? 'Regiunile necesare sunt indisponibile'
+    : g.pending_ms ? `Gesturi simultane · ${g.pending_ms} ms` : 'Monitorizare activă';
+  if ($('gesture-status').textContent !== status) $('gesture-status').textContent = status;
+  const last = (g.recent_events || []).at(-1);
+  $('gesture-last').hidden = !last;
+  $('gesture-last').textContent = last ? `Ultimul episod · ${last.duration_ms} ms · ${last.state === 'interrupted' ? 'întrerupt' : 'încheiat'}` : '';
 }
 
 function draw() {

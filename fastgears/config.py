@@ -43,6 +43,7 @@ class Settings:
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
+    discomfort_overlap_s: float = float(os.getenv("DISCOMFORT_OVERLAP_S", "0.3"))
 
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none

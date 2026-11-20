@@ -143,6 +143,30 @@ Useful flags:
 API: `GET /api/state` (latest detections as JSON) · `GET /api/messages` · `POST /api/chat {"text": "..."}` ·
 `POST /api/recalibrate` · `GET /api/health` · `WS /ws` · `GET /video.mjpg`.
 
+## Verificarea gesturilor faciale
+
+```powershell
+.venv\Scripts\python -m fastgears --no-objects --no-rppg --no-llm
+```
+
+Deschide [dashboard-ul local](http://127.0.0.1:8000) și urmărește panoul **Gesturi faciale**. Stai la birou cu fața la cameră, ochii deschiși și expresia relaxată. Panoul afișează progresul până la acumularea a 5 s de cadre eligibile. Apasă **Recalibrate** la schimbarea persoanei sau a poziției camerei.
+
+Încearcă mișcările separat, apoi coboară sprâncenele, strânge pleoapele și ridică buza superioară simultan. Poți încreți nasul în loc să ridici buza. Dacă semnalele trec pragurile timp de cel puțin 300 ms (`DISCOMFORT_OVERLAP_S`), panoul afișează **Grimasă compatibilă cu disconfort**, regiunile și durata. Relaxează fața pentru a încheia episodul sau ieși din cadru pentru a-l întrerupe. Închiderea ochilor și deschiderea gurii oferă context. Un episod confirmat apare în `discomfort.event` din `/api/state`, iar ultimele opt episoade în `discomfort.recent_events`.
+
+| Marker | Sursa MediaPipe | Valoare afișată |
+|---|---|---|
+| AU4 · Sprâncene | `browDownLeft/Right` | Creșterea scorului mediu de coborâre față de repaus |
+| AU6 · Obraji | `cheekSquintLeft/Right` | Creșterea scorului mediu de ridicare a obrajilor |
+| AU7 · Pleoape | `eyeSquintLeft/Right` | Creșterea scorului mediu de strângere activă |
+| AU9 · Nas | `noseSneerLeft/Right` | Creșterea scorului mediu asociat încrețirii |
+| AU10 · Buza superioară | `mouthUpperUpLeft/Right` | Creșterea scorului mediu de ridicare a buzei |
+| AU43 · Pleoape | EAR stânga și dreapta din `FaceResult` | Cea mai mică scădere relativă dintre cele două deschideri, activă de la 80% |
+| AU25–27 · Gură | MAR din `FaceResult` | Creșterea raportului deschidere/lățime față de repaus |
+
+Scorurile sunt aproximări ale mișcării. Fiecare scor are un prag de demo din `vision/discomfort.py`, ridicat dacă variația la repaus este mare. EAR și MAR folosesc distanțe normalizate, invariante la rotația în plan. Micșorarea EAR este raportată la ochii deschiși, fără un reper calibrat de ochi complet închiși. MediaPipe furnizează câte un `FaceResult` pe cadru, pe imaginea oglindită dacă `MIRROR=1`. Pentru coeficienții pereche folosim media, independent de oglindire. [Denumirile oficiale ale coeficienților MediaPipe](https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/tasks/cc/vision/face_landmarker/face_blendshapes_graph.cc)
+
+Panoul semnalează punctele regionale în afara imaginii, capul prea rotit, fața prea mică și valorile lipsă. Scorurile nu oferă confirmare separată a vizibilității în spatele ochelarilor sau al mâinii. Un gol de peste 250 ms întrerupe episodul. Acoperirea episodului se referă la continuitatea dovezilor din cadrele procesate, la rezoluția fluxului camerei. După cel puțin 2 s fără față se cere un nou reper. Co-pilotul primește durata și markerii evenimentului, fără pixeli, și poate face o verificare neutră cu șoferul.
+
 ### Demo script (≈2 min, for the jury)
 
 1. Sit normally: the banner says **ATTENTIVE**, the pulse appears after about 10 s.

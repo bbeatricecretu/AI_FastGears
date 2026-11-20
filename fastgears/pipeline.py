@@ -35,10 +35,14 @@ class Pipeline:
         self._t0 = time.monotonic()
         self.proc_fps = 0.0
         self._stop = threading.Event()
+        self._recalibrate = threading.Event()
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
+        from .vision.discomfort import DiscomfortMonitor
         self.attention = AttentionMonitor(calib_s=self.s.calib_s)
+        self.discomfort = DiscomfortMonitor(calib_s=self.s.calib_s,
+                                            overlap_s=self.s.discomfort_overlap_s)
         try:
             from .vision.face import FaceTracker
             self.face = FaceTracker(models_dir=self.s.models_dir)
@@ -72,7 +76,7 @@ class Pipeline:
         self.camera.stop()
 
     def recalibrate(self) -> None:
-        self.attention.reset_calibration()
+        self._recalibrate.set()
 
     # ── outputs ───────────────────────────────────────────────────────
     def state(self) -> dict:
@@ -87,6 +91,10 @@ class Pipeline:
         seq, n, t_fps = -1, 0, time.monotonic()
         last_ms = 0
         while not self._stop.is_set():
+            if self._recalibrate.is_set():
+                self._recalibrate.clear()
+                self.attention.reset_calibration()
+                self.discomfort.reset()
             seq2, frame = self.camera.read(seq, timeout=1.0)
             if frame is None or seq2 == seq:
                 self._publish_no_camera()
@@ -110,12 +118,15 @@ class Pipeline:
         dets = self.objects.detect(frame) if self.objects else []
         phone = bool(self.objects and self.objects.phone_in_use(dets, face, frame.shape))
         att = self.attention.update(face, t, phone=phone)
+        gestures = self.discomfort.update(face, t, frame.shape,
+                                          missing_reason="face_model_unavailable" if self.face is None else "face_not_visible")
         pulse = self.rppg.status() if self.rppg else {}
         state = {
             "t": time.time(),
             "uptime_s": round(t - self._t0, 1),
             "status": "running",
             "attention": att,
+            "discomfort": gestures,
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
@@ -131,8 +142,10 @@ class Pipeline:
             self.on_state(state)
 
     def _publish_no_camera(self) -> None:
+        gestures = self.discomfort.update(None, time.monotonic(), missing_reason="no_camera_frame")
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
+                           "discomfort": gestures,
                            "camera": {"connected": self.camera.connected}}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
