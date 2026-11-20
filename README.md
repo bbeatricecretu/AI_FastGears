@@ -91,10 +91,11 @@ Chrome or Edge (for voice), and a Gemini API key (free tier works).
 
 ### Windows (PowerShell)
 
+Pentru iPhone conectat prin USB pe Windows, vezi [ghidul de instalare și configurare Camo](README_CAMO.md).
+
 ```powershell
-git clone https://github.com/bbeatricecretu/AI_FastGears.git
+git clone --branch mara-test-rgb https://github.com/bbeatricecretu/AI_FastGears.git
 cd AI_FastGears
-git checkout vlad
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
@@ -105,8 +106,7 @@ notepad .env        # paste GEMINI_API_KEY=...
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/bbeatricecretu/AI_FastGears.git && cd AI_FastGears
-git checkout vlad
+git clone --branch mara-test-rgb https://github.com/bbeatricecretu/AI_FastGears.git && cd AI_FastGears
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
