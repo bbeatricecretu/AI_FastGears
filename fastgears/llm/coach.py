@@ -100,7 +100,7 @@ def make_client(settings) -> LLMClient | None:
 def local_message(state: dict) -> dict | None:
     """Immediate message for the current state (no network). None when all is fine."""
     a = state.get("attention", {})
-    if a.get("microsleep"):
+    if a.get("microsleep") and "drowsiness_level" not in a:
         return {"message": "Wake up! Eyes on the road now.", "severity": "alert", "reason": "microsleep"}
     if a.get("phone"):
         return {"message": "Put the phone down and keep both hands on the wheel.", "severity": "alert",
@@ -109,9 +109,11 @@ def local_message(state: dict) -> dict | None:
         where = a.get("looking", "away")
         return {"message": f"You're looking {where}. Eyes back on the road.", "severity": "warning",
                 "reason": f"looking {where}"}
+    if a.get("active_warning"):
+        return a["active_warning"]
     if a.get("level") == "danger":
         return {"message": "Danger: please focus on the road.", "severity": "alert", "reason": "danger"}
-    if a.get("yawning") or (a.get("perclos") or 0) > 0.15:
+    if "drowsiness_level" not in a and (a.get("yawning") or (a.get("perclos") or 0) > 0.15):
         return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": "warning",
                 "reason": "signs of fatigue"}
     return None
@@ -124,6 +126,10 @@ def compact_state(state: dict) -> dict:
     keep = ("level", "reasons", "looking", "off_road_s", "eyes_closed", "eye_closed_s", "perclos",
             "blinks_per_min", "yawns_5min", "microsleep", "phone", "drowsiness", "distraction", "face_present")
     out = {k: a.get(k) for k in keep if k in a}
+    for key in ("drowsiness_level", "events", "event_transitions", "tracking_confidence",
+                "perclos_coverage", "perclos_ready", "drooping", "nod_count", "active_warning"):
+        if key in a:
+            out[key] = a[key]
     trust = (p.get("trust") or {}).get("label")
     if p.get("bpm") and trust != "unreliable":
         out["pulse_bpm"], out["pulse_trust"] = p["bpm"], trust
@@ -161,6 +167,7 @@ class Coach:
         self._jobs: queue.Queue = queue.Queue(maxsize=1)
         self._last_llm = 0.0
         self._last_local = {}
+        self._recent_drowsiness_ids = deque(maxlen=32)
         self._last_level = "ok"
         self._last_key = None
         self.llm_errors = 0
@@ -175,6 +182,22 @@ class Coach:
     def observe(self, state: dict, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         a = state.get("attention", {})
+        warning = a.get("active_warning")
+        if warning:
+            key, event_id = warning["reason"], warning["event_id"]
+            is_new = event_id not in self._recent_drowsiness_ids
+            urgent = warning["severity"] == "alert"
+            if is_new:
+                self._recent_drowsiness_ids.append(event_id)
+                if (urgent or
+                        now - self._last_local.get(key, float("-inf")) >= a["notification_cooldown_s"]):
+                    self._last_local[key] = now
+                    self._emit({**warning, "source": "instant"})
+            if self.client and ((is_new and urgent) or now - self._last_llm >= self.min_interval_s):
+                self._last_llm = now
+                self._submit(("drowsiness", compact_state(state), warning))
+            if not a.get("phone") and not a.get("distracted"):
+                return
         if not a.get("calibrated", True):
             return
         level = a.get("level", "ok")
@@ -182,7 +205,7 @@ class Coach:
         key = loc["reason"] if loc else None
 
         # 1) instant local alert on a new danger reason (repeat every 6 s while it lasts)
-        if loc and loc["severity"] == "alert":
+        if loc and loc["severity"] == "alert" and loc is not warning:
             if now - self._last_local.get(key, -1e9) > 6:
                 self._last_local[key] = now
                 self._emit({**loc, "source": "instant"})
@@ -191,7 +214,7 @@ class Coach:
         changed = key != self._last_key or level != self._last_level
         due = now - self._last_llm >= (self.min_interval_s if changed and level != "ok" else self.summary_every_s)
         self._last_key, self._last_level = key, level
-        if due:
+        if due and not warning:
             self._last_llm = now
             self._submit(("react", compact_state(state), loc))
 
@@ -221,19 +244,25 @@ class Coach:
 
     def _worker(self) -> None:
         while True:
-            _, compact, loc = self._jobs.get()
+            job, compact, loc = self._jobs.get()
             out = None
             if self.client:
                 t0 = time.monotonic()
                 try:
                     txt = self.client.complete(SYSTEM_PROMPT.format(language=self.language),
                                                "Driver state now:\n" + json.dumps(compact), json_mode=True)
-                    out = parse_reply(txt)
+                    # Drowsiness warnings use the approved local wording and severity.
+                    if job != "drowsiness":
+                        out = parse_reply(txt)
                     self.last_latency_ms = int((time.monotonic() - t0) * 1000)
                 except Exception as e:
                     self.llm_errors += 1
                     log.warning("LLM call failed: %s", e)
+            if job == "drowsiness":
+                continue
             if out is None:
+                if loc is None and compact.get("face_present") is False:
+                    continue
                 out = loc or {"message": "All good. Keep your eyes on the road.", "severity": "info", "reason": "ok"}
                 out = {**out, "source": "rules"}
             else:

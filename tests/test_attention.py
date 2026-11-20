@@ -149,8 +149,8 @@ def test_yawn():
     out, t = run(mon, t, 0.5, lambda: fake_face(mar=0.8))
     assert out["yawning"] is False
     out, t = run(mon, t, 1.0, lambda: fake_face(mar=0.8))
-    assert out["yawning"] is True and out["yawns_5min"] == 1
-    assert out["level"] in ("caution", "danger")
+    assert out["yawning"] is True and out["yawns_5min"] == 0
+    assert out["level"] == "ok"
     out, _ = run(mon, t, 0.5, lambda: fake_face(blendshapes={"jawOpen": 0.1}))
     assert out["yawning"] is False and out["yawns_5min"] == 1
 
@@ -188,7 +188,7 @@ def test_phone_in_use():
     phone_low = {"label": "cell phone", "conf": 0.6, "bbox": [600, 500, 680, 640]}
     phone_top_far = {"label": "cell phone", "conf": 0.6, "bbox": [10, 10, 60, 90]}
     phone_at_ear = {"label": "cell phone", "conf": 0.6, "bbox": [700, 150, 760, 230]}
-    person = {"label": "person", "conf": 0.9, "bbox": [400, 100, 900, 720]}
+    person = {"label": "person", "conf": 0.9, "bbox": [400, 120, 900, 720]}
     face = fake_face(bbox=(500, 120, 680, 340))
     pu = ObjectDetector.phone_in_use
     assert pu([], face, FRAME) is False

@@ -1,6 +1,7 @@
 """Settings, read once from environment variables (and a local .env file)."""
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,13 @@ def _camera(v: str):
     return int(v) if v.strip().isdigit() else v
 
 
+def _drowsiness_thresholds() -> dict[str, float]:
+    values = json.loads(os.getenv("DROWSINESS_THRESHOLDS", "{}"))
+    if not isinstance(values, dict):
+        raise ValueError("DROWSINESS_THRESHOLDS must be a JSON object")
+    return values
+
+
 @dataclass
 class Settings:
     camera: int | str = field(default_factory=lambda: _camera(os.getenv("CAMERA", "0")))
@@ -43,6 +51,8 @@ class Settings:
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
+
+    drowsiness_thresholds: dict[str, float] = field(default_factory=_drowsiness_thresholds)
 
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none

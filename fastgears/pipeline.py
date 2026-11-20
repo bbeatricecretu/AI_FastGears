@@ -35,10 +35,12 @@ class Pipeline:
         self._t0 = time.monotonic()
         self.proc_fps = 0.0
         self._stop = threading.Event()
+        self._recalibrate = threading.Event()
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
-        self.attention = AttentionMonitor(calib_s=self.s.calib_s)
+        thresholds = {"mirrored": self.s.mirror, **self.s.drowsiness_thresholds}
+        self.attention = AttentionMonitor(calib_s=self.s.calib_s, **thresholds)
         try:
             from .vision.face import FaceTracker
             self.face = FaceTracker(models_dir=self.s.models_dir)
@@ -72,7 +74,7 @@ class Pipeline:
         self.camera.stop()
 
     def recalibrate(self) -> None:
-        self.attention.reset_calibration()
+        self._recalibrate.set()
 
     # ── outputs ───────────────────────────────────────────────────────
     def state(self) -> dict:
@@ -104,11 +106,16 @@ class Pipeline:
                 self.proc_fps, n, t_fps = n / (t - t_fps), 0, t
 
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
-        face = self.face.process(frame, t_ms) if self.face else None
+        try:
+            face = self.face.process(frame, t_ms) if self.face else None
+        except Exception:
+            log.exception("face tracking failed for this frame")
+            face = None
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t)
         dets = self.objects.detect(frame) if self.objects else []
         phone = bool(self.objects and self.objects.phone_in_use(dets, face, frame.shape))
+        self._apply_recalibration()
         att = self.attention.update(face, t, phone=phone)
         pulse = self.rppg.status() if self.rppg else {}
         state = {
@@ -130,10 +137,22 @@ class Pipeline:
         if self.on_state:
             self.on_state(state)
 
+    def _apply_recalibration(self) -> None:
+        if self._recalibrate.is_set():
+            self._recalibrate.clear()
+            self.attention.reset_calibration()
+
     def _publish_no_camera(self) -> None:
+        self._apply_recalibration()
+        att = self.attention.update(None, time.monotonic())
+        self._jpeg = None
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
-                           "camera": {"connected": self.camera.connected}}
+                           "camera": {"connected": self.camera.connected}, "attention": att,
+                           "face_box": None}
+            state = self._state
+        if self.on_state:
+            self.on_state(state)
 
     # ── overlay (what the jury sees live) ─────────────────────────────
     def _draw(self, frame, face, dets, att, pulse) -> bytes | None:
@@ -143,7 +162,7 @@ class Pipeline:
         for d in dets:
             if d.get("label") in ("cell phone", "person"):
                 x0, y0, x1, y1 = map(int, d["bbox"])
-                c = (60, 60, 255) if d["label"] == "cell phone" else (200, 200, 200)
+                c = (60, 60, 255) if d.get("label") == "cell phone" else (200, 200, 200)
                 cv2.rectangle(img, (x0, y0), (x1, y1), c, 2)
                 cv2.putText(img, f'{d["label"]} {d["conf"]:.2f}', (x0, max(15, y0 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
@@ -153,13 +172,17 @@ class Pipeline:
             lm = face.landmarks_px
             for i in (33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380, 468, 473):
                 if i < len(lm):
-                    cv2.circle(img, (int(lm[i][0]), int(lm[i][1])), 2, (255, 255, 0), -1)
+                    cv2.circle(img, (int(lm[i][0]), int(lm[i][1])), 2, (255, 255, 0), 1)
         if self.rppg:
             for a, b, c2, d2 in self.rppg.rois():
                 cv2.rectangle(img, (a, b), (c2, d2), (0, 255, 0), 1)
+        def metric(key, fmt):
+            value = att.get(key)
+            return "N/A" if value is None else format(value, fmt)
+
         lines = [f"{level.upper()}  looking: {att.get('looking', '-')}",
-                 f"EAR {att.get('ear') or 0:.2f}  PERCLOS {100 * (att.get('perclos') or 0):.0f}%  "
-                 f"blinks/min {att.get('blinks_per_min') or 0:.0f}"]
+                 f"EAR {metric('ear', '.2f')}  PERCLOS {metric('perclos', '.0%')}  "
+                 f"blinks/min {metric('blinks_per_min', '.0f')}"]
         if pulse.get("bpm"):
             lines.append(f"pulse {pulse['bpm']} bpm ({(pulse.get('trust') or {}).get('label', '?')})")
         for k, s in enumerate(lines):

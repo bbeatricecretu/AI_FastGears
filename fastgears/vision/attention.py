@@ -19,9 +19,9 @@ and +yaw then means the driver's right. Labels are from the driver's view.
 """
 from __future__ import annotations
 
-from collections import deque
 from statistics import median
 
+from .drowsiness import DrowsinessSignals, THRESHOLDS
 from .filters import OneEuroAxis
 
 # --- calibration ---------------------------------------------------------------
@@ -81,7 +81,7 @@ _THRESHOLD_NAMES = (
     "PERCLOS_FULL", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
 )
-DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES}
+DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES} | THRESHOLDS
 
 
 def _r(x: float | None, nd: int = 3) -> float | None:
@@ -95,29 +95,15 @@ class AttentionMonitor:
             raise TypeError(f"unknown thresholds: {sorted(unknown)}")
         self.calib_s = float(calib_s)
         self.th = {**DEFAULT_THRESHOLDS, **thresholds}
-        self._full_reset()
-
-    # -- state -----------------------------------------------------------------
-    def _full_reset(self) -> None:
+        self.signals = DrowsinessSignals(self.th)
         self.reset_calibration()
-        self._ear_filter = OneEuroAxis(self.th["ear_min_cutoff"],
-                                       self.th["ear_beta"])
-        self._t0: float | None = None
-        self._last_t: float | None = None
-        self._closed_since: float | None = None
-        self._blinks: deque[float] = deque()
-        self._perclos: deque[tuple[float, float, bool]] = deque()  # t, dt, closed80
-        self._mouth_open_since: float | None = None
-        self._yawn_counted = False
-        self._yawns: deque[float] = deque()
-        self._face_missing_since: float | None = None
-        self._off_road_since: float | None = None
-        self._looking = "road"
-        self._ear_s: float | None = None
-        self._rel = (None, None, None)
 
     def reset_calibration(self) -> None:
         """Forget the driver baseline; the next calib_s seconds re-learn it."""
+        self.signals.reset()
+        self._face_missing_since = self._off_road_since = None
+        self._looking = "road"
+        self._ear_filter = OneEuroAxis(self.th["ear_min_cutoff"], self.th["ear_beta"])
         self.calibrated = False
         self._calib_start: float | None = None
         self._calib = {"ear": [], "pitch": [], "yaw": [], "roll": [],
@@ -156,15 +142,6 @@ class AttentionMonitor:
             self.base_iris = (med(c["ix"]), med(c["iy"]))
             self.calibrated = True
 
-    def _closure(self, ear: float, blink: float | None) -> float:
-        """0 = open (baseline), 1 = fully shut."""
-        base = self.base_ear or (self.th["ear_closed_abs"] / self.th["ear_closed_ratio"])
-        span = base * (1.0 - self.th["ear_fully_closed_ratio"])
-        c = (base - ear) / span if span > 1e-6 else 0.0
-        if blink is not None:
-            c = max(c, blink)
-        return min(1.0, max(0.0, c))
-
     def _gaze_label(self, rp: float | None, ry: float | None,
                     iris: tuple[float, float] | None) -> str:
         th = self.th
@@ -192,70 +169,25 @@ class AttentionMonitor:
     def update(self, face, t: float, phone: bool = False) -> dict:
         th = self.th
         t = float(t)
-        if self._t0 is None:
-            self._t0 = t
-        dt = 0.0 if self._last_t is None else min(1.0, max(0.0, t - self._last_t))
-        self._last_t = t
-
-        eyes_closed = False
-        eye_closed_s = 0.0
-        yawning = False
         ear_s = None
-        rel_p = rel_y = rel_r = None
+        if face is not None:
+            ear = (float(face.ear_left) + float(face.ear_right)) / 2.0
+            if not self.calibrated:
+                self._calibrate(face, t, ear, self._blink_bs(face))
+            ear_s = self._ear_filter(ear, t)
+        bp, by, br = self.base_pose
+        rp = None if face is None or face.pitch_deg is None else face.pitch_deg - bp
+        ry = None if face is None or face.yaw_deg is None else face.yaw_deg - by
+        rr = None if face is None or face.roll_deg is None else face.roll_deg - br
+        metrics = self.signals.update(face, t, rp if self.calibrated and self._calib["pitch"] else None, self.calib_s)
+        eyes = metrics["eyes"]
+        eyes_closed = all(eyes) if eyes is not None else None
+        eye_closed_s = metrics["eye_closed_s"] or 0.0
 
         if face is not None:
             self._face_missing_since = None
-            ear = (float(face.ear_left) + float(face.ear_right)) / 2.0
-            blink = self._blink_bs(face)
-            if not self.calibrated:
-                self._calibrate(face, t, ear, blink)
-            ear_s = self._ear_filter(ear, t)
-            self._ear_s = ear_s
-
-            # eyes: raw EAR for the decision (blinks are 100-300 ms)
-            thr = (th["ear_closed_ratio"] * self.base_ear
-                   if self.base_ear else th["ear_closed_abs"])
-            eyes_closed = ear < thr or (blink is not None
-                                        and blink >= th["blink_bs_closed"])
-            if eyes_closed:
-                if self._closed_since is None:
-                    self._closed_since = t
-                eye_closed_s = t - self._closed_since
-            elif self._closed_since is not None:
-                dur = t - self._closed_since
-                if dur <= th["blink_max_s"]:
-                    self._blinks.append(t)
-                self._closed_since = None
-            closure = self._closure(ear, blink)
-            self._perclos.append((t, dt, closure >= th["perclos_closure"]))
-
-            # mouth / yawns
-            jaw = (face.blendshapes or {}).get("jawOpen", 0.0)
-            if float(face.mar) >= th["mar_yawn"] or jaw >= th["jaw_open_yawn"]:
-                if self._mouth_open_since is None:
-                    self._mouth_open_since = t
-                    self._yawn_counted = False
-                if t - self._mouth_open_since >= th["yawn_min_s"]:
-                    yawning = True
-                    if not self._yawn_counted:
-                        self._yawns.append(t)
-                        self._yawn_counted = True
-            else:
-                self._mouth_open_since = None
-
-            # head pose relative to the neutral baseline
-            bp, by, br = self.base_pose
-            rel_p = None if face.pitch_deg is None else face.pitch_deg - bp
-            rel_y = None if face.yaw_deg is None else face.yaw_deg - by
-            rel_r = None if face.roll_deg is None else face.roll_deg - br
-            self._rel = (rel_p, rel_y, rel_r)
-            # iris is unreliable with eyes shut; ignore it then
-            iris = None if eyes_closed else face.iris_offset
-            self._looking = self._gaze_label(rel_p, rel_y, iris)
+            self._looking = self._gaze_label(rp, ry, None if eyes_closed else face.iris_offset)
         else:
-            # face lost: eye/mouth episodes cannot continue
-            self._closed_since = None
-            self._mouth_open_since = None
             if self._face_missing_since is None:
                 self._face_missing_since = t
             if t - self._face_missing_since >= th["face_missing_away_s"]:
@@ -272,29 +204,63 @@ class AttentionMonitor:
         off_road_s = 0.0 if self._off_road_since is None else t - self._off_road_since
         distracted = off_road_s >= th["distracted_s"]
 
-        # windows
-        while self._blinks and t - self._blinks[0] > th["blink_window_s"]:
-            self._blinks.popleft()
-        while self._perclos and t - self._perclos[0][0] > th["perclos_window_s"]:
-            self._perclos.popleft()
-        while self._yawns and t - self._yawns[0] > th["yawn_window_s"]:
-            self._yawns.popleft()
-        elapsed = min(th["blink_window_s"], max(10.0, t - self._t0))
-        blinks_per_min = len(self._blinks) * 60.0 / elapsed
-        tot = sum(d for _, d, _ in self._perclos)
-        perclos = (sum(d for _, d, c in self._perclos if c) / tot) if tot > 0 else 0.0
-        microsleep = eye_closed_s >= th["microsleep_s"]
-        yawns_5min = len(self._yawns)
+        microsleep = eye_closed_s + 1e-9 >= th["microsleep_s"]
+        perclos = metrics["perclos"]
+        perclos_score = min(100.0, 100.0 * perclos / th["perclos_full"]) if (
+            perclos is not None and metrics["perclos_ready"]) else 0.0
+        closure = self.signals.active.get("prolonged_eye_closure")
+        severe = bool(closure or microsleep or metrics["nod_detected"] or metrics["recent_nods"] >= th["repeated_nods"]
+                      or (perclos_score >= th["level_danger"] and metrics["drooping"]))
+        repeated_blinks = metrics["prolonged_blink_count"] >= th["repeated_blinks"]
+        possible = perclos_score >= th["level_caution"] or metrics["drooping"] or repeated_blinks
+        yawns = metrics["recent_yawns"]
+        drowsiness = None if face is None else max(
+            perclos_score if severe
+            else min(perclos_score, th["level_danger"] - 0.1),
+            th["level_danger"] if severe else th["level_caution"] if possible else 0.0,
+            min(th["level_caution"] - 0.1, th["yawn_score_each"] * yawns),
+        )
+        risk = (None if face is None else "HIGH DROWSINESS" if severe
+                else "POSSIBLE DROWSINESS" if possible else "NORMAL")
+        warning = None
+        warning_type = None
+        if face is not None:
+            if severe and not closure and not metrics["nod_detected"]:
+                warning_type = "severe"
+            elif metrics["nod_detected"]:
+                warning_type = "nod"
+            elif closure or (repeated_blinks and not severe):
+                warning_type = "eyes"
+            elif possible:
+                warning_type = "fatigue"
+            elif yawns >= th["repeated_yawns"]:
+                warning_type = "yawning"
+        if warning_type:
+            message, voice = {
+                "fatigue": ("You might be getting tired. Consider taking a break.", False),
+                "yawning": ("Frequent yawning detected. Please stay attentive.", False),
+                "eyes": ("Your eyes seem tired. Please find a safe place to rest.", True),
+                "nod": ("Warning. You may be falling asleep. Pull over safely.", True),
+                "severe": ("Warning. Severe drowsiness detected. Please stop in a safe location.", True),
+            }[warning_type]
+            severity = "HIGH" if severe or metrics["nod_detected"] else "MEDIUM" if possible else "LOW"
+            warning = dict(message=message, reason=warning_type, voice=voice,
+                           severity="alert" if severity == "HIGH" else "warning")
+            if warning_type in ("eyes", "nod") and severity == "HIGH":
+                event = closure if warning_type == "eyes" else next(
+                    e for e in self.signals.transitions if e["type"] == "head_nodding")
+                warning["event_id"] = event["id"]
+            else:
+                self.signals.event(warning_type, self.signals.active.get(warning_type, {}).get(
+                    "start_s", t), t, "active", severity,
+                    perclos=perclos, drooping=metrics["drooping"],
+                    recent_yawns=yawns, recent_nods=metrics["recent_nods"],
+                    prolonged_blinks=metrics["prolonged_blink_count"])
+                warning["event_id"] = self.signals.active[warning_type]["id"]
+        for kind, event in list(self.signals.active.items()):
+            if kind not in (warning_type, "prolonged_eye_closure"):
+                self.signals.event(kind, event["start_s"], t, "ended", event["severity"])
 
-        # scores
-        closure_score = 0.0
-        if eye_closed_s >= th["long_closure_s"]:
-            closure_score = min(100.0, 90.0 * eye_closed_s / th["microsleep_s"])
-        drowsiness = max(min(100.0, 100.0 * perclos / th["perclos_full"]),
-                         closure_score,
-                         min(60.0, th["yawn_score_each"] * yawns_5min))
-        if yawning:
-            drowsiness = min(100.0, drowsiness + 10.0)
         distraction = min(100.0, 70.0 * off_road_s / th["distracted_s"])
         if phone:
             distraction = max(distraction, th["phone_distraction"])
@@ -304,12 +270,14 @@ class AttentionMonitor:
             reasons.append(f"microsleep: eyes closed {eye_closed_s:.1f} s")
         elif eye_closed_s >= th["long_closure_s"]:
             reasons.append(f"eyes closed {eye_closed_s:.1f} s")
-        if perclos >= 0.15:
+        if metrics["perclos_ready"] and perclos is not None and perclos >= 0.15:
             reasons.append(f"PERCLOS {perclos * 100:.0f}%")
-        if yawning:
-            reasons.append("yawning")
-        if yawns_5min >= 2:
-            reasons.append(f"{yawns_5min} yawns in 5 min")
+        if metrics["drooping"]:
+            reasons.append("drooping eyelids")
+        if metrics["nod_detected"]:
+            reasons.append("head nod")
+        if yawns >= th["repeated_yawns"]:
+            reasons.append(f"{yawns} yawns in the recent window")
         if off_road_s >= th["off_road_reason_s"]:
             if face is None:
                 reasons.append(f"face not visible {off_road_s:.1f} s")
@@ -318,26 +286,31 @@ class AttentionMonitor:
         if phone:
             reasons.append("phone in hand")
 
-        worst = max(drowsiness, distraction)
-        if microsleep or worst >= th["level_danger"]:
+        worst = max(drowsiness or 0.0, distraction)
+        if (warning and warning["severity"] == "alert") or worst >= th["level_danger"]:
             level = "danger"
-        elif worst >= th["level_caution"] or yawning:
+        elif worst >= th["level_caution"]:
             level = "caution"
         else:
             level = "ok"
 
-        rp, ry, rr = self._rel if face is not None else (None, None, None)
         return {
+            **metrics,
             "face_present": face is not None,
-            "calibrated": bool(self.calibrated),
-            "ear": _r(ear_s if face is not None else self._ear_s),
-            "eyes_closed": bool(eyes_closed),
-            "eye_closed_s": round(eye_closed_s, 2),
-            "blinks_per_min": round(blinks_per_min, 1),
-            "perclos": round(perclos, 3),
-            "microsleep": bool(microsleep),
-            "yawning": bool(yawning),
-            "yawns_5min": int(yawns_5min),
+            "eyelids_calibrated": self.signals.baseline is not None,
+            "calibrated": self.calibrated,
+            "ear": _r(ear_s),
+            "ear_left": _r(face.ear_left) if face is not None else None,
+            "ear_right": _r(face.ear_right) if face is not None else None,
+            "eyes_closed": eyes_closed,
+            "eye_closed_s": _r(metrics["eye_closed_s"], 4),
+            "blinks_per_min": _r(metrics["blinks_per_min"], 1),
+            "microsleep": microsleep,
+            "drowsiness_level": risk,
+            "active_warning": warning,
+            "events": [dict(event) for event in self.signals.active.values()],
+            "event_transitions": self.signals.transitions,
+            "notification_cooldown_s": th["notification_cooldown_s"],
             "pitch": _r(rp, 1),
             "yaw": _r(ry, 1),
             "roll": _r(rr, 1),
@@ -345,7 +318,7 @@ class AttentionMonitor:
             "off_road_s": round(off_road_s, 2),
             "distracted": bool(distracted),
             "phone": bool(phone),
-            "drowsiness": round(drowsiness, 1),
+            "drowsiness": _r(drowsiness, 1),
             "distraction": round(distraction, 1),
             "level": level,
             "reasons": reasons,

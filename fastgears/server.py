@@ -46,6 +46,8 @@ coach: Coach | None = None
 
 
 def _on_state(state: dict) -> None:
+    for event in state["attention"]["event_transitions"]:
+        hub.publish_threadsafe({"type": "attention_event", "event": event})
     if coach:
         coach.observe(state)
 
