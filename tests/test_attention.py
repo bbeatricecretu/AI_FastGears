@@ -323,3 +323,114 @@ def test_drowsiness_recovers_within_20s_after_long_closure():
     assert out["microsleep"]
     out, t = run(mon, t, 20.0, lambda: fake_face())
     assert out["level"] == "ok" and out["drowsiness"] < 40
+
+
+def test_yawn_with_head_tipped_back_counts_and_is_not_looking_up():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 2.0, lambda: fake_face(mar=0.8, pitch=-29.0,
+                                                 blendshapes={"jawOpen": 0.8}))
+    assert out["yawning"] is True and out["yawns_5min"] == 1
+    assert out["looking"] == "road" and out["distraction"] < 40
+
+
+def test_turned_head_mouth_is_still_not_a_yawn():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 3.0, lambda: fake_face(mar=0.8, yaw=30.0))
+    assert out["yawns_5min"] == 0
+
+
+@pytest.mark.parametrize("pitch", [-40.0, 30.0])
+def test_head_drop_with_droopy_eyes_is_drowsiness(pitch):
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.3, lambda: fake_face(pitch=pitch, ear=0.20))
+    assert out["looking"] in ("up", "down")              # not yet: could be a blink
+    out, t = run(mon, t, 3.5, lambda: fake_face(pitch=pitch, ear=0.20))
+    assert out["looking"] == "nodding"
+    assert out["level"] == "danger" and out["drowsiness"] >= 70
+    assert out["distraction"] < 40
+    assert any(r.startswith("head dropping") for r in out["reasons"])
+    out, t = run(mon, t, 1.0, lambda: fake_face())
+    assert out["looking"] == "road" and out["level"] != "danger"
+
+
+def test_looking_down_with_blinks_stays_distraction():
+    mon, out, t = calibrated()
+    for _ in range(3):
+        out, t = run(mon, t, 0.9, lambda: fake_face(pitch=30.0))
+        out, t = run(mon, t, 0.2, lambda: fake_face(pitch=30.0, ear=0.08))   # blink
+    out, t = run(mon, t, 0.5, lambda: fake_face(pitch=30.0))
+    assert out["looking"] == "down" and out["distracted"] is True
+    assert out["off_road_s"] >= 3.0 and out["drowsiness"] < 40
+
+
+def test_head_thrown_back_is_nodding_even_with_eyes_open():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 4.0, lambda: fake_face(pitch=-44.0, ear=0.27))
+    assert out["looking"] == "nodding" and out["level"] == "danger"
+    assert out["distraction"] < 40
+    out, t = run(mon, t, 4.0, lambda: fake_face(pitch=-25.0, ear=0.30))   # glance up, eyes open
+    assert out["looking"] == "up"
+
+
+def test_chin_drop_losing_face_is_nodding_not_away():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.3, lambda: fake_face(pitch=30.0, ear=0.18))   # head going down, droopy
+    out, t = run(mon, t, 4.0, lambda: None)                              # face out of view
+    assert out["face_present"] is False
+    assert out["looking"] == "nodding" and out["level"] == "danger"
+    assert out["distraction"] < 40
+    assert any(r.startswith("head dropping") for r in out["reasons"])
+
+
+def test_looking_down_alert_then_face_lost_is_away():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.5, lambda: fake_face(pitch=30.0))             # eyes open
+    out, t = run(mon, t, 3.0, lambda: None)
+    assert out["looking"] == "away" and out["distracted"] is True
+
+
+def test_fast_forward_drop_losing_face_is_nodding():
+    # the head falls forward faster than the eyes/pitch can say "nodding" before the face is gone
+    mon, out, t = calibrated()
+    for p in (0.0, 6.0, 12.0, 18.0):                                     # pitch rising, eyes open
+        out, t = run(mon, t, DT, lambda p=p: fake_face(pitch=p))
+    out, t = run(mon, t, 4.0, lambda: None)
+    assert out["looking"] == "nodding" and out["distraction"] < 40
+    assert out["drowsiness"] >= 70
+
+
+def test_face_lost_right_after_nodding_is_still_nodding():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 1.5, lambda: fake_face(pitch=-45.0))           # head thrown back: nodding
+    assert out["looking"] == "nodding"
+    out, t = run(mon, t, 0.5, lambda: fake_face(pitch=0.0))             # swings through neutral...
+    out, t = run(mon, t, 3.0, lambda: None)                             # ...and drops out of view
+    assert out["looking"] == "nodding"
+
+
+def test_face_lost_long_after_nodding_is_away():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 1.5, lambda: fake_face(pitch=-45.0))
+    out, t = run(mon, t, 5.0, lambda: fake_face(pitch=0.0))             # awake again for 5 s
+    out, t = run(mon, t, 3.0, lambda: None)
+    assert out["looking"] == "away"
+
+
+def test_brief_face_dropout_is_not_away():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.7, lambda: None)                             # hand passes over the face
+    assert out["looking"] == "road" and out["distraction"] == 0
+
+
+def test_phone_latch_holds_longer_while_hand_still_holds_it():
+    from fastgears.vision.objects import PhoneLatch
+    latch = PhoneLatch()
+    assert latch.update(0.7, True, 0.0) is True
+    assert latch.update(None, True, 3.0, holding=True) is True          # YOLO lost it, hand still there
+    assert latch.update(None, True, 3.5, holding=False) is False        # hand gone: normal 1.5 s hold
+
+
+def test_driver_crop_reaches_arm_length_to_the_side():
+    face = fake_face(bbox=(600, 200, 700, 320))                         # 100 px wide face
+    x0, y0, x1, y1 = ObjectDetector.driver_crop(face, (720, 1280, 3))
+    assert x0 <= 300 and x1 >= 1000 and y1 == 720

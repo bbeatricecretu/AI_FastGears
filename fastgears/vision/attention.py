@@ -52,13 +52,22 @@ MAR_YAWN = 0.6                   # inner-lip MAR for a yawn
 JAW_OPEN_YAWN = 0.6              # or jawOpen blendshape
 YAWN_MIN_S = 1.5                 # talking opens the mouth too, but rarely for 1.5 s
 YAWN_WINDOW_S = 300.0
-YAWN_POSE_MAX_DEG = 20.0         # mouth shape is only trusted with the head near neutral
-                                 # (a tilted/turned head distorts it: fake yawns)
+YAWN_POSE_MAX_DEG = 20.0         # mouth shape is only trusted with yaw/roll near neutral
+                                 # (a tilted/turned head distorts it: fake yawns). Pitch is
+                                 # NOT gated: a real yawn tips the head back ~20-30 deg.
 
 # --- gaze / head pose (degrees, relative to calibrated neutral) -------------------
 HEAD_TILT_DEG = 35.0             # head rolled this far (lying sideways): "tilted" - pitch/yaw unreliable
 HEAD_TILT_S = 1.0                # tilt held this long counts as nodding off...
 HEAD_TILT_DANGER_S = 3.0         # ...and reaches danger (70) after this long
+HEAD_DROP_CLOSURE = 0.3          # head pitched up/down past the gaze limits with eyes this
+                                 # droopy (0 open .. 1 shut) = head dropping: "nodding",
+                                 # scored as drowsiness (same timer/score as a tilt)
+HEAD_BACK_DEG = 35.0             # head thrown back this far = nodding even with eyes open
+                                 # (no driver watches the road from there)
+NOD_MEMORY_S = 3.0               # face lost within this long after "nodding" = still nodding
+DROP_PITCH_RISE_DEG = 8.0        # face lost while pitch was rising this much...
+DROP_LOOKBACK_S = 0.3            # ...over this window = head falling forward fast (chin to chest)
 YAW_SIDE_DEG = 25.0              # |gaze yaw| beyond this -> left/right
 YAW_AWAY_DEG = 60.0              # beyond this -> away (head fully turned)
 PITCH_DOWN_DEG = 20.0            # gaze pitch beyond this -> down (lap, phone)
@@ -90,7 +99,7 @@ _THRESHOLD_NAMES = (
     "YAWN_MIN_S", "YAWN_WINDOW_S", "YAW_SIDE_DEG", "YAW_AWAY_DEG",
     "PITCH_DOWN_DEG", "PITCH_UP_DEG", "IRIS_YAW_GAIN", "IRIS_PITCH_GAIN",
     "FACE_MISSING_AWAY_S", "DISTRACTED_S", "OFF_ROAD_REASON_S", "MIRRORED",
-    "PERCLOS_TIRED", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "PERCLOS_TAU_S", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
+    "PERCLOS_TIRED", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "PERCLOS_TAU_S", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "HEAD_DROP_CLOSURE", "HEAD_BACK_DEG", "NOD_MEMORY_S", "DROP_PITCH_RISE_DEG", "DROP_LOOKBACK_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
 )
 DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES}
@@ -131,6 +140,10 @@ class AttentionMonitor:
         self._hand_since: float | None = None
         self._perclos_ewma = 0.0
         self._tilt_since: float | None = None
+        self._droop_since: float | None = None
+        self._dropping = False       # last face frame: head going down with droopy eyes / nodding
+        self._last_nod_t: float | None = None
+        self._pitch_hist: deque[tuple[float, float]] = deque()   # (t, rel pitch), last ~1 s
 
     def reset_calibration(self) -> None:
         """Forget the driver baseline; the next calib_s seconds re-learn it."""
@@ -204,6 +217,17 @@ class AttentionMonitor:
             return "right" if image_right == bool(th["mirrored"]) else "left"
         return "road"
 
+    def _fell_forward(self) -> bool:
+        """Pitch was still rising fast (head falling forward) in the last frames before the loss."""
+        h = self._pitch_hist
+        if len(h) < 2:
+            return False
+        t_last, p_last = h[-1]
+        earlier = [p for tt, p in h if t_last - tt >= self.th["drop_lookback_s"] - 1e-6]
+        if not earlier:
+            return False
+        return p_last - earlier[-1] >= self.th["drop_pitch_rise_deg"] and p_last > 0
+
     # -- main ---------------------------------------------------------------------
     def update(self, face, t: float, phone: bool = False, hand_up: bool = False) -> dict:
         th = self.th
@@ -248,11 +272,12 @@ class AttentionMonitor:
 
             # mouth / yawns
             jaw = (face.blendshapes or {}).get("jawOpen", 0.0)
-            bp0, by0, br0 = self.base_pose
-            dev = [abs(v - b) for v, b in ((face.pitch_deg, bp0), (face.yaw_deg, by0), (face.roll_deg, br0))
+            _, by0, br0 = self.base_pose
+            dev = [abs(v - b) for v, b in ((face.yaw_deg, by0), (face.roll_deg, br0))
                    if v is not None]
             pose_ok = not self.calibrated or not dev or max(dev) <= th["yawn_pose_max_deg"]
-            if pose_ok and (float(face.mar) >= th["mar_yawn"] or jaw >= th["jaw_open_yawn"]):
+            mouth_open = pose_ok and (float(face.mar) >= th["mar_yawn"] or jaw >= th["jaw_open_yawn"])
+            if mouth_open:
                 if self._mouth_open_since is None:
                     self._mouth_open_since = t
                     self._yawn_counted = False
@@ -274,28 +299,67 @@ class AttentionMonitor:
             iris = None if eyes_closed else face.iris_offset
             if rel_r is not None and abs(rel_r) >= th["head_tilt_deg"]:
                 self._looking = "tilted"
+                self._droop_since = None
                 if self._tilt_since is None:
                     self._tilt_since = t
             else:
-                self._tilt_since = None
-                self._looking = self._gaze_label(rel_p, rel_y, iris)
+                label = self._gaze_label(rel_p, rel_y, iris)
+                if label == "up" and mouth_open:
+                    # a yawn tips the head back and a wide-open jaw skews the pose fit
+                    label = "road"
+                    self._droop_since = None
+                elif label in ("up", "down") and (closure >= th["head_drop_closure"]
+                                                  or (rel_p is not None and rel_p <= -th["head_back_deg"])):
+                    # head fallen back/forward with drooping eyes: nodding off, not looking.
+                    # Held longer than a blink, so blinking while looking down stays "down".
+                    if self._droop_since is None:
+                        self._droop_since = t
+                    if t - self._droop_since > th["blink_max_s"]:
+                        label = "nodding"
+                else:
+                    self._droop_since = None
+                if label == "nodding":
+                    if self._tilt_since is None:
+                        self._tilt_since = self._droop_since
+                else:
+                    self._tilt_since = None
+                self._looking = label
+            self._dropping = self._looking == "nodding" or (
+                rel_p is not None and rel_p >= th["pitch_down_deg"] and closure >= th["head_drop_closure"])
+            if self._looking == "nodding":
+                self._last_nod_t = t
+            if rel_p is not None:
+                self._pitch_hist.append((t, rel_p))
+            while self._pitch_hist and t - self._pitch_hist[0][0] > 1.0:
+                self._pitch_hist.popleft()
         else:
             # face lost: eye/mouth episodes cannot continue
             self._closed_since = None
             self._mouth_open_since = None
             if self._face_missing_since is None:
                 self._face_missing_since = t
-            if t - self._face_missing_since >= th["face_missing_away_s"]:
-                self._looking = "away"
-                if self._off_road_since is None:
-                    self._off_road_since = self._face_missing_since
+                # a fast drop takes the face out of view before the pitch/eyes say "nodding":
+                # use what led up to the loss
+                self._dropping = self._dropping or self._fell_forward() or (
+                    self._last_nod_t is not None and t - self._last_nod_t <= th["nod_memory_s"])
+            if self._dropping:
+                # chin fell to the chest and took the face out of view: nodding off, not away
+                self._looking = "nodding"
+                if self._tilt_since is None:
+                    self._tilt_since = self._droop_since or self._face_missing_since
+            else:
+                self._droop_since = None
+                if t - self._face_missing_since >= th["face_missing_away_s"]:
+                    self._looking = "away"
+                    if self._off_road_since is None:
+                        self._off_road_since = self._face_missing_since
             # else: hold the last label for brief dropouts
 
         looking = self._looking
-        if face is None:
+        if face is None and looking != "nodding":
             self._tilt_since = None
         tilt_s = 0.0 if self._tilt_since is None else t - self._tilt_since
-        if looking in ("road", "tilted"):          # tilt is drowsiness, not distraction
+        if looking in ("road", "tilted", "nodding"):   # drowsiness, not distraction
             self._off_road_since = None
         elif self._off_road_since is None:
             self._off_road_since = t
@@ -348,7 +412,8 @@ class AttentionMonitor:
         if perclos >= th["perclos_tired"]:
             reasons.append(f"tired: eyes closed {perclos * 100:.0f}% of the time recently")
         if tilt_s >= th["head_tilt_s"]:
-            reasons.append(f"head tilted {tilt_s:.1f} s (nodding off?)")
+            what = "dropping" if looking == "nodding" else "tilted"
+            reasons.append(f"head {what} {tilt_s:.1f} s (nodding off?)")
         if yawning:
             reasons.append("yawning")
         if yawns_5min >= 2:

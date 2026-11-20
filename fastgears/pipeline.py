@@ -28,6 +28,7 @@ class Pipeline:
         self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror)
         self.face = self.rppg = self.objects = self.hands = self.vision = None
         self._hands: list = []
+        self._phone_xy: tuple[float, float] | None = None   # where the driver's phone was last seen
         self._frame_i = 0
         self.errors: dict[str, str] = {}
         self._load_detectors()
@@ -133,24 +134,37 @@ class Pipeline:
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
             self._hands = self.hands.process(frame, t_ms)
-        up = [h for h in raised_hands(self._hands, face) if self.driver.owns_hand(h, face)]
-        boxes = [b for b in (hand_crop(h, frame.shape) for h in up) if b is not None]
+        mine_hands = [h for h in self._hands if self.driver.owns_hand(h, face)]
+        up = raised_hands(mine_hands, face)               # hands off the wheel (caution)
+        # phone search: around ANY of the driver's hands - a phone held low or at arm's length
+        # to the side is not "raised" but is still in a hand
+        crops = [(h, hand_crop(h, frame.shape)) for h in mine_hands]
+        crops = [(h, b) for h, b in crops if b is not None]
+        boxes = [b for _, b in crops]
         dets = self.objects.detect(frame, face, boxes) if self.objects else []
         phone, phone_src = False, None
         if self.objects:
             mine = [d for d in dets if d.get("label") != "cell phone" or self.driver.belongs_to_driver(
                 (d["bbox"][0] + d["bbox"][2]) / 2, (d["bbox"][1] + d["bbox"][3]) / 2, face, frame.shape)]
-            hit = self.objects.phone_hit(mine, face, frame.shape)
+            best = self.objects.phone_best(mine, face, frame.shape)
+            hit = None if best is None else float(best["conf"])
             fresh = self.objects.fresh
-            if hit is not None:
+            if best is not None:
                 phone_src = "yolo"
+                if fresh:
+                    bx = best["bbox"]
+                    self._phone_xy = ((bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0)
             if self.vision:
-                if up and not self.phone_latch.on and hit is None:
-                    self.vision.maybe_check(frame, self.objects.driver_crop(face, frame.shape), t)
+                if crops and not self.phone_latch.on and hit is None:
+                    self.vision.maybe_check(frame, crops[0][1], t)
                 vc = self.vision.phone_conf(t)
                 if vc is not None:
                     hit, fresh, phone_src = max(hit or 0.0, vc), True, phone_src or "gemini-vision"
-            phone = self.phone_latch.update(hit, fresh, t)
+            holding = self._phone_xy is not None and any(
+                b[0] <= self._phone_xy[0] <= b[2] and b[1] <= self._phone_xy[1] <= b[3] for b in boxes)
+            phone = self.phone_latch.update(hit, fresh, t, holding=holding)
+            if not phone:
+                self._phone_xy = None
         att = self.attention.update(face, t, phone=phone, hand_up=bool(up))
         pulse = self.rppg.status() if self.rppg else {}
         state = {

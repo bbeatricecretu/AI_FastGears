@@ -33,6 +33,9 @@ Escalate with the danger: info = friendly, warning = firm, alert = urgent impera
 Suggest a concrete action when useful (eyes on the road, put the phone away, take a break
 at the next rest area, open a window, talk to the passenger). Pulse readings with trust
 'unreliable' must be ignored.
+"primary_hazard" is what matters right now: talk about that one thing only and do not mix in
+other readings (e.g. no fatigue advice while the hazard is the phone). Only when it is null may
+you comment on slower trends such as yawns or tiredness.
 Reply ONLY with JSON: {{"message": "...", "severity": "info|warning|alert", "reason": "<3-6 words>"}}"""
 
 CHAT_PROMPT = """You are FastGears, an in-car co-pilot talking with the driver or a passenger, in {language}.
@@ -110,7 +113,8 @@ def local_message(state: dict) -> dict | None:
     if a.get("phone"):
         return {"message": "Put the phone down and keep both hands on the wheel.", "severity": "alert",
                 "reason": "phone in use"}
-    if a.get("looking") == "tilted" and any(r.startswith("head tilted") for r in a.get("reasons", [])):
+    if a.get("looking") in ("tilted", "nodding") and any(
+            r.startswith(("head tilted", "head dropping")) for r in a.get("reasons", [])):
         return {"message": "Your head is dropping. Sit up, and take a break if you're tired.",
                 "severity": "alert" if a.get("level") == "danger" else "warning", "reason": "head tilted"}
     if a.get("distracted"):
@@ -133,6 +137,8 @@ def compact_state(state: dict) -> dict:
     keep = ("level", "reasons", "looking", "off_road_s", "eyes_closed", "eye_closed_s", "perclos",
             "blinks_per_min", "yawns_5min", "microsleep", "phone", "drowsiness", "distraction", "face_present")
     out = {k: a.get(k) for k in keep if k in a}
+    loc = local_message(state)
+    out["primary_hazard"] = loc["reason"] if loc else None   # one topic per message
     if p.get("bpm") and p.get("pulse_state") in ("tracking", "held"):
         out["pulse_bpm"] = p["bpm"]
     out["driving_minutes"] = round(state.get("uptime_s", 0) / 60, 1)

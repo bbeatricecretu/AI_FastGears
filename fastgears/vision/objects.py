@@ -19,7 +19,11 @@ PHONE_COCO_ID = 67
 CROP_IMGSZ = 480          # driver-crop pass: the phone gets ~2x more pixels than in the full frame
 PHONE_CONFIRM_S = 1.5     # latch ON: 2 phone hits within this window (or one hit >= PHONE_SURE)
 PHONE_SURE = 0.5
-PHONE_HOLD_S = 1.5        # latch OFF: no phone hit for this long
+PHONE_HOLD_S = 1.5        # latch OFF: no phone hit for this long...
+PHONE_HAND_HOLD_S = 4.0   # ...or this long while the driver's hand is still where the phone was
+                          # (YOLOv8n loses edge-on / half-covered phones for seconds at a time)
+DRIVER_CROP_W = 3.0       # driver crop: face +- this many face widths (phones are often held
+                          # at arm's length to the side, outside a narrow crop)
 
 
 def _has_cuda() -> bool:
@@ -94,13 +98,13 @@ class ObjectDetector:
 
     @staticmethod
     def driver_crop(face, frame_shape):
-        """Region where the driver's hands and phone are: face +-1.5 widths, down to the frame bottom."""
+        """Region where the driver's hands and phone are: face +-DRIVER_CROP_W widths, down to the frame bottom."""
         if face is None:
             return None
         h, w = frame_shape[:2]
         fx0, fy0, fx1, fy1 = face.bbox
         fw, fh = fx1 - fx0, fy1 - fy0
-        x0, x1 = max(0, int(fx0 - 1.5 * fw)), min(w, int(fx1 + 1.5 * fw))
+        x0, x1 = max(0, int(fx0 - DRIVER_CROP_W * fw)), min(w, int(fx1 + DRIVER_CROP_W * fw))
         y0, y1 = max(0, int(fy0 - 0.5 * fh)), h
         if x1 - x0 < 64 or y1 - y0 < 64:
             return None
@@ -118,7 +122,7 @@ class ObjectDetector:
         self.fresh = run
         if not run:
             return self._cache + self._phone_cache
-        # phone-only pass: around each raised hand (the phone is in it), else around the driver
+        # phone-only pass: around each of the driver's hands (the phone is in one), else around the driver
         crops = [("hand-crop", b) for b in (hand_boxes or [])[:2]]
         if not crops:
             dc = self.driver_crop(face, frame_bgr.shape)
@@ -141,13 +145,20 @@ class ObjectDetector:
         return sum(1 for d in dets if d.get("label") == label)
 
     @classmethod
-    def phone_hit(cls, dets: list[dict], face, frame_shape) -> float | None:
-        """Highest confidence of a phone that counts for the driver, or None."""
+    def phone_best(cls, dets: list[dict], face, frame_shape) -> dict | None:
+        """The most confident phone detection that counts for the driver, or None."""
         best = None
         for d in dets:
             if d.get("label") == PHONE_LABEL and cls.phone_in_use([d], face, frame_shape):
-                best = max(best or 0.0, float(d["conf"]))
+                if best is None or float(d["conf"]) > float(best["conf"]):
+                    best = d
         return best
+
+    @classmethod
+    def phone_hit(cls, dets: list[dict], face, frame_shape) -> float | None:
+        """Highest confidence of a phone that counts for the driver, or None."""
+        d = cls.phone_best(dets, face, frame_shape)
+        return None if d is None else float(d["conf"])
 
     @staticmethod
     def phone_in_use(dets: list[dict], face, frame_shape) -> bool:
@@ -176,23 +187,26 @@ class PhoneLatch:
     """Turns noisy per-inference phone hits into a steady in-use signal.
 
     ON after 2 hits within PHONE_CONFIRM_S (or one confident hit), OFF after PHONE_HOLD_S
-    without any hit. Only fresh inference results count; cached repeats are ignored.
+    without any hit - or after PHONE_HAND_HOLD_S while `holding` (the driver's hand is still
+    where the phone was last seen). Only fresh inference results count; cached repeats are ignored.
     """
 
     def __init__(self, confirm_s: float = PHONE_CONFIRM_S, hold_s: float = PHONE_HOLD_S,
-                 sure: float = PHONE_SURE):
+                 sure: float = PHONE_SURE, hand_hold_s: float = PHONE_HAND_HOLD_S):
         self.confirm_s, self.hold_s, self.sure = confirm_s, hold_s, sure
+        self.hand_hold_s = hand_hold_s
         self.on = False
         self._hits: list[float] = []
         self._last_hit: float | None = None
 
-    def update(self, hit_conf: float | None, fresh: bool, t: float) -> bool:
+    def update(self, hit_conf: float | None, fresh: bool, t: float, holding: bool = False) -> bool:
         if fresh and hit_conf is not None:
             self._hits = [h for h in self._hits if t - h <= self.confirm_s] + [t]
             self._last_hit = t
             if len(self._hits) >= 2 or hit_conf >= self.sure:
                 self.on = True
-        if self.on and (self._last_hit is None or t - self._last_hit > self.hold_s):
+        hold = self.hand_hold_s if holding else self.hold_s
+        if self.on and (self._last_hit is None or t - self._last_hit > hold):
             self.on = False
             self._hits.clear()
         return self.on

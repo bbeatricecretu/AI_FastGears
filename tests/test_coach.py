@@ -65,3 +65,16 @@ def test_flickering_phone_alerts_once():
     for i in range(20):                      # phone on/off every second for 20 s
         c.observe(st(phone=(i % 2 == 0), level="danger"), now=100.0 + i)
     assert sum(m.get("source") == "instant" for m in got) == 1       # one alert for the whole episode
+
+
+def test_local_message_head_dropping():
+    from fastgears.llm.coach import local_message
+    m = local_message({"attention": {"looking": "nodding", "level": "danger",
+                                     "reasons": ["head dropping 3.0 s (nodding off?)"]}})
+    assert m["reason"] == "head tilted" and m["severity"] == "alert"
+
+
+def test_compact_state_names_one_primary_hazard():
+    c = compact_state(st(level="danger", phone=True, perclos=0.2, yawns_5min=2))
+    assert c["primary_hazard"] == "phone in use"
+    assert compact_state(st(level="ok"))["primary_hazard"] is None

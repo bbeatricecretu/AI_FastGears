@@ -142,7 +142,7 @@ function onState(s) {
   const level = a.level || 'ok';
   $('banner').className = level;
   $('banner').textContent = (s.driver || {}).status === 'searching' ? 'Looking for the driver…'
-    : !a.face_present && a.calibrated ? 'DRIVER NOT VISIBLE'
+    : !a.face_present && a.calibrated && a.looking === 'away' ? 'DRIVER NOT VISIBLE'   // only after the 1 s grace
     : !a.calibrated ? 'Calibrating — look at the road' : level === 'ok' ? 'ATTENTIVE' : level === 'caution' ? 'CAUTION' : 'DANGER';
   $('reasons').textContent = (a.reasons || []).join(' · ');
   const drow = Math.round(a.drowsiness || 0), dist = Math.round(a.distraction || 0);
