@@ -173,7 +173,16 @@ function onState(s) {
   set('m-offroad', a.off_road_s != null ? a.off_road_s.toFixed(1) + 's' : '–', a.distracted);
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
-  set('m-pulse', p.bpm ? p.bpm + ' bpm' : (p.window_s ? `measuring ${p.window_s}s` : '–'));
+  const pulseStatus = {
+    collecting: `Se măsoară (${p.window_s || 0} s)`, sampling_gap: 'Cadre întrerupte',
+    insufficient_samples: 'Semnal insuficient: prea puține cadre',
+    low_sample_rate: 'Rată de eșantionare redusă',
+    insufficient_regions: 'Semnal slab în regiunile feței',
+    regions_disagree: 'Regiunile indică ritmuri diferite',
+    face_not_visible: 'Față indisponibilă', estimation_failed: 'Estimare indisponibilă',
+  };
+  set('m-pulse', p.bpm ? `${p.bpm} bpm` : (pulseStatus[p.reason] || '–'));
+  $('m-pulse').title = pulseStatus[p.reason] || '';
   set('m-trust', trust.label ? `${trust.label} ${trust.score}` : '–', trust.label === 'unreliable');
   set('m-face', a.face_present ? 'yes' : 'no', !a.face_present);
   renderGestures(s.discomfort || {});
@@ -194,9 +203,13 @@ function renderGestures(g) {
   const markers = g.markers || {};
   for (const id of ['au4', 'au6', 'au7', 'au9', 'au10', 'au43', 'au25_27']) {
     const marker = markers[id];
-    const value = marker?.available
-      ? marker.unit === 'closure_fraction' ? `${Math.round(marker.value * 100)}%` : marker.value.toFixed(2)
-      : gestureReasons[marker?.reason] || '–';
+    let value = gestureReasons[marker?.reason] || '–';
+    if (marker?.available) {
+      if (marker.unit === 'closure_fraction') value = `${Math.round(marker.value * 100)}%`;
+      else if (marker.unit === 'eye_distance_fraction') value = `${(marker.value * 100).toFixed(1)}%`;
+      else value = marker.value.toFixed(id === 'au9' ? 3 : 2);
+    }
+    $(`gesture-${id}`).title = marker?.source === 'nose_wing_lift' ? 'Ridicarea aripii nazale față de reper' : '';
     set(`gesture-${id}`, value, marker?.active);
   }
   const event = g.event;

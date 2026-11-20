@@ -15,21 +15,25 @@ import numpy as np
 
 from .camera import Camera
 from .config import Settings
+from .vision.face import FACE_REGION_CONTOURS, PULSE_REGIONS, face_region_contours
 
 log = logging.getLogger("pipeline")
 
 COLORS = {"ok": (80, 200, 80), "caution": (0, 190, 255), "danger": (60, 60, 255)}
+PREVIEW_INTERVAL_S = 1 / 12
 
 
 class Pipeline:
     def __init__(self, settings: Settings, on_state: Callable[[dict], None] | None = None):
         self.s = settings
         self.on_state = on_state
-        self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror)
+        self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror,
+                             backend=settings.camera_backend)
         self.face = self.rppg = self.objects = None
         self.errors: dict[str, str] = {}
         self._load_detectors()
         self._jpeg: bytes | None = None
+        self._last_preview_t: float | None = None
         self._state: dict = {"attention": {}, "pulse": {}, "objects": [], "status": "starting"}
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
@@ -95,12 +99,11 @@ class Pipeline:
                 self._recalibrate.clear()
                 self.attention.reset_calibration()
                 self.discomfort.reset()
-            seq2, frame = self.camera.read(seq, timeout=1.0)
-            if frame is None or seq2 == seq:
+            seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
+            if frame is None or t is None or seq2 == seq:
                 self._publish_no_camera()
                 continue
             seq = seq2
-            t = time.monotonic()
             t_ms = max(int(t * 1000), last_ms + 1)          # MediaPipe VIDEO mode needs strictly increasing
             last_ms = t_ms
             try:
@@ -113,8 +116,10 @@ class Pipeline:
 
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
         face = self.face.process(frame, t_ms) if self.face else None
+        regions = face_region_contours(face, frame.shape)
         if self.rppg:
-            self.rppg.update(frame, face.eyes if face else None, t)
+            self.rppg.update(frame, face.eyes if face else None, t,
+                             landmarks=face.landmarks_px if face else None)
         dets = self.objects.detect(frame) if self.objects else []
         phone = bool(self.objects and self.objects.phone_in_use(dets, face, frame.shape))
         att = self.attention.update(face, t, phone=phone)
@@ -130,26 +135,36 @@ class Pipeline:
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
+            "face_regions": regions,
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
                        "proc_fps": round(self.proc_fps, 1), "size": [frame.shape[1], frame.shape[0]]},
             "detectors": {"face": self.face is not None, "rppg": self.rppg is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
-        self._jpeg = self._draw(frame, face, dets, att, pulse)
+        if self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S:
+            self._jpeg = self._draw(frame, face, dets, att, pulse, regions)
+            self._last_preview_t = t
         with self._lock:
             self._state = state
         if self.on_state:
             self.on_state(state)
 
     def _publish_no_camera(self) -> None:
-        gestures = self.discomfort.update(None, time.monotonic(), missing_reason="no_camera_frame")
+        t = time.monotonic()
+        gestures = self.discomfort.update(None, t, missing_reason="no_camera_frame")
+        if self.rppg:
+            self.rppg.update(None, None, t)
+        pulse = _jsonable(self.rppg.status()) if self.rppg else {}
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
                            "discomfort": gestures,
+                           "pulse": pulse,
+                           "face_box": None,
+                           "face_regions": dict.fromkeys(FACE_REGION_CONTOURS),
                            "camera": {"connected": self.camera.connected}}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
-    def _draw(self, frame, face, dets, att, pulse) -> bytes | None:
+    def _draw(self, frame, face, dets, att, pulse, regions) -> bytes | None:
         img = frame.copy()
         level = att.get("level", "ok")
         col = COLORS.get(level, (255, 255, 255))
@@ -167,9 +182,13 @@ class Pipeline:
             for i in (33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380, 468, 473):
                 if i < len(lm):
                     cv2.circle(img, (int(lm[i][0]), int(lm[i][1])), 2, (255, 255, 0), -1)
-        if self.rppg:
-            for a, b, c2, d2 in self.rppg.rois():
-                cv2.rectangle(img, (a, b), (c2, d2), (0, 255, 0), 1)
+        region_colors = {name: (85, 225, 90) for name in PULSE_REGIONS}
+        region_colors["nose"] = (255, 210, 80)
+        for name, points in regions.items():
+            if points is not None:
+                contour = np.rint(points).astype(np.int32)
+                region_color = region_colors.get(name, (170, 90, 255))
+                cv2.polylines(img, [contour], True, region_color, 1, cv2.LINE_AA)
         lines = [f"{level.upper()}  looking: {att.get('looking', '-')}",
                  f"EAR {att.get('ear') or 0:.2f}  PERCLOS {100 * (att.get('perclos') or 0):.0f}%  "
                  f"blinks/min {att.get('blinks_per_min') or 0:.0f}"]

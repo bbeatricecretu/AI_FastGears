@@ -134,6 +134,7 @@ Useful flags:
 
 ```powershell
 .venv\Scripts\python -m fastgears --camera 1          # second webcam
+.venv\Scripts\python -m fastgears --camera 1 --camera-backend msmf  # Camo on this test laptop
 .venv\Scripts\python -m fastgears --no-objects        # skip YOLO (faster on weak laptops)
 .venv\Scripts\python -m fastgears --no-rppg           # skip camera pulse
 .venv\Scripts\python -m fastgears --no-llm            # rule-based messages only
@@ -142,6 +143,14 @@ Useful flags:
 
 API: `GET /api/state` (latest detections as JSON) · `GET /api/messages` · `POST /api/chat {"text": "..."}` ·
 `POST /api/recalibrate` · `GET /api/health` · `WS /ws` · `GET /video.mjpg`.
+
+## Puls și regiuni faciale în testul Camo
+
+Pentru Camo pe laptopul de test, pornește `fastgears` cu `--camera 1 --camera-backend msmf` și lasă estimarea pulsului activată. Pe flux, verde marchează fruntea și ambii obraji, albastru marchează nasul, iar roz marchează contururile exterior și interior ale gurii. `face_regions` din `/api/state` oferă punctele în coordonatele cadrului original. Zona buzelor se obține scăzând conturul interior din cel exterior. O regiune ieșită din cadru apare cu valoarea `null`.
+
+Estimatorul folosește timpul monoton la care OpenCV a livrat cadrul, inclusiv latența camerei virtuale. Fereastra are 6–10 s. La configurația implicită de 20 Hz, sub 8 probe/s sau la un gol de peste 350 ms nu se afișează BPM. Consensul regional necesită cel puțin 12 probe/s și două regiuni cu cel puțin 85% probe valide și vârfuri POS la cel mult 6 BPM distanță. Eliminăm variația de culoare explicată de mișcarea și schimbarea scalei feței și acceptăm vârfuri secundare comune dacă au suficientă putere în fiecare regiune. Un consens bazat pe un vârf secundar are încredere cel mult `uncertain`. Între 8 și 12 probe/s sau dacă lipsește consensul, POS pe culorile agregate furnizează BPM când există semnal utilizabil. Această citire are încredere `unreliable`. Pragurile sunt tehnice și experimentale.
+
+În regim cu încredere scăzută, afișajul folosește mediana a până la trei estimări consecutive și păstrează ultima estimare brută în `pulse.raw_bpm`. Pentru a verifica acuratețea, compară estimatorii pe aceeași secvență de cadre cu o serie BPM de referință înregistrată simultan. Raportează eroarea absolută medie pentru citirile disponibile și proporția de ferestre în care fiecare estimator a publicat BPM. `pulse.reason`, `pulse.fps`, `pulse.max_gap_s` și `pulse.region_quality` explică rezultatul fiecărei ferestre. Testele din `tests/test_rppg.py` includ semnale sintetice cu probe rare, regiuni divergente și o frunte supraexpusă.
 
 ## Verificarea gesturilor faciale
 
@@ -158,7 +167,7 @@ Deschide [dashboard-ul local](http://127.0.0.1:8000) și urmărește panoul **Ge
 | AU4 · Sprâncene | `browDownLeft/Right` | Creșterea scorului mediu de coborâre față de repaus |
 | AU6 · Obraji | `cheekSquintLeft/Right` | Creșterea scorului mediu de ridicare a obrajilor |
 | AU7 · Pleoape | `eyeSquintLeft/Right` | Creșterea scorului mediu de strângere activă |
-| AU9 · Nas | `noseSneerLeft/Right` | Creșterea scorului mediu asociat încrețirii |
+| AU9 · Nas | `noseSneerLeft/Right` și ridicarea aripilor nazale față de puntea nazală | Semnalul cel mai pronunțat față de propriul prag. Ridicarea se măsoară ca procent din distanța dintre ochi și se folosește ca aproximare a mișcării asociate încrețirii |
 | AU10 · Buza superioară | `mouthUpperUpLeft/Right` | Creșterea scorului mediu de ridicare a buzei |
 | AU43 · Pleoape | EAR stânga și dreapta din `FaceResult` | Cea mai mică scădere relativă dintre cele două deschideri, activă de la 80% |
 | AU25–27 · Gură | MAR din `FaceResult` | Creșterea raportului deschidere/lățime față de repaus |

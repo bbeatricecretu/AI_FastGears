@@ -36,6 +36,21 @@ MOUTH_INNER_VERT = (13, 14)   # upper / lower inner lip
 MOUTH_CORNERS = (78, 308)     # inner mouth corners
 N_LANDMARKS_IRIS = 478
 
+# MediaPipe Face Mesh anatomical contours, ordered around each region.
+MOUTH_OUTER = (61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
+               375, 321, 405, 314, 17, 84, 181, 91, 146)
+MOUTH_INNER = (78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
+               324, 318, 402, 317, 14, 87, 178, 88, 95)
+NOSE_OUTLINE = (168, 193, 122, 49, 64, 98, 2, 327, 294, 279, 351, 417)
+PULSE_REGIONS = ("forehead", "cheek_right", "cheek_left")
+FACE_REGION_CONTOURS = {
+    "forehead": (109, 10, 338, 336, 107),
+    # Paired patches over the lateral cheekbones, below the outer eye corners.
+    "cheek_right": (227, 111, 123, 137),
+    "cheek_left": (447, 340, 352, 366),
+    "nose": NOSE_OUTLINE, "mouth_outer": MOUTH_OUTER, "mouth_inner": MOUTH_INNER,
+}
+
 
 @dataclass
 class FaceResult:
@@ -94,6 +109,31 @@ def mouth_aspect_ratio(lm: np.ndarray) -> float:
     if w < 1e-6:
         return 0.0
     return _d(lm[MOUTH_INNER_VERT[0]], lm[MOUTH_INNER_VERT[1]]) / w
+
+
+def landmark_region(landmarks: np.ndarray, name: str) -> np.ndarray | None:
+    indices = FACE_REGION_CONTOURS[name]
+    if len(landmarks) <= max(indices):
+        return None
+    points = landmarks[list(indices), :2]
+    if not np.isfinite(points).all():
+        return None
+    if name in PULSE_REGIONS:
+        points = 0.82 * points + 0.18 * points.mean(axis=0)
+    return points
+
+
+def face_region_contours(face: FaceResult | None, frame_shape) -> dict[str, list | None]:
+    """Return in-frame contours in the same pixel coordinates as the original frame."""
+    height, width = frame_shape[:2]
+    contours = dict.fromkeys(FACE_REGION_CONTOURS)
+    if face is None:
+        return contours
+    for name in FACE_REGION_CONTOURS:
+        points = landmark_region(face.landmarks_px, name)
+        if points is not None and ((points >= 0) & (points < (width, height))).all():
+            contours[name] = points.tolist()
+    return contours
 
 
 def _one_iris(lm, corners, lids, iris) -> tuple[float, float] | None:
@@ -174,7 +214,8 @@ class FaceTracker:
     """MediaPipe Face Landmarker (VIDEO mode, one face) on full BGR frames."""
 
     def __init__(self, model_path: str | None = None,
-                 models_dir: str = "models"):
+                 models_dir: str = "models", max_input_side: int = 768):
+        self._max_input_side = max_input_side
         if model_path is None or not os.path.exists(model_path):
             model_path = ensure_face_model(models_dir)
         try:
@@ -202,13 +243,18 @@ class FaceTracker:
         if ts <= self._last_ts:
             ts = self._last_ts + 1
         self._last_ts = ts
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w = frame_bgr.shape[:2]
+        image_bgr = frame_bgr
+        if max(h, w) > self._max_input_side:
+            ratio = self._max_input_side / max(h, w)
+            image_bgr = cv2.resize(frame_bgr, (max(1, round(w * ratio)), max(1, round(h * ratio))),
+                                   interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
                                data=np.ascontiguousarray(rgb))
         result = self._landmarker.detect_for_video(image, ts)
         if not result.face_landmarks:
             return None
-        h, w = frame_bgr.shape[:2]
         pts = result.face_landmarks[0]
         lm = np.array([(p.x * w, p.y * h, p.z * w) for p in pts],
                       dtype=np.float64)

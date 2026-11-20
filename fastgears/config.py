@@ -27,6 +27,7 @@ def _camera(v: str):
 @dataclass
 class Settings:
     camera: int | str = field(default_factory=lambda: _camera(os.getenv("CAMERA", "0")))
+    camera_backend: str = os.getenv("CAMERA_BACKEND", "auto").strip().lower()
     width: int = int(os.getenv("CAMERA_WIDTH", "1280"))
     height: int = int(os.getenv("CAMERA_HEIGHT", "720"))
     mirror: bool = _bool("MIRROR", True)

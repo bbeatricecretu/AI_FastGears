@@ -114,3 +114,24 @@ def test_repeated_clock_ticks_do_not_advance_or_crash_the_detector():
     state = monitor.update(None, 1.1, missing_reason="no_camera_frame")
     assert state["markers"]["au4"]["reason"] == "no_camera_frame"
     assert not monitor.update(None, 1.1)["observable"]
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+def test_nose_wing_lift_detected_with_flat_blendshape(mirror):
+    def sample(lift=0, turn=0, tip=0):
+        f = face(yaw=turn)
+        f.blendshapes.update(noseSneerLeft=0, noseSneerRight=0)
+        f.landmarks_px[98, 1] -= lift
+        f.landmarks_px[1, 1] -= tip
+        if mirror:
+            f.landmarks_px[:, 0] = SHAPE[1] - f.landmarks_px[:, 0]
+        return f
+
+    monitor = DiscomfortMonitor(calib_s=0.4)
+    for i in range(11):
+        state = monitor.update(sample(), i / 10, SHAPE)
+    assert not state["markers"]["au9"]["active"]
+    assert not monitor.update(sample(tip=5), 1.1, SHAPE)["markers"]["au9"]["active"]
+    active = monitor.update(sample(lift=2), 1.2, SHAPE)["markers"]["au9"]
+    assert active["active"] and active["source"] == "nose_wing_lift"
+    assert not monitor.update(sample(lift=2, turn=15), 1.3, SHAPE)["markers"]["au9"]["active"]

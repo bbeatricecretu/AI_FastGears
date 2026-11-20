@@ -7,6 +7,8 @@ import os
 def main() -> None:
     ap = argparse.ArgumentParser(description="FastGears driver monitor")
     ap.add_argument("--camera", help="webcam index (0,1,..) or a video file for dev replay")
+    ap.add_argument("--camera-backend", choices=("auto", "dshow", "msmf"),
+                    help="Windows camera capture backend")
     ap.add_argument("--port", type=int)
     ap.add_argument("--host")
     ap.add_argument("--no-llm", action="store_true", help="rule-based messages only")
@@ -16,6 +18,8 @@ def main() -> None:
     # CLI overrides env, before config is imported
     if a.camera is not None:
         os.environ["CAMERA"] = a.camera
+    if a.camera_backend:
+        os.environ["CAMERA_BACKEND"] = a.camera_backend
     if a.port:
         os.environ["PORT"] = str(a.port)
     if a.host:
