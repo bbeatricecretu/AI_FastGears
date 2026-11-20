@@ -21,6 +21,10 @@ from typing import Callable, Protocol
 
 log = logging.getLogger("coach")
 
+ALERT_REPEAT_S = 20.0   # an ongoing danger episode is re-announced at most this often
+EPISODE_GAP_S = 10.0    # a reason must be gone this long before it counts as a new episode
+RATE_LIMIT_PAUSE_S = 30.0
+
 SYSTEM_PROMPT = """You are FastGears, an in-car driver-safety co-pilot. You receive live readings
 from a driver-monitoring camera (eyes, head pose, phone use, yawns, camera-measured pulse).
 Speak directly to the driver, in {language}. Be short, calm and concrete — the text is read
@@ -57,8 +61,9 @@ class GeminiClient:
         kw = dict(system_instruction=system, temperature=0.5, max_output_tokens=300)
         if json_mode:
             kw["response_mime_type"] = "application/json"
-        try:  # 2.5 models think by default: costs latency we don't want in a car
-            kw["thinking_config"] = t.ThinkingConfig(thinking_budget=0)
+        try:  # models think by default: costs latency we don't want in a car
+            kw["thinking_config"] = (t.ThinkingConfig(thinking_budget=0) if "2.5" in self.model
+                                     else t.ThinkingConfig(thinking_level="minimal"))
         except Exception:
             pass
         r = self._client.models.generate_content(model=self.model, contents=user,
@@ -105,12 +110,16 @@ def local_message(state: dict) -> dict | None:
     if a.get("phone"):
         return {"message": "Put the phone down and keep both hands on the wheel.", "severity": "alert",
                 "reason": "phone in use"}
+    if a.get("looking") == "tilted" and any(r.startswith("head tilted") for r in a.get("reasons", [])):
+        return {"message": "Your head is dropping. Sit up, and take a break if you're tired.",
+                "severity": "alert" if a.get("level") == "danger" else "warning", "reason": "head tilted"}
     if a.get("distracted"):
         where = a.get("looking", "away")
         return {"message": f"You're looking {where}. Eyes back on the road.", "severity": "warning",
                 "reason": f"looking {where}"}
-    if a.get("level") == "danger":
-        return {"message": "Danger: please focus on the road.", "severity": "alert", "reason": "danger"}
+    if a.get("hand_off_wheel"):
+        return {"message": "Please keep both hands on the wheel.", "severity": "warning",
+                "reason": "hand off the wheel"}
     if a.get("yawning") or (a.get("perclos") or 0) > 0.15:
         return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": "warning",
                 "reason": "signs of fatigue"}
@@ -124,9 +133,8 @@ def compact_state(state: dict) -> dict:
     keep = ("level", "reasons", "looking", "off_road_s", "eyes_closed", "eye_closed_s", "perclos",
             "blinks_per_min", "yawns_5min", "microsleep", "phone", "drowsiness", "distraction", "face_present")
     out = {k: a.get(k) for k in keep if k in a}
-    trust = (p.get("trust") or {}).get("label")
-    if p.get("bpm") and trust != "unreliable":
-        out["pulse_bpm"], out["pulse_trust"] = p["bpm"], trust
+    if p.get("bpm") and p.get("pulse_state") in ("tracking", "held"):
+        out["pulse_bpm"] = p["bpm"]
     out["driving_minutes"] = round(state.get("uptime_s", 0) / 60, 1)
     return out
 
@@ -161,6 +169,10 @@ class Coach:
         self._jobs: queue.Queue = queue.Queue(maxsize=1)
         self._last_llm = 0.0
         self._last_local = {}
+        self._last_seen: dict = {}
+        self._prev_seen: dict = {}
+        self._pending = False
+        self._pause_until = -1e9
         self._last_level = "ok"
         self._last_key = None
         self.llm_errors = 0
@@ -181,18 +193,31 @@ class Coach:
         loc = local_message(state)
         key = loc["reason"] if loc else None
 
-        # 1) instant local alert on a new danger reason (repeat every 6 s while it lasts)
+        # 1) instant local alert once per danger episode (re-announced every ALERT_REPEAT_S
+        #    while it lasts); an episode ends when its reason disappears
+        if key:
+            self._last_seen[key] = now
+        for k in [k for k in self._last_local if now - self._last_seen.get(k, -1e9) > EPISODE_GAP_S]:
+            del self._last_local[k]
         if loc and loc["severity"] == "alert":
-            if now - self._last_local.get(key, -1e9) > 6:
+            if now - self._last_local.get(key, -1e9) > ALERT_REPEAT_S:
                 self._last_local[key] = now
                 self._emit({**loc, "source": "instant"})
 
         # 2) LLM on change, or periodic summary
-        changed = key != self._last_key or level != self._last_level
-        due = now - self._last_llm >= (self.min_interval_s if changed and level != "ok" else self.summary_every_s)
+        # ask the LLM on a NEW episode (reason not seen in the last EPISODE_GAP_S) or an escalation,
+        # not on every flicker of the same situation
+        rank = {"ok": 0, "caution": 1, "danger": 2}
+        new_episode = bool(key) and now - self._prev_seen.get(key, -1e9) > EPISODE_GAP_S
+        changed = new_episode or rank.get(level, 0) > rank.get(self._last_level, 0)
+        if key:
+            self._prev_seen[key] = now
+        self._pending = (self._pending or changed) and level != "ok"   # waits for min_interval if needed
+        due = now - self._last_llm >= (self.min_interval_s if self._pending else self.summary_every_s)
         self._last_key, self._last_level = key, level
-        if due:
+        if due and now >= self._pause_until:
             self._last_llm = now
+            self._pending = False
             self._submit(("react", compact_state(state), loc))
 
     def _submit(self, job) -> None:
@@ -233,6 +258,9 @@ class Coach:
                 except Exception as e:
                     self.llm_errors += 1
                     log.warning("LLM call failed: %s", e)
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                        self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_S
+                        continue            # rate-limited: stay quiet, instant alerts still work
             if out is None:
                 out = loc or {"message": "All good. Keep your eyes on the road.", "severity": "info", "reason": "ok"}
                 out = {**out, "source": "rules"}

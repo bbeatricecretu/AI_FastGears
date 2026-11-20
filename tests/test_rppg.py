@@ -74,3 +74,21 @@ def test_trust_score_sanity():
     assert "face too dark" in bad["reasons"] and "still settling" in bad["reasons"]
     over = trust_score(8.0, [72, 72, 72], 72, [72, 72, 72], 0.0, 230, 0.0)
     assert over["parts"]["exposure"] == 0.5 and "face overexposed" in over["reasons"]
+
+
+def test_filter_rejects_motion_holds_and_slew_limits():
+    r = RPPG()
+    good = lambda bpm: {"bpm": bpm, "snr": 5.0, "motion": 0.02}
+    assert r._filter(good(72), 100.0) == {"bpm": 72, "bpm_raw": 72, "pulse_state": "tracking", "rejected": None}
+    # head moving: a +30 BPM spike must not reach the user
+    out = r._filter({"bpm": 105, "snr": 3.0, "motion": 0.3}, 101.0)
+    assert out["bpm"] == 72 and out["pulse_state"] == "held" and out["rejected"] == "head moving"
+    out = r._filter({"bpm": 110, "snr": -2.0, "motion": 0.01}, 102.0)
+    assert out["bpm"] == 72 and out["rejected"] == "weak signal"
+    # real change is followed, but at most SLEW_BPM_PER_S per second (median of last 3 accepted)
+    r._filter(good(90), 103.0)
+    out = r._filter(good(90), 104.0)
+    assert 72 < out["bpm"] <= 72 + 3 * 4            # 4 s since the last good reading
+    # rejected for longer than HOLD_MAX_S: back to measuring
+    out = r._filter({"bpm": 150, "snr": 1.0, "motion": 0.5}, 104.0 + 13)
+    assert out["bpm"] is None and out["pulse_state"] == "measuring"

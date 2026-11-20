@@ -42,14 +42,17 @@ class Settings:
     enable_objects: bool = _bool("ENABLE_OBJECTS", True)
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
+    driver_seat: str = os.getenv("DRIVER_SEAT", "auto").lower()   # auto | left | right (as on screen)
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
 
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     anthropic_api_key: str | None = os.getenv("ANTHROPIC_API_KEY")
     anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+    phone_vision_check: bool = _bool("PHONE_VISION_CHECK", True)
+    gemini_vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
     llm_min_interval_s: float = float(os.getenv("LLM_MIN_INTERVAL_S", "8"))
     llm_summary_every_s: float = float(os.getenv("LLM_SUMMARY_EVERY_S", "45"))
     language: str = os.getenv("ASSISTANT_LANGUAGE", "English")

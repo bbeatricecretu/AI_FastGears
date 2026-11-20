@@ -44,6 +44,16 @@ FACE_LOST_S = 2.0           # drop the face after this long without a detection
 FACE_EMA = 0.3              # source smoothed at each 0.5 s detection with this weight
 FACE_EMA_PERIOD_S = 0.5
 ESTIMATE_EVERY_S = 1.0
+# Output filter (FastGears, on top of the validated estimate): head movement shifts the ROIs
+# over the skin and produces a fake peak, so a moving window must not change the reading.
+MOTION_GATE = 0.08          # window motion (eye-midpoint spread / eye distance) above this: reject
+SNR_GATE_DB = 0.0           # below 0 dB the pulse is weaker than the noise: reject
+TRACK_BPM = 12              # prefer a spectral peak within +-12 BPM of the shown pulse...
+TRACK_MIN_RATIO = 0.5       # ...if it has at least half the power of the global peak
+SLEW_BPM_PER_S = 3.0        # the shown pulse changes at most this fast (a real heart rate is smooth)
+HOLD_MAX_S = 12.0           # keep the last good value this long while rejected, then "measuring"
+STEP_GATE = 0.04            # eye-midpoint jump between two samples (x eye distance): a movement;
+                            # the window restarts after it so the pulse returns after MIN_WINDOW_S still
 
 # forehead + two cheeks, relative to (cx, cy) in units of eye distance d
 BOXES = [(-0.55, -1.10, 0.55, -0.45),   # forehead, above the eyes
@@ -204,6 +214,9 @@ class RPPG:
         self._rois: list[tuple[int, int, int, int]] = []
         self._diag: dict = {}
         self._history: deque = deque(maxlen=8)
+        self._accepted: deque = deque(maxlen=3)   # last accepted window estimates
+        self._shown: float | None = None          # filtered pulse shown to the user
+        self._shown_t = self._last_ok = 0.0
         self._result = {"bpm": None, "snr": None, "window_s": 0.0, "fps": None, "regions_bpm": [],
                         "motion": None, "trust": None}
         self._est_at = None          # wall-clock (monotonic) of last recompute
@@ -338,13 +351,26 @@ class RPPG:
             return {"bpm": None, "snr": None, "window_s": 0.0}
         t_end = pts[-1][0]
         pts = [p for p in pts if p[0] >= t_end - WINDOW_S]
-        span = pts[-1][0] - pts[0][0]
-        if span < MIN_WINDOW_S:
-            return {"bpm": None, "snr": None, "window_s": round(span, 1)}
         arr = np.array(pts, dtype=float)
+        step = np.hypot(np.diff(arr[:, 4]), np.diff(arr[:, 5])) / np.maximum(arr[1:, 6], 1.0)
+        moved = np.nonzero(step > STEP_GATE)[0]
+        settling = len(moved) > 0
+        if settling:                              # keep only what came after the last movement
+            arr = arr[moved[-1] + 1:]
+        span = float(arr[-1, 0] - arr[0, 0]) if len(arr) > 1 else 0.0
+        if span < MIN_WINDOW_S:
+            return {"bpm": None, "snr": None, "window_s": round(span, 1), "settling": settling}
+        pts = arr
         ts = arr[:, 0]
         fb, sb, f0, snr = pos_spectrum(ts, arr[:, 1:4], self.sample_hz)
         bpm = round(f0 * 60)
+        shown = self._shown
+        if shown is not None:                     # peak tracking: stay on the heart's peak
+            near = np.abs(fb * 60 - shown) <= TRACK_BPM
+            if near.any():
+                i = int(np.argmax(np.where(near, sb, -1.0)))
+                if sb[i] >= TRACK_MIN_RATIO * sb.max():
+                    bpm = round(fb[i] * 60)
         region_bpms = []
         for k in range(3):
             rgb = arr[:, 7 + 3 * k:10 + 3 * k]
@@ -383,10 +409,41 @@ class RPPG:
                     logger.warning("rPPG estimate failed: %s", e)
             base = {"bpm": None, "snr": None, "window_s": 0.0, "fps": None, "regions_bpm": [],
                     "motion": None, "trust": None}
+            out = {**base, **(res or {})}
+            out.update(self._filter(out, now))
             with self._lock:
-                self._result = {**base, **(res or {})}
+                self._result = out
         finally:
             self._est_lock.release()
+
+    def _filter(self, res: dict, now: float) -> dict:
+        """Gate by motion/SNR, median of the last accepted windows, slew-limit, hold."""
+        raw, snr, motion = res.get("bpm"), res.get("snr"), res.get("motion")
+        why = None
+        if raw is None:
+            why = "settling after movement" if res.get("settling") else "no estimate"
+        elif motion is not None and motion > MOTION_GATE:
+            why = "head moving"
+        elif snr is None or snr < SNR_GATE_DB:
+            why = "weak signal"
+        if why is None:
+            self._accepted.append(raw)
+            target = float(np.median(self._accepted))
+            if self._shown is None:
+                self._shown = target
+            else:
+                step = SLEW_BPM_PER_S * max(now - self._shown_t, ESTIMATE_EVERY_S)
+                self._shown += float(np.clip(target - self._shown, -step, step))
+            self._shown_t = self._last_ok = now
+            state = "tracking"
+        elif self._shown is not None and now - self._last_ok <= HOLD_MAX_S:
+            state = "held"
+        else:
+            self._shown = None
+            self._accepted.clear()
+            state = "measuring"
+        return {"bpm": round(self._shown) if self._shown is not None else None, "bpm_raw": raw,
+                "pulse_state": state, "rejected": why}
 
     # ── outputs ───────────────────────────────────────────────────────
     def status(self) -> dict:

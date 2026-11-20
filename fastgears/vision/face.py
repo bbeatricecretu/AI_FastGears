@@ -174,7 +174,7 @@ class FaceTracker:
     """MediaPipe Face Landmarker (VIDEO mode, one face) on full BGR frames."""
 
     def __init__(self, model_path: str | None = None,
-                 models_dir: str = "models"):
+                 models_dir: str = "models", num_faces: int = 4):
         if model_path is None or not os.path.exists(model_path):
             model_path = ensure_face_model(models_dir)
         try:
@@ -189,13 +189,18 @@ class FaceTracker:
             base_options=BaseOptions(model_asset_path=model_path),
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=True,
-            num_faces=1,
+            num_faces=num_faces,   # all faces: DriverLock picks the driver
             running_mode=vision.RunningMode.VIDEO,
         )
         self._landmarker = vision.FaceLandmarker.create_from_options(opts)
         self._last_ts = -1
 
     def process(self, frame_bgr: np.ndarray, t_ms: int) -> FaceResult | None:
+        """First face only (compatibility); the app uses process_all + DriverLock."""
+        faces = self.process_all(frame_bgr, t_ms)
+        return faces[0] if faces else None
+
+    def process_all(self, frame_bgr: np.ndarray, t_ms: int) -> list[FaceResult]:
         import cv2
         # VIDEO mode requires strictly increasing integer timestamps.
         ts = int(t_ms)
@@ -206,24 +211,24 @@ class FaceTracker:
         image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
                                data=np.ascontiguousarray(rgb))
         result = self._landmarker.detect_for_video(image, ts)
-        if not result.face_landmarks:
-            return None
         h, w = frame_bgr.shape[:2]
-        pts = result.face_landmarks[0]
-        lm = np.array([(p.x * w, p.y * h, p.z * w) for p in pts],
-                      dtype=np.float64)
-        bs: dict[str, float] = {}
-        if result.face_blendshapes:
-            for c in result.face_blendshapes[0]:
-                name = getattr(c, "category_name", None) or \
-                    getattr(c, "name", None)
-                if name:
-                    bs[name] = float(c.score)
-        mat = None
-        if result.facial_transformation_matrixes:
-            mat = np.asarray(result.facial_transformation_matrixes[0],
-                             dtype=np.float64)
-        return face_result_from_landmarks(lm, frame_bgr.shape, bs, mat)
+        out: list[FaceResult] = []
+        for i, pts in enumerate(result.face_landmarks or []):
+            lm = np.array([(p.x * w, p.y * h, p.z * w) for p in pts],
+                          dtype=np.float64)
+            bs: dict[str, float] = {}
+            if result.face_blendshapes and i < len(result.face_blendshapes):
+                for c in result.face_blendshapes[i]:
+                    name = getattr(c, "category_name", None) or \
+                        getattr(c, "name", None)
+                    if name:
+                        bs[name] = float(c.score)
+            mat = None
+            mats = result.facial_transformation_matrixes
+            if mats and i < len(mats):
+                mat = np.asarray(mats[i], dtype=np.float64)
+            out.append(face_result_from_landmarks(lm, frame_bgr.shape, bs, mat))
+        return out
 
     def close(self) -> None:
         try:

@@ -148,7 +148,7 @@ def test_yawn():
     mon, out, t = calibrated()
     out, t = run(mon, t, 0.5, lambda: fake_face(mar=0.8))
     assert out["yawning"] is False
-    out, t = run(mon, t, 1.0, lambda: fake_face(mar=0.8))
+    out, t = run(mon, t, 1.5, lambda: fake_face(mar=0.8))
     assert out["yawning"] is True and out["yawns_5min"] == 1
     assert out["level"] in ("caution", "danger")
     out, _ = run(mon, t, 0.5, lambda: fake_face(blendshapes={"jawOpen": 0.1}))
@@ -250,3 +250,76 @@ def test_euler_yaw_rotation():
     m[:3, :3] = [[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]]
     p, y, r = _euler_from_matrix(m)
     assert y == pytest.approx(30.0) and abs(p) < 1e-6 and abs(r) < 1e-6
+
+
+def test_drowsiness_recovers_after_eyes_reopen():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 6.0, lambda: fake_face(ear=0.08))      # head drop, eyes shut 6 s
+    assert out["level"] == "danger" and out["microsleep"]
+    out, t = run(mon, t, 2.0, lambda: fake_face())              # eyes open again
+    assert out["level"] != "danger" and out["drowsiness"] < 70
+    assert out["perclos"] > 0.05                                # trend still remembers it...
+    out, t = run(mon, t, 62.0, lambda: fake_face())             # ...until it leaves the 60 s window
+    assert out["level"] == "ok"
+
+
+def test_talking_is_not_a_yawn():
+    mon, out, t = calibrated()
+    for _ in range(10):                                          # mouth open 0.6 s, closed 0.3 s
+        out, t = run(mon, t, 0.6, lambda: fake_face(mar=0.8))
+        out, t = run(mon, t, 0.3, lambda: fake_face())
+    assert out["yawns_5min"] == 0
+
+
+def test_phone_latch_debounces():
+    from fastgears.vision.objects import PhoneLatch
+    latch = PhoneLatch()
+    assert latch.update(0.3, True, 0.0) is False                 # one weak hit: not yet
+    assert latch.update(None, False, 0.1) is False
+    assert latch.update(0.3, True, 0.5) is True                  # confirmed by a 2nd hit
+    assert latch.update(None, True, 1.5) is True                 # missed detections: held
+    assert latch.update(None, True, 2.1) is False                # > 1.5 s without a hit: off
+    assert latch.update(0.7, True, 3.0) is True                  # one confident hit is enough
+
+
+def test_tilted_head_mouth_is_not_a_yawn():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 3.0, lambda: fake_face(mar=0.8, roll=40.0))   # head on the side
+    assert out["yawns_5min"] == 0
+
+
+def test_yawn_score_fades():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 1.6, lambda: fake_face(mar=0.8))
+    out, t = run(mon, t, 1.0, lambda: fake_face())
+    fresh = out["drowsiness"]
+    out, t = run(mon, t, 150.0, lambda: fake_face())
+    assert out["yawns_5min"] == 1 and out["drowsiness"] < fresh
+
+
+def test_hand_up_is_hand_off_wheel():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 2.0, lambda: fake_face(), )
+    for _ in range(40):
+        t += 0.05
+        out = mon.update(fake_face(), t, hand_up=True)
+    assert out["hand_off_wheel"] and "hand off the wheel" in out["reasons"] and out["level"] == "caution"
+
+
+def test_head_lying_sideways_is_tilted_and_drowsy():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.5, lambda: fake_face(roll=60.0, pitch=-25.0))
+    assert out["looking"] == "tilted"                       # not "up": pitch is unreliable when rolled
+    out, t = run(mon, t, 3.0, lambda: fake_face(roll=60.0, pitch=-25.0))
+    assert out["level"] == "danger" and any(r.startswith("head tilted") for r in out["reasons"])
+    assert out["distraction"] < 40                           # it's drowsiness, not distraction
+    out, t = run(mon, t, 1.0, lambda: fake_face())
+    assert out["looking"] == "road" and out["level"] != "danger"
+
+
+def test_drowsiness_recovers_within_20s_after_long_closure():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 9.0, lambda: fake_face(ear=0.08))      # 9 s eyes closed (screenshot)
+    assert out["microsleep"]
+    out, t = run(mon, t, 20.0, lambda: fake_face())
+    assert out["level"] == "ok" and out["drowsiness"] < 40

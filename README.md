@@ -47,7 +47,9 @@ sensors.
 | `fastgears/pipeline.py` | Per-frame loop, overlay drawing, state assembly |
 | `fastgears/vision/face.py` | MediaPipe face landmarks, EAR, MAR, iris, head pose |
 | `fastgears/vision/attention.py` | Drowsiness / distraction logic → level + reasons |
-| `fastgears/vision/objects.py` | YOLOv8n phone / person detection |
+| `fastgears/vision/objects.py` | YOLOv8n phone / person detection, hand/driver crops, phone latch |
+| `fastgears/vision/hands.py` | MediaPipe hand tracking (raised hands, crops) |
+| `fastgears/vision/phone_check.py` | Gemini vision second opinion on phone use |
 | `fastgears/vision/rppg.py` | Camera heart rate (POS) with trust score |
 | `fastgears/vision/identity.py` | Optional driver recognition (InsightFace) |
 | `fastgears/vision/filters.py` | One-Euro smoothing filter |
@@ -67,20 +69,54 @@ The camera pulse, face pose and identity code is ported from our earlier project
 - `vision/face.py`: MediaPipe landmarker wrapper and head-pose Euler extraction (verified).
 - `vision/identity.py`, `vision/filters.py`: face-embedding identity lock and One-Euro filter.
 
+## Driver lock (only the driver is measured)
+
+All faces are tracked, but only the **driver's** face feeds the eye, head, yawn and pulse
+measurements, and only the driver's hands and phone count. Passengers get a grey
+"passenger (ignored)" box.
+
+1. **Acquire:** at start (and after *Recalibrate*), the biggest face, closest to the camera, becomes
+   the driver once it has won 5 frames in a row. With `DRIVER_SEAT=left|right`, only faces on that
+   side of the screen are considered.
+2. **Track:** each frame the driver is the face that continues the previous one (small movement,
+   similar size). MediaPipe's face order is never trusted.
+3. **Lost:** if the driver leaves the frame, the dashboard says *DRIVER NOT VISIBLE*. The lock never
+   jumps to a passenger, even one leaning into the middle. Only a face back in the driver's seat
+   (within 0.6 face widths of the learned position) takes the lock again.
+4. **Phone / hands:** a hand belongs to whoever its **forearm points at** (wrist → elbow → that
+   person's shoulder), so the driver's hand raised beside a passenger's face still counts as the
+   driver's. A phone closer to a passenger's face than to the driver's is ignored.
+
 ## How attention is measured
 
 - **Calibration (first 5 s):** the driver looks at the road. This sets their own open-eye EAR and
   neutral head pose, so glasses, face shape and camera position don't matter. The *Recalibrate*
   button repeats it.
 - **Eyes closed:** EAR below 60 % of the driver's baseline, or the MediaPipe eyeBlink blendshape ≥ 0.5.
-- **Microsleep:** eyes closed ≥ 1.5 s → **danger**.
-- **PERCLOS:** the share of the last 60 s with the eyes ≥ 80 % closed. This is the standard
-  drowsiness measure; > 15 % means tired.
-- **Yawns:** mouth aspect ratio / jawOpen held ≥ 1 s, counted over 5 min.
+- **Microsleep:** eyes closed ≥ 1.5 s → **danger**. The closure score fades within ~2 s once the eyes reopen.
+- **PERCLOS:** the share of time with the eyes ≥ 80 % closed, as an exponentially weighted average
+  (time constant 20 s: recent seconds weigh most). ≥ 15 % means tired. It is a trend, so it can raise
+  **caution** but never holds **danger**; after a long closure it fades back in ~15–20 s.
+- **Head tilted (nodding off):** head rolled ≥ 35° from the driver's normal pose, e.g. lying on a
+  shoulder. Counts as drowsiness after 1 s and reaches **danger** at 3 s. Pitch/yaw are unreliable
+  while the head is rolled that far, so it is not reported as "looking up/down".
+- **Yawns:** mouth wide open (MAR / jawOpen ≥ 0.6) for ≥ 1.5 s, only while the head is near neutral
+  (a tilted head distorts the mouth shape). Each yawn adds 15 drowsiness, fading to 0 over 5 min.
 - **Looking:** head yaw/pitch relative to the baseline, plus iris position → road / left / right /
   down / up / away. **Distracted** = off the road ≥ 2 s.
-- **Phone:** YOLO "cell phone" box in the frame near the driver → **danger**.
-- **Pulse:** shown only with its trust label. The LLM ignores "unreliable" readings.
+- **Phone:** three layers, steadied by an on/off latch (on after 2 hits in 1.5 s, off after 1.5 s
+  without one):
+  1. YOLOv8n on the full frame, and a phone-only pass on a high-resolution crop **around each raised
+     hand** (MediaPipe Hands). The phone is in the hand, and the crop makes edge-on or half-covered
+     phones visible.
+  2. If a hand is up but YOLO sees no phone, **Gemini vision** looks at the driver crop (at most every
+     5 s, `PHONE_VISION_CHECK=1`).
+  3. Even without a recognised phone, a hand held at face/chest level for ≥ 1.5 s = **hand off the
+     wheel** (caution).
+- **Pulse:** windows where the head moved or the signal is below the noise are rejected, and the last
+  good value is shown as "held" (up to 12 s). After a movement the window restarts, so a new reading
+  needs ~6 s of stillness. The shown value is the median of the last 3 good windows and changes at most
+  3 BPM/s.
 
 Thresholds are constants at the top of `fastgears/vision/attention.py`.
 
@@ -118,7 +154,10 @@ run the models download into `models/` automatically: `face_landmarker.task` (~4
 `yolov8n.pt` (~6 MB).
 
 **Gemini key:** create one at <https://aistudio.google.com/apikey> and put it in `.env` as
-`GEMINI_API_KEY`. To use Claude instead: `pip install anthropic`, then set `LLM_PROVIDER=anthropic`
+`GEMINI_API_KEY`. The default model is `gemini-3.5-flash-lite`. The free tier of `gemini-2.5-flash`
+allows only 20 requests/day, and `gemini-2.5-flash-lite` is closed to new keys. Check your usage at
+<https://ai.dev/rate-limit>. When Gemini rate-limits (429), the co-pilot pauses LLM calls for 30 s;
+instant alerts keep working. To use Claude instead: `pip install anthropic`, then set `LLM_PROVIDER=anthropic`
 and `ANTHROPIC_API_KEY`. With no key the app still runs, using built-in rule-based messages.
 
 ## Run

@@ -12,7 +12,7 @@ Deadline-driven: small, working, demoable increments; one commit per feature.
 
 ## Architecture
 `python -m fastgears` -> `server.py` (FastAPI, `/ws`, `/video.mjpg`) -> `pipeline.py` (worker thread)
--> `vision/face.py` (MediaPipe) -> `vision/rppg.py` (camera pulse) + `vision/objects.py` (YOLOv8n phone)
+-> `vision/face.py` (MediaPipe, all faces) -> `vision/driver.py` (DriverLock: only the driver is measured) -> `vision/rppg.py` (camera pulse) + `vision/objects.py` (YOLOv8n phone)
 -> `vision/attention.py` (level ok/caution/danger + reasons) -> `llm/coach.py` (instant alert + Gemini) -> `web/index.html`.
 
 ## Rules

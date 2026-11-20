@@ -19,6 +19,7 @@ and +yaw then means the driver's right. Labels are from the driver's view.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from statistics import median
 
@@ -36,7 +37,9 @@ EAR_CLOSED_ABS = 0.20            # fallback absolute threshold before calibratio
 BLINK_BS_CLOSED = 0.5            # eyeBlinkLeft/Right mean >= 0.5 also = closed
 EAR_FULLY_CLOSED_RATIO = 0.3     # EAR of a fully shut eye ~0.3 x open EAR
 PERCLOS_CLOSURE = 0.8            # PERCLOS P80: eye >= 80 % closed
-PERCLOS_WINDOW_S = 60.0
+PERCLOS_WINDOW_S = 60.0          # (kept for config compatibility)
+PERCLOS_TAU_S = 20.0             # PERCLOS = exponentially weighted share of closed time (recent ~20 s
+                                 # weigh most): rises with closures, fades smoothly after them
 BLINK_MAX_S = 0.5                # closures shorter than this count as blinks
 BLINK_WINDOW_S = 60.0
 LONG_CLOSURE_S = 0.5             # closure reported as a reason beyond this
@@ -47,10 +50,15 @@ EAR_BETA = 1.0
 # --- mouth ----------------------------------------------------------------------
 MAR_YAWN = 0.6                   # inner-lip MAR for a yawn
 JAW_OPEN_YAWN = 0.6              # or jawOpen blendshape
-YAWN_MIN_S = 1.0
+YAWN_MIN_S = 1.5                 # talking opens the mouth too, but rarely for 1.5 s
 YAWN_WINDOW_S = 300.0
+YAWN_POSE_MAX_DEG = 20.0         # mouth shape is only trusted with the head near neutral
+                                 # (a tilted/turned head distorts it: fake yawns)
 
 # --- gaze / head pose (degrees, relative to calibrated neutral) -------------------
+HEAD_TILT_DEG = 35.0             # head rolled this far (lying sideways): "tilted" - pitch/yaw unreliable
+HEAD_TILT_S = 1.0                # tilt held this long counts as nodding off...
+HEAD_TILT_DANGER_S = 3.0         # ...and reaches danger (70) after this long
 YAW_SIDE_DEG = 25.0              # |gaze yaw| beyond this -> left/right
 YAW_AWAY_DEG = 60.0              # beyond this -> away (head fully turned)
 PITCH_DOWN_DEG = 20.0            # gaze pitch beyond this -> down (lap, phone)
@@ -63,9 +71,13 @@ OFF_ROAD_REASON_S = 1.0
 MIRRORED = True                  # frames are horizontally flipped (selfie view)
 
 # --- scoring ----------------------------------------------------------------------
-PERCLOS_FULL = 0.30              # PERCLOS mapping to drowsiness 100
+PERCLOS_TIRED = 0.15             # PERCLOS at which the trend score reaches caution (40)
+PERCLOS_SCORE_MAX = 60.0         # PERCLOS is a slow 60 s trend: it can raise caution, never hold danger
+ACUTE_DECAY_S = 2.0              # eye-closure score fades with this time constant once eyes reopen
 YAWN_SCORE_EACH = 15.0           # drowsiness per yawn in the last 5 min (cap 60)
 PHONE_DISTRACTION = 80.0
+HAND_UP_S = 1.5                  # a hand held up at face/chest level this long...
+HAND_UP_DISTRACTION = 45.0       # ...means hands off the wheel: caution
 LEVEL_CAUTION = 40.0
 LEVEL_DANGER = 70.0
 
@@ -78,7 +90,7 @@ _THRESHOLD_NAMES = (
     "YAWN_MIN_S", "YAWN_WINDOW_S", "YAW_SIDE_DEG", "YAW_AWAY_DEG",
     "PITCH_DOWN_DEG", "PITCH_UP_DEG", "IRIS_YAW_GAIN", "IRIS_PITCH_GAIN",
     "FACE_MISSING_AWAY_S", "DISTRACTED_S", "OFF_ROAD_REASON_S", "MIRRORED",
-    "PERCLOS_FULL", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "LEVEL_CAUTION",
+    "PERCLOS_TIRED", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "PERCLOS_TAU_S", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
 )
 DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES}
@@ -115,6 +127,10 @@ class AttentionMonitor:
         self._looking = "road"
         self._ear_s: float | None = None
         self._rel = (None, None, None)
+        self._acute = 0.0
+        self._hand_since: float | None = None
+        self._perclos_ewma = 0.0
+        self._tilt_since: float | None = None
 
     def reset_calibration(self) -> None:
         """Forget the driver baseline; the next calib_s seconds re-learn it."""
@@ -189,7 +205,7 @@ class AttentionMonitor:
         return "road"
 
     # -- main ---------------------------------------------------------------------
-    def update(self, face, t: float, phone: bool = False) -> dict:
+    def update(self, face, t: float, phone: bool = False, hand_up: bool = False) -> dict:
         th = self.th
         t = float(t)
         if self._t0 is None:
@@ -227,11 +243,16 @@ class AttentionMonitor:
                     self._blinks.append(t)
                 self._closed_since = None
             closure = self._closure(ear, blink)
-            self._perclos.append((t, dt, closure >= th["perclos_closure"]))
+            a = 1.0 - math.exp(-dt / th["perclos_tau_s"])
+            self._perclos_ewma += a * ((1.0 if closure >= th["perclos_closure"] else 0.0) - self._perclos_ewma)
 
             # mouth / yawns
             jaw = (face.blendshapes or {}).get("jawOpen", 0.0)
-            if float(face.mar) >= th["mar_yawn"] or jaw >= th["jaw_open_yawn"]:
+            bp0, by0, br0 = self.base_pose
+            dev = [abs(v - b) for v, b in ((face.pitch_deg, bp0), (face.yaw_deg, by0), (face.roll_deg, br0))
+                   if v is not None]
+            pose_ok = not self.calibrated or not dev or max(dev) <= th["yawn_pose_max_deg"]
+            if pose_ok and (float(face.mar) >= th["mar_yawn"] or jaw >= th["jaw_open_yawn"]):
                 if self._mouth_open_since is None:
                     self._mouth_open_since = t
                     self._yawn_counted = False
@@ -251,7 +272,13 @@ class AttentionMonitor:
             self._rel = (rel_p, rel_y, rel_r)
             # iris is unreliable with eyes shut; ignore it then
             iris = None if eyes_closed else face.iris_offset
-            self._looking = self._gaze_label(rel_p, rel_y, iris)
+            if rel_r is not None and abs(rel_r) >= th["head_tilt_deg"]:
+                self._looking = "tilted"
+                if self._tilt_since is None:
+                    self._tilt_since = t
+            else:
+                self._tilt_since = None
+                self._looking = self._gaze_label(rel_p, rel_y, iris)
         else:
             # face lost: eye/mouth episodes cannot continue
             self._closed_since = None
@@ -265,7 +292,10 @@ class AttentionMonitor:
             # else: hold the last label for brief dropouts
 
         looking = self._looking
-        if looking == "road":
+        if face is None:
+            self._tilt_since = None
+        tilt_s = 0.0 if self._tilt_since is None else t - self._tilt_since
+        if looking in ("road", "tilted"):          # tilt is drowsiness, not distraction
             self._off_road_since = None
         elif self._off_road_since is None:
             self._off_road_since = t
@@ -275,14 +305,11 @@ class AttentionMonitor:
         # windows
         while self._blinks and t - self._blinks[0] > th["blink_window_s"]:
             self._blinks.popleft()
-        while self._perclos and t - self._perclos[0][0] > th["perclos_window_s"]:
-            self._perclos.popleft()
         while self._yawns and t - self._yawns[0] > th["yawn_window_s"]:
             self._yawns.popleft()
         elapsed = min(th["blink_window_s"], max(10.0, t - self._t0))
         blinks_per_min = len(self._blinks) * 60.0 / elapsed
-        tot = sum(d for _, d, _ in self._perclos)
-        perclos = (sum(d for _, d, c in self._perclos if c) / tot) if tot > 0 else 0.0
+        perclos = self._perclos_ewma
         microsleep = eye_closed_s >= th["microsleep_s"]
         yawns_5min = len(self._yawns)
 
@@ -290,12 +317,26 @@ class AttentionMonitor:
         closure_score = 0.0
         if eye_closed_s >= th["long_closure_s"]:
             closure_score = min(100.0, 90.0 * eye_closed_s / th["microsleep_s"])
-        drowsiness = max(min(100.0, 100.0 * perclos / th["perclos_full"]),
-                         closure_score,
-                         min(60.0, th["yawn_score_each"] * yawns_5min))
+        # acute part: a closure keeps the score up only briefly after the eyes reopen
+        self._acute = max(closure_score, self._acute * math.exp(-dt / th["acute_decay_s"]))
+        perclos_score = min(th["perclos_score_max"], th["level_caution"] * perclos / th["perclos_tired"])
+        # each yawn counts fully when fresh and fades to 0 over the yawn window
+        yawn_score = sum(th["yawn_score_each"] * (1.0 - (t - ty) / th["yawn_window_s"]) for ty in self._yawns)
+        tilt_score = 0.0
+        if tilt_s >= th["head_tilt_s"]:
+            tilt_score = min(100.0, th["level_danger"] * tilt_s / th["head_tilt_danger_s"])
+        drowsiness = max(perclos_score, self._acute, min(60.0, yawn_score), tilt_score)
         if yawning:
             drowsiness = min(100.0, drowsiness + 10.0)
         distraction = min(100.0, 70.0 * off_road_s / th["distracted_s"])
+        if hand_up:
+            if self._hand_since is None:
+                self._hand_since = t
+        else:
+            self._hand_since = None
+        hand_off = self._hand_since is not None and t - self._hand_since >= th["hand_up_s"]
+        if hand_off:
+            distraction = max(distraction, th["hand_up_distraction"])
         if phone:
             distraction = max(distraction, th["phone_distraction"])
 
@@ -304,8 +345,10 @@ class AttentionMonitor:
             reasons.append(f"microsleep: eyes closed {eye_closed_s:.1f} s")
         elif eye_closed_s >= th["long_closure_s"]:
             reasons.append(f"eyes closed {eye_closed_s:.1f} s")
-        if perclos >= 0.15:
-            reasons.append(f"PERCLOS {perclos * 100:.0f}%")
+        if perclos >= th["perclos_tired"]:
+            reasons.append(f"tired: eyes closed {perclos * 100:.0f}% of the time recently")
+        if tilt_s >= th["head_tilt_s"]:
+            reasons.append(f"head tilted {tilt_s:.1f} s (nodding off?)")
         if yawning:
             reasons.append("yawning")
         if yawns_5min >= 2:
@@ -317,6 +360,8 @@ class AttentionMonitor:
                 reasons.append(f"looking {looking} {off_road_s:.1f} s")
         if phone:
             reasons.append("phone in hand")
+        elif hand_off:
+            reasons.append("hand off the wheel")
 
         worst = max(drowsiness, distraction)
         if microsleep or worst >= th["level_danger"]:
@@ -345,6 +390,7 @@ class AttentionMonitor:
             "off_road_s": round(off_road_s, 2),
             "distracted": bool(distracted),
             "phone": bool(phone),
+            "hand_off_wheel": bool(hand_off),
             "drowsiness": round(drowsiness, 1),
             "distraction": round(distraction, 1),
             "level": level,

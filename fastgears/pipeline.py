@@ -26,7 +26,9 @@ class Pipeline:
         self.s = settings
         self.on_state = on_state
         self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror)
-        self.face = self.rppg = self.objects = None
+        self.face = self.rppg = self.objects = self.hands = self.vision = None
+        self._hands: list = []
+        self._frame_i = 0
         self.errors: dict[str, str] = {}
         self._load_detectors()
         self._jpeg: bytes | None = None
@@ -38,10 +40,12 @@ class Pipeline:
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
+        from .vision.driver import DriverLock
         self.attention = AttentionMonitor(calib_s=self.s.calib_s)
+        self.driver = DriverLock(self.s.driver_seat)
         try:
             from .vision.face import FaceTracker
-            self.face = FaceTracker(models_dir=self.s.models_dir)
+            self.face = FaceTracker(models_dir=self.s.models_dir, num_faces=3)
         except Exception as e:
             self.errors["face"] = str(e)
             log.exception("face tracker unavailable")
@@ -55,12 +59,27 @@ class Pipeline:
                 log.exception("rPPG unavailable")
         if self.s.enable_objects:
             try:
-                from .vision.objects import ObjectDetector
+                from .vision.objects import ObjectDetector, PhoneLatch
                 self.objects = ObjectDetector(model=self.s.yolo_model, every_n=self.s.yolo_every,
                                               models_dir=self.s.models_dir)
+                self.objects.warmup()
+                self.phone_latch = PhoneLatch()
             except Exception as e:
                 self.errors["objects"] = str(e)
                 log.exception("object detector unavailable")
+            try:
+                from .vision.hands import HandTracker
+                self.hands = HandTracker(models_dir=self.s.models_dir)
+            except Exception as e:
+                self.errors["hands"] = str(e)
+                log.exception("hand tracker unavailable")
+            if self.s.phone_vision_check and self.s.llm_provider == "gemini" and self.s.gemini_api_key:
+                try:
+                    from .vision.phone_check import VisionPhoneCheck
+                    self.vision = VisionPhoneCheck(self.s.gemini_api_key, self.s.gemini_vision_model)
+                except Exception as e:
+                    self.errors["phone_vision"] = str(e)
+                    log.exception("vision phone check unavailable")
 
     def start(self) -> "Pipeline":
         self.camera.start()
@@ -72,6 +91,8 @@ class Pipeline:
         self.camera.stop()
 
     def recalibrate(self) -> None:
+        """Forget the driver lock and baseline: the face in the driver seat now is re-learned."""
+        self.driver.reset()
         self.attention.reset_calibration()
 
     # ── outputs ───────────────────────────────────────────────────────
@@ -104,12 +125,33 @@ class Pipeline:
                 self.proc_fps, n, t_fps = n / (t - t_fps), 0, t
 
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
-        face = self.face.process(frame, t_ms) if self.face else None
+        faces = self.face.process_all(frame, t_ms) if self.face else []
+        face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t)
-        dets = self.objects.detect(frame) if self.objects else []
-        phone = bool(self.objects and self.objects.phone_in_use(dets, face, frame.shape))
-        att = self.attention.update(face, t, phone=phone)
+        from .vision.hands import raised_hands, hand_crop
+        self._frame_i += 1
+        if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
+            self._hands = self.hands.process(frame, t_ms)
+        up = [h for h in raised_hands(self._hands, face) if self.driver.owns_hand(h, face)]
+        boxes = [b for b in (hand_crop(h, frame.shape) for h in up) if b is not None]
+        dets = self.objects.detect(frame, face, boxes) if self.objects else []
+        phone, phone_src = False, None
+        if self.objects:
+            mine = [d for d in dets if d.get("label") != "cell phone" or self.driver.belongs_to_driver(
+                (d["bbox"][0] + d["bbox"][2]) / 2, (d["bbox"][1] + d["bbox"][3]) / 2, face, frame.shape)]
+            hit = self.objects.phone_hit(mine, face, frame.shape)
+            fresh = self.objects.fresh
+            if hit is not None:
+                phone_src = "yolo"
+            if self.vision:
+                if up and not self.phone_latch.on and hit is None:
+                    self.vision.maybe_check(frame, self.objects.driver_crop(face, frame.shape), t)
+                vc = self.vision.phone_conf(t)
+                if vc is not None:
+                    hit, fresh, phone_src = max(hit or 0.0, vc), True, phone_src or "gemini-vision"
+            phone = self.phone_latch.update(hit, fresh, t)
+        att = self.attention.update(face, t, phone=phone, hand_up=bool(up))
         pulse = self.rppg.status() if self.rppg else {}
         state = {
             "t": time.time(),
@@ -119,12 +161,16 @@ class Pipeline:
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
+            "driver": self.driver.state.as_dict(),
+            "hands": {"seen": len(self._hands), "raised": len(up), "phone_source": phone_src if phone else None,
+                      "vision_calls": self.vision.calls if self.vision else 0},
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
                        "proc_fps": round(self.proc_fps, 1), "size": [frame.shape[1], frame.shape[0]]},
             "detectors": {"face": self.face is not None, "rppg": self.rppg is not None,
+                          "hands": self.hands is not None, "phone_vision": self.vision is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
-        self._jpeg = self._draw(frame, face, dets, att, pulse)
+        self._jpeg = self._draw(frame, face, dets, att, pulse, up)
         with self._lock:
             self._state = state
         if self.on_state:
@@ -136,20 +182,31 @@ class Pipeline:
                            "camera": {"connected": self.camera.connected}}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
-    def _draw(self, frame, face, dets, att, pulse) -> bytes | None:
+    def _draw(self, frame, face, dets, att, pulse, hands_up=()) -> bytes | None:
         img = frame.copy()
+        for b in self.driver.state.passenger_boxes:
+            x0, y0, x1, y1 = map(int, b)
+            cv2.rectangle(img, (x0, y0), (x1, y1), (150, 150, 150), 1)
+            cv2.putText(img, "passenger (ignored)", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (150, 150, 150), 1)
+        for hd in hands_up:
+            x0, y0, x1, y1 = hd.bbox
+            cv2.rectangle(img, (x0, y0), (x1, y1), (255, 160, 0), 2)
+            cv2.putText(img, "hand", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 160, 0), 2)
         level = att.get("level", "ok")
         col = COLORS.get(level, (255, 255, 255))
         for d in dets:
-            if d.get("label") in ("cell phone", "person"):
+            # only phones that count: confident ones, or any while the phone latch is on
+            if d.get("label") == "cell phone" and (d["conf"] >= 0.4 or att.get("phone")):
                 x0, y0, x1, y1 = map(int, d["bbox"])
-                c = (60, 60, 255) if d["label"] == "cell phone" else (200, 200, 200)
+                c = (60, 60, 255)
                 cv2.rectangle(img, (x0, y0), (x1, y1), c, 2)
                 cv2.putText(img, f'{d["label"]} {d["conf"]:.2f}', (x0, max(15, y0 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
         if face is not None:
             x0, y0, x1, y1 = map(int, face.bbox)
             cv2.rectangle(img, (x0, y0), (x1, y1), col, 2)
+            cv2.putText(img, "DRIVER", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
             lm = face.landmarks_px
             for i in (33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380, 468, 473):
                 if i < len(lm):

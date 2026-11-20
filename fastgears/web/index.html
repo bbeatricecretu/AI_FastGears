@@ -84,14 +84,14 @@
         <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
         <div class="m" id="m-phone"><small>Phone</small><span>–</span></div>
         <div class="m" id="m-ear"><small>EAR</small><span>–</span></div>
-        <div class="m" id="m-perclos"><small>PERCLOS 60s</small><span>–</span></div>
+        <div class="m" id="m-perclos"><small>PERCLOS (recent)</small><span>–</span></div>
         <div class="m" id="m-blinks"><small>Blinks/min</small><span>–</span></div>
         <div class="m" id="m-yawn"><small>Yawns 5 min</small><span>–</span></div>
         <div class="m" id="m-offroad"><small>Off-road</small><span>–</span></div>
         <div class="m" id="m-head"><small>Yaw / pitch</small><span>–</span></div>
         <div class="m" id="m-pulse"><small>Pulse (camera)</small><span>–</span></div>
         <div class="m" id="m-trust"><small>Pulse trust</small><span>–</span></div>
-        <div class="m" id="m-face"><small>Face</small><span>–</span></div>
+        <div class="m" id="m-face"><small>Driver</small><span>–</span></div>
       </div>
     </div>
     <div class="card">
@@ -141,7 +141,8 @@ function onState(s) {
   if (s.llm) $('llm').textContent = `LLM ${s.llm.provider}` + (s.llm.latency_ms ? ` · ${s.llm.latency_ms} ms` : '');
   const level = a.level || 'ok';
   $('banner').className = level;
-  $('banner').textContent = !a.face_present && a.calibrated ? 'DRIVER NOT VISIBLE'
+  $('banner').textContent = (s.driver || {}).status === 'searching' ? 'Looking for the driver…'
+    : !a.face_present && a.calibrated ? 'DRIVER NOT VISIBLE'
     : !a.calibrated ? 'Calibrating — look at the road' : level === 'ok' ? 'ATTENTIVE' : level === 'caution' ? 'CAUTION' : 'DANGER';
   $('reasons').textContent = (a.reasons || []).join(' · ');
   const drow = Math.round(a.drowsiness || 0), dist = Math.round(a.distraction || 0);
@@ -159,11 +160,15 @@ function onState(s) {
   set('m-offroad', a.off_road_s != null ? a.off_road_s.toFixed(1) + 's' : '–', a.distracted);
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
-  set('m-pulse', p.bpm ? p.bpm + ' bpm' : (p.window_s ? `measuring ${p.window_s}s` : '–'));
+  set('m-pulse', p.bpm ? p.bpm + ' bpm' + (p.pulse_state === 'held' ? ` · held (${p.rejected})` : '')
+                       : (p.window_s ? 'measuring – keep still' : '–'));
   set('m-trust', trust.label ? `${trust.label} ${trust.score}` : '–', trust.label === 'unreliable');
-  set('m-face', a.face_present ? 'yes' : 'no', !a.face_present);
+  const dr = s.driver || {};
+  const extra = dr.passengers ? ` · ${dr.passengers} ignored` : '';
+  set('m-face', (dr.status === 'locked' ? 'locked' : dr.status === 'lost' ? `lost ${dr.lost_s}s` : 'searching') + extra,
+      dr.status !== 'locked');
   const now = Date.now() / 1000;
-  hist.push({ t: now, drow, dist, bpm: trust.label && trust.label !== 'unreliable' ? p.bpm : null });
+  hist.push({ t: now, drow, dist, bpm: p.bpm || null });
   while (hist.length && now - hist[0].t > 120) hist.shift();
 }
 

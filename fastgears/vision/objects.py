@@ -14,6 +14,12 @@ PHONE_LABEL = "cell phone"
 PERSON_LABEL = "person"
 PHONE_NEAR_FACE = 1.0     # phone centre within this many face widths of the face box
 PHONE_LOWER_FRAC = 1 / 3  # or in the lower 2/3 of the frame
+PHONE_CONF = 0.20         # phones are small and often seen edge-on: lower bar, the latch filters noise
+PHONE_COCO_ID = 67
+CROP_IMGSZ = 480          # driver-crop pass: the phone gets ~2x more pixels than in the full frame
+PHONE_CONFIRM_S = 1.5     # latch ON: 2 phone hits within this window (or one hit >= PHONE_SURE)
+PHONE_SURE = 0.5
+PHONE_HOLD_S = 1.5        # latch OFF: no phone hit for this long
 
 
 def _has_cuda() -> bool:
@@ -27,7 +33,7 @@ def _has_cuda() -> bool:
 class ObjectDetector:
     def __init__(self, model: str = "yolov8n.pt", every_n: int = 3,
                  conf: float = 0.35, models_dir: str = "models",
-                 imgsz: int = 480):
+                 imgsz: int = 640):
         self.model_name = model
         self.every_n = max(1, int(every_n))
         self.conf = float(conf)
@@ -37,6 +43,8 @@ class ObjectDetector:
         self._device = None
         self._calls = 0
         self._cache: list[dict] = []
+        self._phone_cache: list[dict] = []
+        self.fresh = False        # True when the last detect() call ran inference
 
     def _model_path(self) -> str:
         p = Path(self.model_name)
@@ -57,14 +65,16 @@ class ObjectDetector:
             self._model = YOLO(self._model_path())
         return self._model
 
-    def detect(self, frame_bgr) -> list[dict]:
-        """[{"label", "conf", "bbox": [x0,y0,x1,y1]}]; inference every_n calls."""
-        run = self._calls % self.every_n == 0
-        self._calls += 1
-        if not run:
-            return list(self._cache)
+    def warmup(self) -> None:
+        """First inferences are slow (lazy init): do them before the camera starts."""
+        import numpy as np
+        blank = np.zeros((480, 640, 3), np.uint8)
+        for _ in range(2):
+            self._predict(blank, self.imgsz, min(self.conf, PHONE_CONF))
+
+    def _predict(self, img, imgsz, conf, classes=None, dx=0, dy=0) -> list[dict]:
         model = self._get_model()
-        res = model.predict(frame_bgr, conf=self.conf, imgsz=self.imgsz,
+        res = model.predict(img, conf=conf, imgsz=imgsz, classes=classes,
                             device=self._device, verbose=False)
         out: list[dict] = []
         if res:
@@ -76,15 +86,68 @@ class ObjectDetector:
                 confs = boxes.conf.cpu().numpy()
                 clss = boxes.cls.cpu().numpy().astype(int)
                 for b, c, k in zip(xyxy, confs, clss):
+                    x0, y0, x1, y1 = (int(v) for v in b)
                     out.append({"label": str(names[int(k)]),
                                 "conf": round(float(c), 3),
-                                "bbox": [int(v) for v in b]})
-        self._cache = out
-        return list(out)
+                                "bbox": [x0 + dx, y0 + dy, x1 + dx, y1 + dy]})
+        return out
+
+    @staticmethod
+    def driver_crop(face, frame_shape):
+        """Region where the driver's hands and phone are: face +-1.5 widths, down to the frame bottom."""
+        if face is None:
+            return None
+        h, w = frame_shape[:2]
+        fx0, fy0, fx1, fy1 = face.bbox
+        fw, fh = fx1 - fx0, fy1 - fy0
+        x0, x1 = max(0, int(fx0 - 1.5 * fw)), min(w, int(fx1 + 1.5 * fw))
+        y0, y1 = max(0, int(fy0 - 0.5 * fh)), h
+        if x1 - x0 < 64 or y1 - y0 < 64:
+            return None
+        return x0, y0, x1, y1
+
+    def detect(self, frame_bgr, face=None, hand_boxes=None) -> list[dict]:
+        """[{"label", "conf", "bbox": [x0,y0,x1,y1]}]; inference every_n calls.
+
+        Inference ticks alternate between the full frame (everything, phones at a lower bar)
+        and, when a face is known, a phone-only pass on the crop around the driver.
+        """
+        run = self._calls % self.every_n == 0
+        tick = self._calls // self.every_n
+        self._calls += 1
+        self.fresh = run
+        if not run:
+            return self._cache + self._phone_cache
+        # phone-only pass: around each raised hand (the phone is in it), else around the driver
+        crops = [("hand-crop", b) for b in (hand_boxes or [])[:2]]
+        if not crops:
+            dc = self.driver_crop(face, frame_bgr.shape)
+            crops = [("driver-crop", dc)] if dc is not None else []
+        if crops and tick % 2 == 1:
+            self._phone_cache = []
+            for src, (x0, y0, x1, y1) in crops:
+                for d in self._predict(frame_bgr[y0:y1, x0:x1], CROP_IMGSZ, PHONE_CONF,
+                                       classes=[PHONE_COCO_ID], dx=x0, dy=y0):
+                    d["source"] = src
+                    self._phone_cache.append(d)
+        else:
+            dets = self._predict(frame_bgr, self.imgsz, min(self.conf, PHONE_CONF))
+            self._cache = [d for d in dets if d["label"] != PHONE_LABEL and d["conf"] >= self.conf]
+            self._phone_cache = [d for d in dets if d["label"] == PHONE_LABEL]
+        return self._cache + self._phone_cache
 
     @staticmethod
     def count(dets: list[dict], label: str = PERSON_LABEL) -> int:
         return sum(1 for d in dets if d.get("label") == label)
+
+    @classmethod
+    def phone_hit(cls, dets: list[dict], face, frame_shape) -> float | None:
+        """Highest confidence of a phone that counts for the driver, or None."""
+        best = None
+        for d in dets:
+            if d.get("label") == PHONE_LABEL and cls.phone_in_use([d], face, frame_shape):
+                best = max(best or 0.0, float(d["conf"]))
+        return best
 
     @staticmethod
     def phone_in_use(dets: list[dict], face, frame_shape) -> bool:
@@ -107,3 +170,29 @@ class ObjectDetector:
             if fx0 - m <= cx <= fx1 + m and fy0 - m <= cy <= fy1 + m:
                 return True
         return False
+
+
+class PhoneLatch:
+    """Turns noisy per-inference phone hits into a steady in-use signal.
+
+    ON after 2 hits within PHONE_CONFIRM_S (or one confident hit), OFF after PHONE_HOLD_S
+    without any hit. Only fresh inference results count; cached repeats are ignored.
+    """
+
+    def __init__(self, confirm_s: float = PHONE_CONFIRM_S, hold_s: float = PHONE_HOLD_S,
+                 sure: float = PHONE_SURE):
+        self.confirm_s, self.hold_s, self.sure = confirm_s, hold_s, sure
+        self.on = False
+        self._hits: list[float] = []
+        self._last_hit: float | None = None
+
+    def update(self, hit_conf: float | None, fresh: bool, t: float) -> bool:
+        if fresh and hit_conf is not None:
+            self._hits = [h for h in self._hits if t - h <= self.confirm_s] + [t]
+            self._last_hit = t
+            if len(self._hits) >= 2 or hit_conf >= self.sure:
+                self.on = True
+        if self.on and (self._last_hit is None or t - self._last_hit > self.hold_s):
+            self.on = False
+            self._hits.clear()
+        return self.on
