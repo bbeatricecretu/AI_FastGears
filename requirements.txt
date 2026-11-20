@@ -1,0 +1,14 @@
+# FastGears driver monitor — runtime (CPU only, no special hardware)
+numpy>=1.26,<2.4
+opencv-python>=4.9
+mediapipe>=0.10.14        # face landmarks, eye/iris, blendshapes, head pose
+ultralytics>=8.3          # YOLOv8n phone/person detection (pulls torch; CPU wheel is fine)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+google-genai>=1.0         # Gemini (default LLM)
+
+# optional
+# anthropic>=0.40         # LLM_PROVIDER=anthropic
+# insightface>=0.7.3      # driver recognition (needs C++ build tools on Windows)
+# onnxruntime>=1.17       # used by insightface

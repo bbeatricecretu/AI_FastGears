@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+*.pt
+*.task
+*.onnx
+.claude/settings.local.json
+.claude/worktrees/

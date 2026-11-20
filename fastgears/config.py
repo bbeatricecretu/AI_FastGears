@@ -1,0 +1,58 @@
+"""Settings, read once from environment variables (and a local .env file)."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+try:  # optional: python-dotenv
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
+
+def _bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _camera(v: str):
+    """'0' -> 0 (webcam index); anything else is a path/URL (dev replay only)."""
+    return int(v) if v.strip().isdigit() else v
+
+
+@dataclass
+class Settings:
+    camera: int | str = field(default_factory=lambda: _camera(os.getenv("CAMERA", "0")))
+    width: int = int(os.getenv("CAMERA_WIDTH", "1280"))
+    height: int = int(os.getenv("CAMERA_HEIGHT", "720"))
+    mirror: bool = _bool("MIRROR", True)
+
+    host: str = os.getenv("HOST", "127.0.0.1")
+    port: int = int(os.getenv("PORT", "8000"))
+
+    models_dir: str = os.getenv("MODELS_DIR", str(ROOT / "models"))
+    data_dir: str = os.getenv("DATA_DIR", str(ROOT / "data"))
+
+    # detectors
+    enable_rppg: bool = _bool("ENABLE_RPPG", True)
+    enable_objects: bool = _bool("ENABLE_OBJECTS", True)
+    yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
+    yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
+    calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
+
+    # LLM
+    llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none
+    gemini_api_key: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    anthropic_api_key: str | None = os.getenv("ANTHROPIC_API_KEY")
+    anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+    llm_min_interval_s: float = float(os.getenv("LLM_MIN_INTERVAL_S", "8"))
+    llm_summary_every_s: float = float(os.getenv("LLM_SUMMARY_EVERY_S", "45"))
+    language: str = os.getenv("ASSISTANT_LANGUAGE", "English")
+
+
+settings = Settings()
