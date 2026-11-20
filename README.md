@@ -165,7 +165,7 @@ Deschide [dashboard-ul local](http://127.0.0.1:8000) și urmărește panoul **Ge
 | Marker | Sursa MediaPipe | Valoare afișată |
 |---|---|---|
 | AU4 · Sprâncene | `browDownLeft/Right` | Creșterea scorului mediu de coborâre față de repaus |
-| AU6 · Obraji | `cheekSquintLeft/Right` | Creșterea scorului mediu de ridicare a obrajilor |
+| AU6 · Obraji | `cheekSquintLeft/Right` și deplasarea verticală a pomeților | Semnalul cel mai pronunțat față de propriul prag. Deplasarea se raportează la distanța dintre ochi |
 | AU7 · Pleoape | `eyeSquintLeft/Right` | Creșterea scorului mediu de strângere activă |
 | AU9 · Nas | `noseSneerLeft/Right` și ridicarea aripilor nazale față de puntea nazală | Semnalul cel mai pronunțat față de propriul prag. Ridicarea se măsoară ca procent din distanța dintre ochi și se folosește ca aproximare a mișcării asociate încrețirii |
 | AU10 · Buza superioară | `mouthUpperUpLeft/Right` | Creșterea scorului mediu de ridicare a buzei |

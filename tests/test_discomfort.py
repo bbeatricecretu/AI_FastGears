@@ -135,3 +135,24 @@ def test_nose_wing_lift_detected_with_flat_blendshape(mirror):
     active = monitor.update(sample(lift=2), 1.2, SHAPE)["markers"]["au9"]
     assert active["active"] and active["source"] == "nose_wing_lift"
     assert not monitor.update(sample(lift=2, turn=15), 1.3, SHAPE)["markers"]["au9"]["active"]
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+def test_cheek_lift_works_with_flat_blendshapes_and_rejects_head_motion(mirror):
+    def sample(lift=0, turn=0, shift=0):
+        f = face(yaw=turn)
+        f.blendshapes.update(cheekSquintLeft=0, cheekSquintRight=0)
+        f.landmarks_px[:, 1] += shift
+        f.landmarks_px[[50, 101], 1] -= lift
+        if mirror:
+            f.landmarks_px[:, 0] = SHAPE[1] - f.landmarks_px[:, 0]
+        return f
+
+    monitor = DiscomfortMonitor(calib_s=0.4)
+    for i in range(11):
+        monitor.update(sample(), i / 10, SHAPE)
+    assert not monitor.update(sample(shift=12), 1.1, SHAPE)["markers"]["au6"]["active"]
+    lifted = monitor.update(sample(lift=2), 1.2, SHAPE)["markers"]["au6"]
+    assert lifted["active"] and lifted["source"] == "cheek_lift"
+    assert lifted["unit"] == "eye_distance_fraction"
+    assert not monitor.update(sample(lift=2, turn=15), 1.3, SHAPE)["markers"]["au6"]["active"]

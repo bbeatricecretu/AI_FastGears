@@ -209,7 +209,9 @@ function renderGestures(g) {
       else if (marker.unit === 'eye_distance_fraction') value = `${(marker.value * 100).toFixed(1)}%`;
       else value = marker.value.toFixed(id === 'au9' ? 3 : 2);
     }
-    $(`gesture-${id}`).title = marker?.source === 'nose_wing_lift' ? 'Ridicarea aripii nazale față de reper' : '';
+    const liftLabels = {nose_wing_lift: 'Ridicarea aripii nazale față de reper',
+      cheek_lift: 'Ridicarea pomeților față de reper'};
+    $(`gesture-${id}`).title = liftLabels[marker?.source] || '';
     set(`gesture-${id}`, value, marker?.active);
   }
   const event = g.event;

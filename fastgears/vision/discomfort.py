@@ -21,7 +21,12 @@ class Marker:
 EYES = LEFT_EYE_EAR + RIGHT_EYE_EAR
 NOSE_WINGS = (98, 327)
 NOSE_BRIDGE = 168
-NOSE_LIFT_THRESHOLD = 0.012  # fraction of inter-eye distance
+CHEEK_POINTS = ((50, 101), (280, 330))
+# Minimum upward displacement as a fraction of inter-eye distance.
+LIFT_SIGNALS = {
+    "au6": ("cheek_lift", CHEEK_POINTS, 0.010),
+    "au9": ("nose_wing_lift", ((NOSE_WINGS[0],), (NOSE_WINGS[1],)), 0.012),
+}
 MARKERS = {
     "au4": Marker("brows", (70, 107, 336, 300), "browDown", 0.18),
     "au6": Marker("cheeks", (50, 280), "cheekSquint", 0.15),
@@ -53,9 +58,9 @@ def _span(landmarks, first, second):
     return hypot(*(landmarks[first][:2] - landmarks[second][:2]))
 
 
-def _nose_wing_lift(face, width, height):
+def _project_lift(face, sides, width, height):
     points = face.landmarks_px
-    if not _in_frame(points, (*NOSE_WINGS, NOSE_BRIDGE, 33, 263), width, height):
+    if not _in_frame(points, (*sides[0], *sides[1], NOSE_BRIDGE, 33, 263), width, height):
         return None
     axis_x, axis_y = points[263, :2] - points[33, :2]
     norm = hypot(axis_x, axis_y)
@@ -64,8 +69,9 @@ def _nose_wing_lift(face, width, height):
     # Measure upwards in the eye-aligned plane, even if the frame is mirrored.
     sign = 1 if axis_x >= 0 else -1
     down_x, down_y = -sign * axis_y / norm, sign * axis_x / norm
-    offsets = points[NOSE_BRIDGE, :2] - points[list(NOSE_WINGS), :2]
-    return tuple(float((x * down_x + y * down_y) / face.eyes[2]) for x, y in offsets)
+    bridge_x, bridge_y = points[NOSE_BRIDGE, :2]
+    return tuple(float(((bridge_x - x) * down_x + (bridge_y - y) * down_y) / face.eyes[2])
+                 for x, y in (points[list(side), :2].mean(axis=0) for side in sides))
 
 
 class DiscomfortMonitor:
@@ -122,12 +128,13 @@ class DiscomfortMonitor:
             else:
                 pair = _bilateral(face.blendshapes, marker.source)
                 if pair is not None:
-                    readings[code] = max(pair) if code == "au9" else sum(pair) / 2
-            if code == "au9":
-                lift = _nose_wing_lift(face, width, height)
+                    readings[code] = max(pair) if code in LIFT_SIGNALS else sum(pair) / 2
+            if code in LIFT_SIGNALS:
+                source, sides, _ = LIFT_SIGNALS[code]
+                lift = _project_lift(face, sides, width, height)
                 if lift is not None:
-                    readings["nose_lift"] = lift
-                    readings["nose_pose"] = (face.pitch_deg, face.yaw_deg)
+                    readings[source] = lift
+                    readings["pose"] = (face.pitch_deg, face.yaw_deg)
                     continue
             if code not in readings:
                 reasons[code] = "missing_signal"
@@ -135,11 +142,13 @@ class DiscomfortMonitor:
 
     def _calibrate(self, face, readings, dt):
         blink = _bilateral(face.blendshapes, "eyeBlink") if face else None
+        smile = _bilateral(face.blendshapes, "mouthSmile") if face else None
         ears = readings.get("au43")
         # Region coefficients may be absent. Collect available signals while eyes are open.
         neutral = bool(ears and min(ears) >= 0.15 and (blink is None or max(blink) < 0.3)
+                       and (smile is None or max(smile) < 0.35)
                        and readings.get("au25_27", 0) < 0.25
-                       and all(readings.get(code, 0) < 0.35 for code in ("au4", "au7", "au9", "au10")))
+                       and all(readings.get(code, 0) < 0.35 for code in ("au4", "au6", "au7", "au9", "au10")))
         if neutral:
             self._samples.append(readings)
             if self._last_neutral:
@@ -159,25 +168,26 @@ class DiscomfortMonitor:
                 centre = median(values)
                 mad = median(abs(value - centre) for value in values)
                 self._baseline[code] = centre, mad
-        nose_samples = [sample["nose_lift"] for sample in self._samples if "nose_lift" in sample]
-        if len(nose_samples) >= 0.7 * len(self._samples):
-            centres = tuple(median(side) for side in zip(*nose_samples))
+        for source, _, _ in LIFT_SIGNALS.values():
+            valid = [sample for sample in self._samples if source in sample]
+            if len(valid) < 0.7 * len(self._samples):
+                continue
+            values = [sample[source] for sample in valid]
+            centres = tuple(median(side) for side in zip(*values))
             noise = tuple(median(abs(x - centre) for x in side)
-                          for side, centre in zip(zip(*nose_samples), centres))
-            self._baseline["nose_lift"] = (centres, noise)
-            poses = [sample["nose_pose"] for sample in self._samples if "nose_pose" in sample]
-            self._baseline["nose_pose"] = tuple(median(angle) for angle in zip(*poses))
+                          for side, centre in zip(zip(*values), centres))
+            pose = tuple(median(angle) for angle in zip(*(sample["pose"] for sample in valid)))
+            self._baseline[source] = (centres, noise, pose)
         self._samples.clear()
 
-    def _nose_evidence(self, face, readings):
-        if self._baseline is None or "nose_lift" not in self._baseline or "nose_lift" not in readings:
+    def _lift_evidence(self, source, minimum, face, readings):
+        if self._baseline is None or source not in self._baseline or source not in readings:
             return None
-        neutral_pitch, neutral_yaw = self._baseline["nose_pose"]
+        centres, noise, (neutral_pitch, neutral_yaw) = self._baseline[source]
         if max(abs(face.pitch_deg - neutral_pitch), abs(face.yaw_deg - neutral_yaw)) > 10:
             return None
-        centres, noise = self._baseline["nose_lift"]
-        evidence = [(value - centre, max(NOSE_LIFT_THRESHOLD, 4 * mad))
-                    for value, centre, mad in zip(readings["nose_lift"], centres, noise)]
+        evidence = [(value - centre, max(minimum, 4 * mad))
+                    for value, centre, mad in zip(readings[source], centres, noise)]
         return max(evidence, key=lambda candidate: candidate[0] / candidate[1])
 
     def _markers(self, face, readings, reasons):
@@ -202,12 +212,13 @@ class DiscomfortMonitor:
                     value = readings[code] - centre
                     threshold = max(threshold, 4 * mad)
                 active = value >= threshold
-            if code == "au9":
-                lift = self._nose_evidence(face, readings)
+            if code in LIFT_SIGNALS:
+                lift_source, _, minimum = LIFT_SIGNALS[code]
+                lift = self._lift_evidence(lift_source, minimum, face, readings)
                 if lift is not None and (value is None or lift[0] / lift[1] >= value / threshold):
                     value, threshold = lift
                     reason, active = None, value >= threshold
-                    source, unit = "nose_wing_lift", "eye_distance_fraction"
+                    source, unit = lift_source, "eye_distance_fraction"
             markers[code] = {"region": marker.region, "source": source, "unit": unit,
                              "available": reason is None, "reason": reason,
                              "value": None if value is None else round(value, 4),
