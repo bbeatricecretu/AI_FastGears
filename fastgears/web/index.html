@@ -56,6 +56,12 @@
   #rgb-observations .rgb-finding { margin: 4px 0 0; }
   #rgb-observations .rgb-evidence { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
   .rgb-evaluations { margin-top: 12px; }
+  #bio h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; margin: 12px 0 6px; }
+  #bio .m span { font-size: 15px; }
+  #bio-finding { margin: 0; font-weight: 600; }
+  #bio[data-flag="true"] { border-color: var(--caution); }
+  #bio[data-flag="true"] #bio-finding { color: var(--caution); }
+  .bio-note { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
   .presets { display: flex; gap: 6px; margin-bottom: 8px; }
   .presets button { flex: 1; }
   .tune { display: grid; grid-template-columns: 1fr 120px 48px; gap: 4px 8px; align-items: center; font-size: 13px; }
@@ -120,23 +126,47 @@
       </div>
       <p id="gesture-last" hidden></p>
     </div>
-    <div class="card" id="rgb-panel" hidden>
-      <h2>Facial colour · RGB</h2>
-      <p id="rgb-light" role="status"></p>
+    <section class="card" id="bio" aria-labelledby="bio-title">
+      <h2 id="bio-title">Biometrics</h2>
+      <p id="bio-finding" role="status">Waiting for camera data.</p>
+      <h3>Heart rate (camera)</h3>
       <div class="grid">
-        <div class="m" id="rgb-cheek_right"><small>Right cheek</small><span>–</span></div>
-        <div class="m" id="rgb-cheek_left"><small>Left cheek</small><span>–</span></div>
-        <div class="m" id="rgb-forehead"><small>Forehead</small><span>–</span></div>
-        <div class="m" id="rgb-lips"><small>Lips</small><span>–</span></div>
+        <div class="m" id="bio-bpm"><small>Trusted pulse</small><span>–</span></div>
+        <div class="m" id="bio-snr"><small>Signal strength</small><span>–</span></div>
+        <div class="m" id="bio-still"><small>Head stillness</small><span>–</span></div>
+        <div class="m" id="bio-forehead"><small>Forehead</small><span>–</span></div>
+        <div class="m" id="bio-cheek_right"><small>Right cheek</small><span>–</span></div>
+        <div class="m" id="bio-cheek_left"><small>Left cheek</small><span>–</span></div>
       </div>
-      <h2 class="rgb-evaluations">Individual RGB readings</h2>
-      <ul id="rgb-observations">
-        <li class="m" id="rgb-result-cheek_redness"><small>Cheek redness</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p><p class="rgb-evidence" hidden></p></li>
-        <li class="m" id="rgb-result-cheek_color_reduction"><small>Reduced cheek colour</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p></li>
-        <li class="m" id="rgb-result-lip_tone_shift"><small>Lip tone</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p></li>
-      </ul>
-      <p id="rgb-last" hidden></p>
-    </div>
+      <p class="bio-note" id="bio-pulse-note"></p>
+      <h3>Fatigue &amp; posture</h3>
+      <div class="grid">
+        <div class="m" id="bio-fatigue"><small>Fatigue signs</small><span>–</span></div>
+        <div class="m" id="bio-roll"><small>Head tilt</small><span>–</span></div>
+        <div class="m" id="bio-hands"><small>Hands</small><span>–</span></div>
+      </div>
+      <h3>Facial colour</h3>
+      <div class="grid">
+        <div class="m" id="bio-color"><small>Colour change</small><span>–</span></div>
+      </div>
+      <div id="rgb-panel" hidden>
+        <p id="rgb-light" role="status"></p>
+        <div class="grid">
+          <div class="m" id="rgb-cheek_right"><small>Right cheek</small><span>–</span></div>
+          <div class="m" id="rgb-cheek_left"><small>Left cheek</small><span>–</span></div>
+          <div class="m" id="rgb-forehead"><small>Forehead</small><span>–</span></div>
+          <div class="m" id="rgb-lips"><small>Lips</small><span>–</span></div>
+        </div>
+        <h3>Individual RGB readings</h3>
+        <ul id="rgb-observations">
+          <li class="m" id="rgb-result-cheek_redness"><small>Cheek redness</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p><p class="rgb-evidence" hidden></p></li>
+          <li class="m" id="rgb-result-cheek_color_reduction"><small>Reduced cheek colour</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p></li>
+          <li class="m" id="rgb-result-lip_tone_shift"><small>Lip tone</small><strong>Waiting for measurements</strong><p class="rgb-finding" hidden></p></li>
+        </ul>
+        <p id="rgb-last" hidden></p>
+      </div>
+      <p class="bio-note">Indicative camera signals, not a medical diagnosis.</p>
+    </section>
     <div class="card">
       <h2>Co-pilot</h2>
       <div id="check" role="status" hidden></div>
@@ -245,6 +275,7 @@ function onState(s) {
   renderCheck(s.check);
   renderGestures(s.discomfort || {});
   renderRgb(s.rgb || {});
+  renderBiometrics(s);
   const now = Date.now() / 1000;
   const bpm = p.bpm || null, sure = bpm && trust.label && trust.label !== 'unreliable';
   hist.push({ t: now, drow, dist, bpm, bpmOk: sure ? bpm : null });
@@ -260,6 +291,56 @@ function pulseProgress(p) {
     face_not_visible: 'Face not detected', estimation_failed: 'Estimate unavailable',
   };
   return statuses[p.reason] || 'Waiting for an estimate';
+}
+
+const healthFindings = {
+  possible_presyncope: 'Possible fainting signs: pale cheeks, eyes closed and a slow pulse.',
+  pallor_and_eye_closure: 'Pale cheeks together with prolonged eye closure.',
+  combined_discomfort_signals: 'Discomfort grimace with a colour change or an unusual pulse.',
+  color_and_pulse_change: 'Facial colour change with a pulse outside the usual range.',
+  drowsiness: 'Signs of drowsiness.',
+  no_combined_pattern: 'No combined pattern observed.',
+  face_unavailable: 'Face not visible.',
+  camera_unavailable: 'Camera unavailable.',
+};
+
+function renderBiometrics(s) {
+  const d = s.driver_signals || {}, p = s.pulse || {}, a = s.attention || {};
+  let text = healthFindings[d.finding] || 'Waiting for camera data.';
+  if (d.finding === 'partial_signals') {
+    const missing = [];
+    if (d.pulse === 'unavailable') missing.push('a reliable pulse');
+    if (d.color === 'disabled') missing.push('colour (start with --rgb)');
+    else if (d.color === 'unavailable') missing.push('colour');
+    if (d.expression === 'unavailable') missing.push('facial expression');
+    text = missing.length ? `No combined pattern · waiting for ${missing.join(', ')}.` : healthFindings.no_combined_pattern;
+  }
+  if ($('bio-finding').textContent !== text) $('bio-finding').textContent = text;
+  $('bio').dataset.flag = ['possible_presyncope', 'pallor_and_eye_closure', 'combined_discomfort_signals',
+                           'color_and_pulse_change'].includes(d.finding);
+
+  const range = { slow: 'slow', fast: 'fast', typical: 'typical' };
+  set('bio-bpm', d.bpm != null ? `${d.bpm} bpm · ${range[d.pulse]}` : 'no reliable reading', d.pulse === 'slow' || d.pulse === 'fast');
+  set('bio-snr', p.snr != null ? `${p.snr > 0 ? '+' : ''}${p.snr} dB` : '–', p.snr != null && p.snr < 0);
+  const still = p.trust?.parts?.stillness;
+  set('bio-still', still != null ? `${Math.round(still * 100)}%` : '–', still != null && still < 0.5);
+  ['forehead', 'cheek_right', 'cheek_left'].forEach((name, k) => {
+    const bpm = (p.regions_bpm || [])[k], q = (p.region_quality || {})[name];
+    set(`bio-${name}`, bpm != null ? `${bpm} bpm` : q ? `– (${Math.round((q.coverage || 0) * 100)}% visible)` : '–');
+  });
+  const notes = [];
+  if (p.fps) notes.push(`${p.fps} samples/s over ${p.window_s} s`);
+  if (p.trust?.reasons?.length) notes.push('trust lowered by: ' + p.trust.reasons.join(', '));
+  $('bio-pulse-note').textContent = notes.join(' · ');
+
+  set('bio-fatigue', !a.face_present ? '–' : a.microsleep ? 'MICROSLEEP' : a.eyes_closing ? 'eyes closing'
+      : a.tired ? 'tired (trend)' : 'none', a.microsleep || a.eyes_closing || a.tired);
+  set('bio-roll', a.roll != null ? `${Math.round(a.roll)}°` : '–', a.roll != null && Math.abs(a.roll) >= 25);
+  set('bio-hands', a.hand_off_wheel ? 'both off the wheel' : a.face_present ? 'on the wheel' : '–', a.hand_off_wheel);
+
+  const colorText = { pallor: 'paler cheeks', lip_tone: 'lip tone changed', redness: 'redder cheeks',
+                      no_change: 'no change', unavailable: 'not measurable now', disabled: 'off · start with --rgb' };
+  set('bio-color', colorText[d.color] || '–', ['pallor', 'lip_tone', 'redness'].includes(d.color));
 }
 
 const rgbStatus = {
