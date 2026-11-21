@@ -90,6 +90,17 @@
   .params .m small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .col { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
 
+  /* focus mode: the dashboard slides out to the left, the co-pilot chat glides to the middle (--dx set in JS) */
+  main { position: relative; }
+  .left, .center { transition: transform .65s cubic-bezier(.65, 0, .35, 1), opacity .5s ease, visibility 0s; }
+  body.focus .left { transform: translateX(calc(-100% - 60px)); opacity: 0; visibility: hidden; pointer-events: none;
+                     transition: transform .65s cubic-bezier(.65, 0, .35, 1), opacity .5s ease, visibility 0s .65s; }
+  body.focus .center { transform: translateX(var(--dx, 0px)); }
+  #layout { display: inline-grid; place-items: center; width: 32px; padding: 6px 0; }
+  #layout svg { width: 14px; height: 14px; display: block; transition: transform .65s cubic-bezier(.65, 0, .35, 1); }
+  body.focus #layout svg { transform: rotate(180deg); }
+  body.focus #layout { color: var(--text); border-color: color-mix(in srgb, var(--c2) 60%, transparent); }
+
   /* frosted glass card */
   /* structural regions: heavier, darker material (Apple: weight encodes hierarchy); the chat stays lighter */
   .card { background: linear-gradient(180deg, rgba(22,25,34,.72), rgba(12,14,20,.62));
@@ -228,6 +239,9 @@
     .orb { width: min(22vw, 120px); }
     .thread { flex: none; min-height: 140px; max-height: 42vh; max-width: none; }
     .pill { max-width: none; position: sticky; bottom: 12px; z-index: 2; }   /* the input stays in reach while scrolling */
+    body.focus .left { transform: none; }
+    body.focus .cam, body.focus .params { display: none; }   /* one column already: focus just drops the dashboard */
+    body.focus .center { transform: none; }
   }
   /* phones */
   @media (max-width: 600px) {
@@ -249,6 +263,7 @@
   /* big desktop screens: keep the two columns from stretching too far */
   @media (min-width: 1800px) { main { max-width: 1760px; width: 100%; margin: 0 auto; } }
   @media (prefers-reduced-motion: reduce) {
+    .left, .center, #layout svg { transition-duration: .01s !important; }
     .orb i, .orb, #mic.listening::after { animation: none !important; }
     .bubble { animation: fade .2s ease both; } .typing .dots span { animation: none; opacity: .9; }
     @keyframes fade { from { opacity: 0; } }
@@ -267,6 +282,9 @@
   <div class="brand"><span class="logo" role="img" aria-label="FastGears logo"></span><div><b>Fast</b><span>Gears</span></div></div>
   <div class="chips">
     <span class="chip" id="fps">–</span>
+    <button class="ghost" id="layout" aria-pressed="false" aria-label="Hide dashboard" title="Hide dashboard: chat only">
+      <svg viewBox="0 0 14 14" aria-hidden="true"><path d="M10.5 1.5 3 7l7.5 5.5z" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+    </button>
     <button class="ghost on" id="voice" aria-pressed="true">Voice on</button>
     <button class="ghost" id="freq" aria-haspopup="dialog" aria-expanded="false" aria-controls="freq-panel" title="How often the co-pilot speaks">Messages</button>
     <button class="ghost" id="recal" title="Look at the road for a few seconds">Recalibrate</button>
@@ -678,6 +696,22 @@ $('voice').onclick = () => {
     speechSynthesis.speak(Object.assign(new SpeechSynthesisUtterance('Voice on'), { lang: 'en-US' }));
   }
 };
+// layout switch: slide the dashboard away and centre the chat, or bring it back (remembered across reloads)
+const LAYOUT_KEY = 'fastgears.copilot.focus';
+function centreOffset() {   // distance from the chat column's centre to the middle of the screen (ignores transforms)
+  const c = document.querySelector('.center'), m = document.querySelector('main');
+  document.body.style.setProperty('--dx', (m.clientWidth / 2 - (c.offsetLeft + c.offsetWidth / 2)) + 'px');
+}
+function applyFocus(on) {
+  centreOffset();
+  document.body.classList.toggle('focus', on);
+  const b = $('layout'), label = on ? 'Show dashboard' : 'Hide dashboard: chat only';
+  b.setAttribute('aria-pressed', on); b.setAttribute('aria-label', on ? 'Show dashboard' : 'Hide dashboard'); b.title = label;
+  try { localStorage.setItem(LAYOUT_KEY, on ? '1' : '0'); } catch (e) {}
+}
+$('layout').onclick = () => applyFocus(!document.body.classList.contains('focus'));
+window.addEventListener('resize', centreOffset);
+try { if (localStorage.getItem(LAYOUT_KEY) === '1') applyFocus(true); } catch (e) {}
 // while this page is open it is the one that talks; the dashboard stays quiet so nothing is read twice
 setInterval(() => voiceBus?.postMessage({ copilot: Date.now() }), 2000);
 voiceBus?.postMessage({ copilot: Date.now() });
