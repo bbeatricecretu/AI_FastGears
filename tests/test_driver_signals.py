@@ -69,3 +69,24 @@ def test_camera_loss_clears_stale_attention_and_combined_finding(monkeypatch):
     assert not state["attention"]["face_present"]
     assert not state["attention"]["microsleep"]
     assert state["driver_signals"] == {"finding": "camera_unavailable"}
+
+
+def test_pulse_thread_uses_the_latest_driver_face_until_it_goes_stale(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import numpy as np
+
+    from fastgears.config import Settings
+    from fastgears.pipeline import RPPG_FACE_MAX_AGE_S, Pipeline
+
+    monkeypatch.setattr("fastgears.vision.face.FaceTracker", lambda **kwargs: None)
+    pipeline = Pipeline(Settings(enable_rppg=False, enable_objects=False, enable_rgb=False, enable_hands=False))
+    pipeline.rppg = Mock()
+    face = SimpleNamespace(eyes=(1.0, 2.0, 3.0), landmarks_px=np.zeros((478, 3)))
+    pipeline._rppg_face = (face, 10.0)
+    frame = np.zeros((4, 4, 3), np.uint8)
+    pipeline._feed_rppg(frame, 10.0 + RPPG_FACE_MAX_AGE_S / 2)
+    assert pipeline.rppg.update.call_args.args[1] == face.eyes
+    pipeline._feed_rppg(frame, 10.0 + RPPG_FACE_MAX_AGE_S + 0.1)
+    assert pipeline.rppg.update.call_args.args[1] is None
