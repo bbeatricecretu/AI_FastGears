@@ -9,6 +9,12 @@ there, whether the danger is still on. The answer and that reaction are then jud
   * camera not ok   -> say why and ask another question (up to MAX_ROUNDS)
   * still not ok    -> final alert: stop at the next safe place
 
+Two kinds of question, alternated on round 1 (odd check-ins: road, even: check); follow-up rounds
+always use a check question:
+  * road   "What colour is the car in front?" pulls the eyes back to the road. Nobody can verify the
+           answer, so only whether it is a real answer counts.
+  * check  "What is seven plus five?" has one right answer, so a wrong one shows the mind isn't back yet.
+
 The camera decides whether to ask again; the answer is optional. A driver who is clearly back on
 the road is not asked again just because the mic missed the answer.
 
@@ -21,6 +27,7 @@ the Coach runs the judge call on its own thread so the video loop never waits fo
 from __future__ import annotations
 
 import json
+import re
 import threading
 
 ANSWER_TIMEOUT_S = 20.0     # question spoken (~3 s) + time to answer + transcription (~2 s)
@@ -30,7 +37,7 @@ REACT_GRACE_S = 2.0         # the first seconds after the question are reaction 
 ON_ROAD_SHARE_OK = 0.6      # eyes on the road at least this share of the judged window
 MIN_ANSWER_CHARS = 2
 
-QUESTIONS = (
+QUESTIONS = (            # road questions: can't be verified, they bring the eyes back
     "What is directly ahead of you right now?",
     "What colour is the vehicle in front of you?",
     "What was the last road sign you passed?",
@@ -38,14 +45,35 @@ QUESTIONS = (
     "Is anything on the road ahead you need to watch for?",
 )
 
+# check questions: one right answer, trivial on purpose (a driver must not be overloaded).
+# Accepted answers are matched as whole words of the reply, so "it's twelve" passes.
+CHECK_QUESTIONS = (
+    ("What is seven plus five?", ("12", "twelve")),
+    ("What is three plus four?", ("7", "seven")),
+    ("What is ten minus two?", ("8", "eight")),
+    ("Which day comes after Monday?", ("tuesday",)),
+    ("How many wheels does a car have?", ("4", "four")),
+    ("What is two plus six?", ("8", "eight")),
+)
+WRONG_MSG = "That's not right. Stay with me."
+
+
+def answer_matches(answer: str | None, expected) -> bool:
+    words = set(re.findall(r"[a-z0-9]+", (answer or "").lower()))
+    return any(e in words for e in expected)
+
+
 JUDGE_PROMPT = """You are FastGears, an in-car co-pilot running an alertness check, in {language}.
 The driver was just in danger ({hazard}). You asked a question about the road. You get ONE combined
 picture of the driver: their answer, how fast and how clearly they gave it, and their camera-measured
 behaviour while answering. Judge them as a whole: answer AND behaviour together.
 - Every measurement comes with a "band" that is already computed: trust the bands, don't re-derive
   them from the numbers. A "fast" or "normal" reply is never too slow.
-- Short answers are fine ("a red car", "two lanes", "empty road"). You cannot see the road: never
-  doubt whether the answer is true; only whether it is a real answer to the question.
+- "question_type" tells you which kind of question it was:
+  * "road": short answers are fine ("a red car", "two lanes", "empty road"). You cannot see the road:
+    never doubt whether the answer is true; only whether it is a real answer to the question.
+  * "check": it has one right answer, given as "correct_answer". A wrong answer means the driver is
+    not yet alert (follow_up). Accept any language or wording ("twelve", "it's 12", "doisprezece").
 - Weigh it: a good answer with eyes on the road and no tiredness = alert. A good answer but tired
   behaviour = alert for now, recommend a break. Eyes still off the road, eyes closing, a nonsense
   answer or no answer = not yet alert.
@@ -53,11 +81,10 @@ behaviour while answering. Judge them as a whole: answer AND behaviour together.
 Choose the next action:
   "continue"  alert: end the check, short thanks
   "break"     alert enough to continue but tired: end the check, tell them to plan a break soon
-  "follow_up" not yet alert: say why in a few words and ask a new short question about the road
+  "follow_up" not yet alert: say why in a few words (the co-pilot then asks the next question itself)
   "stop"      clearly unfit (e.g. worse every round): tell them to stop at the next safe place
 Reply ONLY with JSON: {{"action": "continue|break|follow_up|stop",
-"message": "<at most 15 words to say now; name the real reason>",
-"next_question": "<only for follow_up: a new short question about the road ahead>"}}"""
+"message": "<at most 15 words to say now; name the real reason; no question>"}}"""
 
 PASS_MSG = "Thanks, you're back with me. Keep your eyes on the road."
 BREAK_MSG = "Good answer. Your eyes still show tiredness, so plan a break soon."
@@ -84,8 +111,12 @@ def evidence(job: dict) -> dict:
         rt_band = "not measured"
     else:
         rt_band = "very slow" if rt >= VERY_SLOW_ANSWER_S else "slow" if rt >= SLOW_ANSWER_S else "fast" if rt < 2 else "normal"
+    kind = job.get("kind", "road")
+    q = {"question": job["question"], "question_type": kind}
+    if kind == "check":
+        q["correct_answer"] = (job.get("expected") or ["?"])[0]
     return {
-        "question": job["question"],
+        **q,
         "answer": job.get("answer") or "(no answer)",
         "reply": {"time_s": rt, "band": rt_band,
                   "voice": voice or "typed or not analysed"},
@@ -133,9 +164,16 @@ def rule_verdict(job: dict) -> dict:
     # slow statistics (PERCLOS, yawns over 5 min) can't recover in a 20 s check: they don't fail it,
     # they turn the pass into a break recommendation
     if r.get("tired") or r.get("drowsiness_avg", 0.0) >= STAT_CAUTION:
-        return {"ok": True, "cv_ok": True, "action": "break", "message": BREAK_MSG, "next_question": ""}
-    return {"ok": True, "cv_ok": True, "action": "continue", "message": PASS_MSG if answered else "",
-            "next_question": ""}
+        v = {"ok": True, "cv_ok": True, "action": "break", "message": BREAK_MSG, "next_question": ""}
+    else:
+        v = {"ok": True, "cv_ok": True, "action": "continue", "message": PASS_MSG if answered else "",
+             "next_question": ""}
+    # a check question answered wrong: not back yet. Word matching is English-only and literal, so
+    # this one is soft: with an LLM present, the LLM judges correctness instead (see merge_verdict)
+    if answered and job.get("kind") == "check" and not answer_matches(ans, job.get("expected") or ()):
+        return {"ok": False, "cv_ok": True, "action": "follow_up", "message": WRONG_MSG,
+                "next_question": "", "wrong_answer": True, "camera_verdict": v}
+    return v
 
 
 def parse_judge(text: str) -> dict | None:
@@ -163,6 +201,8 @@ def merge_verdict(rule: dict, llm: dict | None) -> dict:
     hard limits (a driver the camera says is not back can't pass; measured tiredness keeps its break)."""
     if llm is None:
         return {**rule, "source": "rules"}
+    if rule.get("wrong_answer"):            # the LLM reads the answer better than word matching
+        rule = rule["camera_verdict"]
     llm = {**llm, "action": llm.get("action") or ("continue" if llm["ok"] else "follow_up")}
     action = max(rule.get("action", "continue"), llm["action"], key=_SEVERITY.get)
     if rule["ok"] and not llm["ok"]:
@@ -189,12 +229,15 @@ class CheckIn:
         self.round = 0
         self.hazard: str | None = None
         self.question: str | None = None
+        self.kind = "road"
+        self.expected: tuple[str, ...] = ()
         self.asked_at: float | None = None
         self.rounds: list[dict] = []
         self._samples: list[tuple[float, bool, str, bool]] = []   # t, on_road, level, microsleep
         self._stats: list[tuple[float, float, bool, bool]] = []   # drowsiness, distraction, tired, eyes_closing
         self._ended_at = -1e9
         self._q_next = 0
+        self._c_next = 0
         self._lock = threading.Lock()
 
     @property
@@ -210,12 +253,17 @@ class CheckIn:
         cd = self.cooldown_s if cooldown_s is None else min(self.cooldown_s, cooldown_s)
         return self.phase == "idle" and now - self._ended_at >= cd
 
-    def _pick_question(self) -> str:
+    def _pick_question(self, kind: str) -> tuple[str, str, tuple[str, ...]]:
+        if kind == "check":
+            q, expected = CHECK_QUESTIONS[self._c_next % len(CHECK_QUESTIONS)]
+            self._c_next += 1
+            return q, kind, expected
         q = QUESTIONS[self._q_next % len(QUESTIONS)]
         self._q_next += 1
-        return q
+        return q, kind, ()
 
-    def _ask(self, question: str, now: float, lead: str = "") -> dict:
+    def _ask(self, picked: tuple[str, str, tuple[str, ...]], now: float, lead: str = "") -> dict:
+        question, self.kind, self.expected = picked
         self.phase, self.question, self.asked_at = "waiting", question, now
         self._samples, self._stats = [], []
         return {"message": f"{lead} {question}".strip(), "severity": "warning", "reason": "check-in",
@@ -227,7 +275,8 @@ class CheckIn:
                 return None
             self.id += 1
             self.round, self.hazard, self.rounds = 1, hazard, []
-            return self._ask(self._pick_question(), now)
+            # round 1 alternates: odd check-ins a road question, even ones a check question
+            return self._ask(self._pick_question("road" if self.id % 2 else "check"), now)
 
     def observe(self, state: dict, now: float, hold: bool = False) -> dict | None:
         """Record the driver's reaction; returns a judge job when the answer time runs out.
@@ -269,6 +318,7 @@ class CheckIn:
         self.phase = "judging"
         return {"check_id": self.id, "round": self.round, "max_rounds": self.max_rounds,
                 "hazard": self.hazard, "question": self.question, "answer": answer,
+                "kind": self.kind, "expected": list(self.expected),
                 "answer_latency_s": None if answer is None else round(now - self.asked_at, 1),
                 "reaction": self._reaction(now), "previous_rounds": list(self.rounds)}
 
@@ -290,11 +340,12 @@ class CheckIn:
                 self._end(now)
                 return [{"message": STOP_MSG, "severity": "alert", "reason": "check-in failed", "source": src}]
             self.round += 1
-            q = verdict.get("next_question") or self._pick_question()
-            return [{**self._ask(q, now, lead=verdict["message"]), "source": src}]
+            # follow-ups are always check questions: their answer can be verified
+            return [{**self._ask(self._pick_question("check"), now, lead=verdict["message"]), "source": src}]
 
     def _end(self, now: float) -> None:
         self.phase, self.question, self.asked_at = "idle", None, None
+        self.kind, self.expected = "road", ()
         self._ended_at = now
 
     def status(self, now: float) -> dict:
@@ -305,4 +356,5 @@ class CheckIn:
             if self.phase == "waiting":
                 left = max(0.0, round(self.answer_timeout_s - (now - self.asked_at), 1))
             return {"active": True, "phase": self.phase, "round": self.round, "max_rounds": self.max_rounds,
-                    "hazard": self.hazard, "question": self.question, "seconds_left": left}
+                    "hazard": self.hazard, "question": self.question, "question_type": self.kind,
+                    "seconds_left": left}

@@ -411,3 +411,53 @@ def test_ongoing_danger_gets_a_new_question_instead_of_repeated_alerts():
     questions = [m for m in got if m.get("reason") == "check-in"]
     assert len(questions) == 2                             # asked again once the alert repeated
     assert sum(m.get("source") == "instant" for m in got) <= 3
+
+
+def _answer_round(ck, t, answer):
+    for i in range(1, 5):
+        ck.observe(road(), t + i)
+    return ck.answer(answer, t + 5)
+
+
+def test_round_one_alternates_road_and_check_questions():
+    from fastgears.llm.intervention import CHECK_QUESTIONS, QUESTIONS
+    ck = CheckIn(cooldown_s=0)
+    kinds = []
+    for n in range(4):
+        q = ck.start("eyes off road", n * 100.0)
+        kinds.append(ck.kind)
+        assert q["message"] in (QUESTIONS if ck.kind == "road" else [c[0] for c in CHECK_QUESTIONS])
+        job = _answer_round(ck, n * 100.0, "12 a red car")
+        ck.resolve(job, {"ok": True, "action": "continue", "message": ""}, n * 100.0 + 6)
+    assert kinds == ["road", "check", "road", "check"]
+
+
+def test_wrong_check_answer_fails_right_one_passes_without_llm():
+    ck = CheckIn(cooldown_s=0)
+    ck.start("eyes off road", 0.0)                                 # check-in 1: road, anything goes
+    job = _answer_round(ck, 0.0, "a purple elephant")
+    assert rule_verdict(job)["ok"]
+    ck.resolve(job, merge_verdict(rule_verdict(job), None), 6.0)
+    ck.start("eyes off road", 10.0)                                # check-in 2: "What is seven plus five?"
+    assert ck.kind == "check" and ck.expected == ("12", "twelve")
+    job = _answer_round(ck, 10.0, "eleven")
+    v = merge_verdict(rule_verdict(job), None)
+    assert not v["ok"] and v["message"] == "That's not right. Stay with me."
+    out = ck.resolve(job, v, 16.0)
+    assert out[0]["expects_answer"] and ck.round == 2 and ck.kind == "check"   # follow-up is a check question
+    job = _answer_round(ck, 20.0, "it's seven")                    # "What is three plus four?"
+    assert merge_verdict(rule_verdict(job), None)["ok"]
+
+
+def test_llm_judges_check_answers_in_any_wording_but_camera_floor_stays():
+    from fastgears.llm.intervention import evidence, parse_judge
+    job = {"kind": "check", "expected": ["12", "twelve"], "question": "What is seven plus five?",
+           "answer": "doisprezece", "round": 1, "max_rounds": 3,
+           "reaction": {"level_now": "ok", "on_road_share": 1.0, "microsleep": False}}
+    e = evidence(job)
+    assert e["question_type"] == "check" and e["correct_answer"] == "12"
+    assert not rule_verdict(job)["ok"]                               # word matching misses it ...
+    llm = parse_judge('{"action": "continue", "message": "Correct, thanks."}')
+    assert merge_verdict(rule_verdict(job), llm)["ok"]              # ... the LLM accepts it
+    job["reaction"]["on_road_share"] = 0.1                           # eyes off the road: still a fail
+    assert not merge_verdict(rule_verdict(job), llm)["ok"]
