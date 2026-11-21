@@ -19,6 +19,7 @@ log = logging.getLogger("phone_check")
 VISION_EVERY_S = 5.0     # free-tier friendly (~12 requests/min while a hand is up)
 VISION_VALID_S = 4.0
 VISION_MIN_CONF = 0.6
+VISION_TIMEOUT_S = 15.0
 PROMPT = ("You are checking a driver-monitoring camera frame. Is the person holding, looking at, "
           "or using a mobile phone (any orientation: screen, back, edge-on, at the ear)? "
           'Reply only JSON: {"phone": true|false, "confidence": 0.0-1.0}')
@@ -29,7 +30,8 @@ class VisionPhoneCheck:
         from google import genai
         from google.genai import types
         self._types = types
-        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            api_version="v1beta", timeout=int(VISION_TIMEOUT_S * 1000)))   # a stalled call must not keep _busy set
         self.model = model
         self._busy = False
         self._last_call = -1e9

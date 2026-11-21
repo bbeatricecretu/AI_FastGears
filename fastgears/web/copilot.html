@@ -604,7 +604,8 @@ function connect() {
     if (m.type === 'state') onState(m); else if (m.type === 'message') onMessage(m);
     else if (m.type === 'voice') applyVoice(m.on, false);
   };
-  setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
+  const ping = setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
+  ws.addEventListener('close', () => clearInterval(ping));   // reconnects must not pile up timers
 }
 connect();
 

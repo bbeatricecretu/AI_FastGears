@@ -36,6 +36,8 @@ AWAIT_REPLY_S = 20.0    # after a question the co-pilot stays quiet this long, w
 ANSWER_MAX_S = 30.0     # a reply being spoken/transcribed holds the floor at most this long
 INTERRUPTS_REPLY = {"microsleep"}   # the only hazard that may talk over an open question
 WARN_LLM_WAIT_S = 2.5   # a warning waits this long for the LLM's wording, then the rule text is said
+JUDGE_WAIT_S = 6.0      # a check-in verdict waits this long for the LLM, then the camera rules decide
+LLM_TIMEOUT_S = 15.0    # network timeout for every LLM call: a stalled connection must not hang a thread
 
 # Message pacing, adjustable live from the dashboard (Coach.set_tuning / POST /api/tuning).
 # Danger alerts ignore message_gap_s and warn_hold_s: they are always spoken at once.
@@ -109,7 +111,8 @@ class GeminiClient:
         from google.genai import types
         self._types = types
         # v1 rejects system_instruction ("Developer instruction is not enabled"): use v1beta
-        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            api_version="v1beta", timeout=int(LLM_TIMEOUT_S * 1000)))
         self.models = list(dict.fromkeys([model, *fallback_models]))
         self._i = 0
         self._lock = threading.Lock()
@@ -170,7 +173,7 @@ class AnthropicClient:
 
     def __init__(self, api_key: str, model: str):
         import anthropic
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=LLM_TIMEOUT_S)
         self.model = model
 
     def complete(self, system: str, user: str, json_mode: bool = False) -> str:
@@ -566,10 +569,34 @@ class Coach:
         return merge_verdict(rule, llm)
 
     def _judge_async(self, job: dict) -> None:
-        def run():
-            verdict = self.judge(job)
+        """Judge one round off the video thread. While a round is being judged the co-pilot stays
+        quiet, so the LLM gets at most JUDGE_WAIT_S: then the camera rules decide. Whichever comes
+        first is applied; resolve() ignores the second (the round is no longer "judging")."""
+        lock, done = threading.Lock(), {"v": False}
+
+        def apply(verdict: dict) -> None:
+            with lock:
+                if done["v"]:
+                    return
+                done["v"] = True
             for m in self.checkin.resolve(job, verdict, self._t):
                 self._emit(m)
+
+        def fallback() -> None:
+            apply(merge_verdict(rule_verdict(job), None))
+
+        timer = threading.Timer(JUDGE_WAIT_S, fallback)
+        timer.daemon = True
+        timer.start()
+
+        def run():
+            try:
+                verdict = self.judge(job)
+            except Exception:
+                log.exception("check-in judge crashed: camera rules decide")
+                verdict = merge_verdict(rule_verdict(job), None)
+            timer.cancel()
+            apply(verdict)
         threading.Thread(target=run, name="checkin-judge", daemon=True).start()
 
     def checkin_status(self) -> dict:

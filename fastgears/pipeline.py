@@ -304,6 +304,9 @@ class Pipeline:
                            "pulse": pulse,
                            "face_box": None,
                            "face_regions": dict.fromkeys(FACE_REGION_CONTOURS),
+                           "objects": [],          # no frame: no detections (not the last frame's)
+                           "hands": {**(self._state.get("hands") or {}), "seen": 0, "driver": 0, "free": 0,
+                                     "phone_source": None},
                            "camera": {"connected": self.camera.connected}}
 
     def _rgb_state(self, frame, face, regions, t):

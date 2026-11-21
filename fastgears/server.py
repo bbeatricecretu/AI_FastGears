@@ -33,12 +33,19 @@ class Hub:
             asyncio.run_coroutine_threadsafe(self.broadcast(msg), self.loop)
 
     async def broadcast(self, msg: dict) -> None:
-        data = json.dumps(msg)
+        data = json.dumps(msg, default=_json_default)
         for ws in list(self.clients):
             try:
                 await ws.send_text(data)
             except Exception:
                 self.clients.discard(ws)
+
+
+def _json_default(x):
+    """numpy scalars / arrays that slipped into the state: send them as plain numbers / lists."""
+    if hasattr(x, "tolist"):
+        return x.tolist()
+    raise TypeError(f"not JSON serializable: {type(x).__name__}")
 
 
 hub = Hub()
@@ -78,15 +85,22 @@ async def _state_pump():
     """Push the latest state to dashboards at 5 Hz."""
     while True:
         await asyncio.sleep(0.2)
-        if pipeline and hub.clients:
-            st = pipeline.state()
-            st["llm"] = {"provider": coach.provider, "errors": coach.llm_errors,
-                         "latency_ms": coach.last_latency_ms, "stt": coach.can_transcribe} if coach else None
-            st["engagement"] = coach.engagement.status() if coach else {"replies": 0}
-            st["awaiting_reply"] = coach.awaiting_reply(coach._t) if coach else False
-            st["check"] = coach.checkin_status() if coach else {"active": False}
-            st["voice"] = voice_on
-            await hub.broadcast({"type": "state", **st})
+        try:
+            await _push_state()
+        except Exception:   # one bad state must not stop the dashboard for good
+            log.exception("state push failed")
+
+
+async def _push_state():
+    if pipeline and hub.clients:
+        st = pipeline.state()
+        st["llm"] = {"provider": coach.provider, "errors": coach.llm_errors,
+                     "latency_ms": coach.last_latency_ms, "stt": coach.can_transcribe} if coach else None
+        st["engagement"] = coach.engagement.status() if coach else {"replies": 0}
+        st["awaiting_reply"] = coach.awaiting_reply(coach._t) if coach else False
+        st["check"] = coach.checkin_status() if coach else {"active": False}
+        st["voice"] = voice_on
+        await hub.broadcast({"type": "state", **st})
 
 
 app = FastAPI(title="FastGears driver monitor", lifespan=lifespan)
