@@ -657,7 +657,13 @@ class RPPG:
         """Thread-safe; recomputes at most once per second (lazily), otherwise cached."""
         self._refresh()
         with self._lock:
-            return {**self._result, "face": self._face is not None, "diag": dict(self._diag),
+            result = self._result
+            if (result.get("bpm") is None and self._shown is not None and self._last_frame_t is not None
+                    and self._last_frame_t - self._last_ok <= HOLD_MAX_S):
+                # face lost / window restarted: keep showing the last good pulse (main's hold)
+                result = {**result, "bpm": round(self._shown), "pulse_state": "held",
+                          "rejected": result.get("rejected") or result.get("reason")}
+            return {**result, "face": self._face is not None, "diag": dict(self._diag),
                     "sampled_monotonic_s": self._est_sample_t if self._face is not None else None}
 
     def rois(self) -> list[tuple[int, int, int, int]]:

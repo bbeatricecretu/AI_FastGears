@@ -169,8 +169,9 @@ class Pipeline:
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         regions = face_region_contours(face, frame.shape)
         rgb_state = self._rgb_state(frame, face, regions, t)
-        with self._rppg_lock:                             # the pulse thread samples every frame
-            self._rppg_face = (face, t) if face is not None else None
+        if face is not None:                              # the pulse thread samples every frame;
+            with self._rppg_lock:                         # a missed detection keeps the last face
+                self._rppg_face = (face, t)               # for up to RPPG_FACE_MAX_AGE_S
         from .vision.hands import free_hands, hand_crop, on_open_palm
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)

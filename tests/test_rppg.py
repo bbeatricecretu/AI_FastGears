@@ -200,7 +200,8 @@ def test_loss_and_long_gap_invalidate_cached_estimate():
         rppg.update(frame, FACE, t)
     assert rppg.status()["bpm"] is not None
     rppg.update(None, None, t + 0.1)
-    assert rppg.status()["bpm"] is None
+    lost = rppg.status()                       # estimate invalidated, last value only held
+    assert lost["reason"] == "face_not_visible" and lost["pulse_state"] == "held"
     rppg.update(frame, FACE, t + 0.6)
     assert rppg.status()["reason"] == "sampling_gap"
 
@@ -288,3 +289,16 @@ def test_weak_regions_fall_back_to_main_pooled_estimate():
     assert result["method"] == "pooled" and abs(result["bpm"] - 72) <= 3 and result["snr"] >= 0
     out = RPPG()._filter(result, 10.0)
     assert out["pulse_state"] == "tracking" and out["bpm"] == result["bpm"]
+
+
+def test_shown_pulse_is_held_through_a_face_loss():
+    r = RPPG()
+    for frame, t in _frames(seconds=10.0):
+        r.update(frame, FACE, t)
+    first = r.status()
+    assert first["pulse_state"] == "tracking"
+    r.update(frame, None, t + 1.0)                       # face lost: window reset
+    held = r.status()
+    assert held["bpm"] == first["bpm"] and held["pulse_state"] == "held"
+    r.update(frame, None, t + 20.0)                      # longer than HOLD_MAX_S
+    assert r.status()["bpm"] is None
