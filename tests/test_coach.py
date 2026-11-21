@@ -251,3 +251,51 @@ def test_calm_drive_gets_an_occasional_conversation_opener():
     c.chat("all fine", st())                                       # talking resets the idle timer
     c.observe(st(), now=900.0)
     assert sum(m.get("reason") == "conversation" for m in got) == 1
+
+
+# ── message pacing ──────────────────────────────────────────────────────────────
+
+def test_warnings_are_spaced_by_message_gap():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, message_gap_s=12)
+    c.observe(st(phone=True, level="caution"), now=100.0)                 # warning spoken
+    c.observe(st(tired=True, level="caution"), now=103.0)                 # other warning: too soon
+    assert [m["reason"] for m in got] == ["phone in use"]
+    c.observe(st(tired=True, level="caution"), now=113.0)                 # gap over: now it is said
+    assert [m["reason"] for m in got] == ["phone in use", "signs of fatigue"]
+
+
+def test_danger_alert_ignores_message_gap():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, message_gap_s=60)
+    c.observe(st(phone=True, level="caution"), now=100.0)
+    c.observe(st(microsleep=True, level="danger"), now=101.0)
+    assert [m["severity"] for m in got] == ["warning", "alert"]
+
+
+def test_flickering_warning_needs_hold_time():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, warn_hold_s=1.5)
+    c.observe(st(phone=True, level="caution"), now=100.0)
+    c.observe(st(), now=100.5)
+    assert got == []                                                      # a blip stays silent
+    c.observe(st(phone=True, level="caution"), now=101.0)
+    c.observe(st(phone=True, level="caution"), now=101.6)                 # same episode, held 1.6 s
+    assert [m["reason"] for m in got] == ["phone in use"]
+
+
+def test_presets_and_custom_tuning():
+    c = Coach(None, lambda m: None, checkin=CheckIn())
+    t = c.set_tuning("quiet")
+    assert t["preset"] == "quiet" and t["values"]["message_gap_s"] == 25 and c.checkin.cooldown_s == 180
+    t = c.set_tuning(message_gap_s=999, questions=False)                  # clamped, now custom
+    assert t["preset"] == "custom" and t["values"]["message_gap_s"] == 120 and not t["values"]["questions"]
+    assert c.set_tuning("normal")["preset"] == "normal"
+
+
+def test_questions_can_be_switched_off():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, checkin=CheckIn())
+    c.set_tuning(questions=False)
+    c.observe(st(microsleep=True, level="danger"), now=100.0)
+    assert [m["source"] for m in got] == ["instant"] and not c.checkin.active

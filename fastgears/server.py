@@ -63,6 +63,11 @@ async def lifespan(app: FastAPI):
                   checkin=CheckIn(settings.checkin_answer_s, settings.checkin_max_rounds,
                                   settings.checkin_cooldown_s) if settings.checkin else None,
                   convo_idle_s=settings.convo_idle_s)
+    try:
+        coach.set_tuning(settings.message_preset)
+    except ValueError:
+        log.warning("MESSAGE_PRESET=%s unknown: using normal", settings.message_preset)
+        coach.set_tuning("normal")
     pipeline = Pipeline(settings, on_state=_on_state).start()
     task = asyncio.create_task(_state_pump())
     log.info("dashboard: http://%s:%d  (LLM: %s)", settings.host, settings.port, coach.provider)
@@ -117,6 +122,29 @@ def messages():
 def recalibrate():
     pipeline.recalibrate()
     return {"ok": True}
+
+
+class TuningIn(BaseModel):
+    preset: str | None = None
+    message_gap_s: float | None = None
+    warn_hold_s: float | None = None
+    alert_repeat_s: float | None = None
+    summary_every_s: float | None = None
+    question_cooldown_s: float | None = None
+    questions: bool | None = None
+
+
+@app.get("/api/tuning")
+def get_tuning():
+    return coach.tuning()
+
+
+@app.post("/api/tuning")
+def set_tuning(body: TuningIn):
+    try:
+        return coach.set_tuning(**body.model_dump())
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 class ChatIn(BaseModel):

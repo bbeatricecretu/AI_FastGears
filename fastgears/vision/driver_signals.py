@@ -43,7 +43,6 @@ def assess_driver(t, attention, gestures, rgb, pulse):
 
     bpm = pulse.get("bpm")
     trusted = ((pulse.get("trust") or {}).get("label") == "reliable"
-               and pulse.get("pulse_state", "tracking") in ("tracking", "held")
                and _fresh(pulse.get("sampled_monotonic_s"), t, 2.0))
     bpm = bpm if trusted else None
     pulse_state = "unavailable"

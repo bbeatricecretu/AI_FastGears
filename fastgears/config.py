@@ -40,11 +40,11 @@ class Settings:
 
     # detectors
     enable_rppg: bool = _bool("ENABLE_RPPG", True)
-    rppg_compare: bool = _bool("RPPG_COMPARE", False)   # debug: also run main's box ROIs, as pulse_boxes
     enable_objects: bool = _bool("ENABLE_OBJECTS", True)
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     driver_seat: str = os.getenv("DRIVER_SEAT", "left").lower()   # auto | left | right (as on screen)
+    enable_hands: bool = _bool("ENABLE_HANDS", True)
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
     discomfort_overlap_s: float = float(os.getenv("DISCOMFORT_OVERLAP_S", "0.3"))
     enable_rgb: bool = _bool("ENABLE_RGB", False)
@@ -70,6 +70,8 @@ class Settings:
     checkin_max_rounds: int = int(os.getenv("CHECKIN_MAX_ROUNDS", "3"))
     checkin_cooldown_s: float = float(os.getenv("CHECKIN_COOLDOWN_S", "30"))
     convo_idle_s: float = float(os.getenv("CONVO_IDLE_S", "600"))   # co-pilot starts a chat after this long (0 = off)
+    # message pacing preset at start-up (quiet | normal | talkative); tunable live on the dashboard
+    message_preset: str = os.getenv("MESSAGE_PRESET", "normal").strip().lower()
 
 
 settings = Settings()

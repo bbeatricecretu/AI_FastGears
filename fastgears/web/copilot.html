@@ -352,10 +352,23 @@ function onState(s) {
   tile('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–', '');
   tile('m-check', ck.active ? (ck.phase === 'judging' ? 'checking…' : `Q ${ck.round}/${ck.max_rounds} · ${Math.ceil(ck.seconds_left ?? 0)} s`) : 'idle', ck.active ? 'warn' : '');
 
-  tile('m-pulse', p.bpm ? `${Math.round(p.bpm)} bpm${p.pulse_state === 'held' ? ' · held' : ''}` : (p.pulse_state || '–'), '');
+  tile('m-pulse', p.bpm ? `${Math.round(p.bpm)} bpm` : pulseProgress(p), '');
+  $('m-pulse').title = p.reason ? pulseProgress(p) : '';
   tile('m-expr', ds.expression || '–', '');
   tile('m-driver', d.status || '–', d.locked ? '' : 'warn');
   tile('m-people', d.passengers ?? 0, '');
+}
+
+// pulse progress text, same wording as the dashboard (main_final's estimator reasons)
+function pulseProgress(p) {
+  const statuses = {
+    collecting: `Measuring (${p.window_s || 0} s)`, sampling_gap: 'Frames interrupted',
+    insufficient_samples: 'Too few frames', low_sample_rate: 'Too few frames per second',
+    insufficient_regions: 'Weak signal in the face regions',
+    regions_disagree: 'Face regions disagree on the pulse',
+    face_not_visible: 'Face not detected', estimation_failed: 'Estimate unavailable',
+  };
+  return statuses[p.reason] || 'Waiting for an estimate';
 }
 
 // ── live suggestion: text + voice ──

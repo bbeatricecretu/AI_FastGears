@@ -103,12 +103,14 @@ def test_blink_counting():
 ])
 def test_head_yaw_left_right_distracted(yaw, mirrored, label):
     mon, out, t = calibrated(mirrored=mirrored)
-    out, t1 = run(mon, t, 3.0, lambda: fake_face(yaw=yaw))
+    out, t1 = run(mon, t, 1.5, lambda: fake_face(yaw=yaw))
     assert out["looking"] == label
     assert out["distracted"] is False and out["level"] == "ok"   # a short glance alone: no alarm
-    out, _ = run(mon, t1, 17.5, lambda: fake_face(yaw=yaw))
+    out, t2 = run(mon, t1, 1.7, lambda: fake_face(yaw=yaw))
+    assert out["distracted"] is False and out["level"] == "caution"   # ~3 s off the road: caution
+    out, _ = run(mon, t2, 2.0, lambda: fake_face(yaw=yaw))
     assert out["looking"] == label
-    assert out["off_road_total_s"] >= 20.0
+    assert out["off_road_total_s"] >= 5.0
     assert out["distracted"] is True
     assert out["level"] == "danger"
     assert any(r.startswith(f"looking {label}") for r in out["reasons"])
@@ -137,10 +139,19 @@ def test_off_road_glances_add_up_over_the_window():
     assert any(r.startswith("eyes off road") for r in out["reasons"])
 
 
+def test_back_on_road_the_off_road_score_fades_within_seconds():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 14.0, lambda: fake_face(yaw=40.0))     # looked to the side for 14 s
+    assert out["level"] == "danger" and out["distracted"]
+    out, t = run(mon, t, 3.0, lambda: fake_face())              # back on the road for 3 s
+    assert out["level"] == "ok" and out["distraction"] <= 5 and out["reasons"] == []
+    assert out["off_road_total_s"] >= 13.9                       # the 30 s window still remembers it
+
+
 def test_off_road_total_leaves_the_window():
     mon, out, t = calibrated()
     out, t = run(mon, t, 15.0, lambda: fake_face(yaw=40.0))
-    out, t = run(mon, t, 61.0, lambda: fake_face())
+    out, t = run(mon, t, 31.0, lambda: fake_face())
     assert out["off_road_total_s"] == 0 and out["level"] == "ok"
 
 

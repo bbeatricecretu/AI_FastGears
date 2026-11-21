@@ -13,15 +13,15 @@ from .color import CHANNELS, REGIONS, RegionReading, compensate_light, measure, 
 
 CHEEKS = ("cheek_right", "cheek_left")
 OBSERVATIONS = {
-    "cheek_redness": "Creștere persistentă a roșeții obrajilor",
-    "cheek_color_reduction": "Reducere persistentă a colorației obrajilor",
-    "lip_tone_shift": "Schimbare persistentă a nuanței buzelor",
+    "cheek_redness": "Persistent increase in cheek redness",
+    "cheek_color_reduction": "Persistent reduction in cheek colour",
+    "lip_tone_shift": "Persistent change in lip tone",
 }
 VISIBLE_FINDINGS = {
-    "cheek_redness": "Ambii obraji apar mai roșii decât la calibrare.",
-    "cheek_color_reduction": "Ambii obraji au o colorație redusă față de reper.",
-    "blue_axis": "Culoarea buzelor s-a deplasat spre albastru față de reper.",
-    "lower_chroma": "Culoarea buzelor are o cromatică mai scăzută față de reper.",
+    "cheek_redness": "Both cheeks look redder than at calibration.",
+    "cheek_color_reduction": "Both cheeks show less colour than the baseline.",
+    "blue_axis": "Lip colour has shifted towards blue from the baseline.",
+    "lower_chroma": "Lip colour is less saturated than the baseline.",
 }
 
 

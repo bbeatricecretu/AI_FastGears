@@ -22,9 +22,9 @@ log = logging.getLogger("pipeline")
 
 COLORS = {"ok": (80, 200, 80), "caution": (0, 190, 255), "danger": (60, 60, 255)}
 PREVIEW_INTERVAL_S = 1 / 12
-# The pulse is sampled on every camera frame (~30 fps) in its own thread, with the driver's
-# latest landmarks from the (slower, ~8 fps) detector loop. The estimator needs >= 12 samples/s
-# for a trusted reading; the detector loop alone can't give that on a laptop CPU.
+# The pulse estimator (main_final's, unchanged) needs >= 12 samples/s for a trusted reading and
+# >= 8 for any reading; the detector loop runs at ~6-8 fps on a laptop CPU. So the pulse is fed
+# every camera frame (~30 fps) from its own thread, using the driver's latest landmarks.
 RPPG_FACE_MAX_AGE_S = 0.5        # landmarks older than this: no face for the pulse
 
 
@@ -35,7 +35,6 @@ class Pipeline:
         self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror,
                              backend=settings.camera_backend)
         self.face = self.rppg = self.objects = self.hands = self.vision = self.rgb = None
-        self.rppg_boxes = None
         self._hands: list = []
         self._phone_xy: tuple[float, float] | None = None   # where the driver's phone was last seen
         self._frame_i = 0
@@ -45,12 +44,13 @@ class Pipeline:
         self._last_preview_t: float | None = None
         self._state: dict = {"attention": {}, "pulse": {}, "objects": [], "status": "starting"}
         self._lock = threading.Lock()
+        self._rppg_face: tuple | None = None   # (driver FaceResult, its frame time) for the pulse thread
+        self._rppg_lock = threading.Lock()
+        self._rppg_threaded = False
         self._t0 = time.monotonic()
         self.proc_fps = 0.0
         self._stop = threading.Event()
         self._recalibrate = threading.Event()
-        self._rppg_face: tuple | None = None   # (driver FaceResult, its frame time) for the pulse thread
-        self._rppg_lock = threading.Lock()
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
@@ -71,7 +71,6 @@ class Pipeline:
                 from .vision.rppg import RPPG
                 self.rppg = RPPG(device=self.s.camera if isinstance(self.s.camera, str)
                                  and self.s.camera.startswith("/dev/video") else None)
-                self.rppg_boxes = RPPG() if self.s.rppg_compare else None
             except Exception as e:
                 self.errors["rppg"] = str(e)
                 log.exception("rPPG unavailable")
@@ -85,6 +84,7 @@ class Pipeline:
             except Exception as e:
                 self.errors["objects"] = str(e)
                 log.exception("object detector unavailable")
+        if self.s.enable_objects and self.s.enable_hands:
             try:
                 from .vision.hands import HandTracker
                 # 4: the passenger's two hands must not use up the driver's slots
@@ -92,6 +92,7 @@ class Pipeline:
             except Exception as e:
                 self.errors["hands"] = str(e)
                 log.exception("hand tracker unavailable")
+        if self.s.enable_objects:
             if self.s.phone_vision_check and self.s.llm_provider == "gemini" and self.s.gemini_api_key:
                 try:
                     from .vision.phone_check import VisionPhoneCheck
@@ -114,6 +115,7 @@ class Pipeline:
         self.camera.start()
         threading.Thread(target=self._loop, name="pipeline", daemon=True).start()
         if self.rppg:
+            self._rppg_threaded = True
             threading.Thread(target=self._rppg_loop, name="rppg", daemon=True).start()
         return self
 
@@ -143,6 +145,10 @@ class Pipeline:
                 self.driver.reset()
                 self.attention.reset_calibration()
                 self.discomfort.reset()
+                if self.rppg:
+                    with self._rppg_lock:
+                        self._rppg_face = None
+                    self.rppg.reset()
                 if self.rgb:
                     self.rgb.reset()
             seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
@@ -171,9 +177,11 @@ class Pipeline:
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         regions = face_region_contours(face, frame.shape)
         rgb_state = self._rgb_state(frame, face, regions, t)
-        if face is not None:                              # the pulse thread samples every frame;
-            with self._rppg_lock:                         # a missed detection keeps the last face
-                self._rppg_face = (face, t)               # for up to RPPG_FACE_MAX_AGE_S
+        if face is not None:                              # the pulse thread uses the newest driver face
+            with self._rppg_lock:
+                self._rppg_face = (face, t)
+        if self.rppg and not self._rppg_threaded:         # no pulse thread (tests): feed this frame
+            self._feed_rppg(frame, t)
         from .vision.hands import free_hands, hand_crop, on_open_palm
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
@@ -226,11 +234,10 @@ class Pipeline:
             "rgb": rgb_state,
             "driver_signals": assess_driver(t, att, gestures, rgb_state, pulse),
             "pulse": _jsonable(pulse),
-            **({"pulse_boxes": _jsonable(self.rppg_boxes.status())} if self.rppg_boxes else {}),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
             "driver": self.driver.state.as_dict(),
-            "hands": {"seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
+            "hands": {"available": self.hands is not None, "seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
                       "vision_calls": self.vision.calls if self.vision else 0},
             "face_regions": regions,
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
@@ -270,8 +277,6 @@ class Pipeline:
             face = None
         self.rppg.update(frame, face.eyes if face else None, t,
                          landmarks=face.landmarks_px if face else None)
-        if getattr(self, "rppg_boxes", None):              # debug comparison: main's eye-based boxes
-            self.rppg_boxes.update(frame, face.eyes if face else None, t)
 
     def _publish_no_camera(self) -> None:
         t = time.monotonic()
