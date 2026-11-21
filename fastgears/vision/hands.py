@@ -2,9 +2,13 @@
 
 Used for two things:
   * the phone is almost always *in a hand*: the object detector searches a high-resolution
-    crop around each raised hand, where an edge-on or half-covered phone is much easier to see;
-  * a hand held up at face/chest level for a while = hands off the wheel (caution), even when
-    the phone itself can't be recognised.
+    crop around each of the driver's hands, where an edge-on or half-covered phone is much
+    easier to see;
+  * hands off the wheel. A camera between the front seats sees the hands on the wheel too, so
+    a visible hand is not a free hand. A hand is *free* when its fingers are stretched out
+    (a hand on the wheel grips it: fingers curled) or it is up at the face. One hand on the
+    wheel is fine: only both hands free counts (see free_hands). A hand out of view is
+    assumed to be on the wheel.
 """
 from __future__ import annotations
 
@@ -19,6 +23,11 @@ HAND_TASK_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarke
 HAND_TASK_FILENAME = "hand_landmarker.task"
 HAND_UP_BELOW_FACE = 1.2   # hand centre above face bottom + this x face height = "raised"
 HAND_NEAR_FACE_W = 2.5     # and horizontally within this many face widths of the face
+HAND_OPEN_RATIO = 1.55     # fingertip->wrist / knuckle->wrist above this = fingers stretched (not gripping)
+HAND_AT_FACE_BELOW = 0.5   # hand centre above chin + this x face height...
+HAND_AT_FACE_W = 1.5       # ...and within this many face widths of the face centre = at the face
+HAND_EDGE_PX = 6           # a hand cut off by the frame edge: its fingers are guessed, not seen
+_TIPS, _KNUCKLES = (8, 12, 16, 20), (5, 9, 13, 17)
 
 
 @dataclass
@@ -29,6 +38,8 @@ class Hand:
     forearm: tuple[float, float] | None = None   # unit vector from the knuckles through the wrist,
                                                  # i.e. pointing down the forearm to the owner
     length: float = 0.0                          # wrist -> middle knuckle, px
+    openness: float | None = None                # mean fingertip->wrist / knuckle->wrist:
+                                                 # ~1.0 fist/gripping, ~1.9 flat open hand
 
     @property
     def centre(self) -> tuple[float, float]:
@@ -75,8 +86,39 @@ class HandTracker:
             n = (dx * dx + dy * dy) ** 0.5
             out.append(Hand((int(max(0, min(xs))), int(max(0, min(ys))),
                              int(min(w - 1, max(xs))), int(min(h - 1, max(ys)))), score,
-                            wrist=(wx, wy), forearm=(dx / n, dy / n) if n > 1 else None, length=n))
+                            wrist=(wx, wy), forearm=(dx / n, dy / n) if n > 1 else None, length=n,
+                            openness=openness(xs, ys)))
         return out
+
+
+def openness(xs, ys) -> float | None:
+    """How stretched the fingers are, from 21 hand landmarks (scale- and rotation-free)."""
+    d = lambda i: ((xs[i] - xs[0]) ** 2 + (ys[i] - ys[0]) ** 2) ** 0.5  # noqa: E731
+    knuckles = sum(d(i) for i in _KNUCKLES)
+    return None if knuckles < 1 else sum(d(i) for i in _TIPS) / knuckles
+
+
+def hand_free(hand: Hand, face, frame_shape=None) -> bool:
+    """Off the wheel: fingers stretched out, or the hand up at the face (phone at the ear,
+    rubbing eyes). A curled hand lower down is gripping the wheel; so is one cut off by the
+    frame edge (the wheel sits low in the image; the hidden fingers can't be judged)."""
+    if face is not None:
+        fx0, fy0, fx1, fy1 = face.bbox
+        fw, fh = fx1 - fx0, fy1 - fy0
+        cx, cy = hand.centre
+        if cy <= fy1 + HAND_AT_FACE_BELOW * fh and abs(cx - (fx0 + fx1) / 2.0) <= HAND_AT_FACE_W * fw:
+            return True
+    if frame_shape is not None:
+        h, w = frame_shape[:2]
+        x0, y0, x1, y1 = hand.bbox
+        if x0 <= HAND_EDGE_PX or y0 <= HAND_EDGE_PX or x1 >= w - 1 - HAND_EDGE_PX or y1 >= h - 1 - HAND_EDGE_PX:
+            return False
+    return hand.openness is not None and hand.openness >= HAND_OPEN_RATIO
+
+
+def free_hands(hands: list[Hand], face, frame_shape=None) -> list[Hand]:
+    """The driver's hands that are off the wheel. Without a face: none (can't tell whose)."""
+    return [] if face is None else [hd for hd in hands if hand_free(hd, face, frame_shape)]
 
 
 def raised_hands(hands: list[Hand], face) -> list[Hand]:

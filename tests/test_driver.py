@@ -1,3 +1,4 @@
+import pytest
 from types import SimpleNamespace
 
 from fastgears.vision.driver import DriverLock
@@ -100,3 +101,33 @@ def test_passenger_hand_stays_the_passengers():
     feed(lock, [[pas, drv]] * 6)
     hand = Hand((60, 380, 200, 560), 0.9, wrist=(130, 560), forearm=(0.0, 1.0), length=110)
     assert not lock.owns_hand(hand, drv)
+
+
+def test_left_seat_rejects_passenger_side_things_even_without_passenger_face():
+    from fastgears.vision.hands import Hand
+    lock = DriverLock(seat="left")
+    drv = face(450, 120)
+    feed(lock, [[drv]] * 6)                                       # passenger's face not detected
+    assert lock.belongs_to_driver(600, 600, drv, SHAPE)           # in front of the driver
+    assert not lock.belongs_to_driver(1100, 600, drv, SHAPE)      # passenger's phone
+    hand = Hand((1000, 400, 1100, 520), 0.9)
+    assert not lock.owns_hand(hand, drv)
+
+
+def test_driver_crop_follows_driver_and_seat():
+    lock = DriverLock(seat="left")
+    assert lock.roi(SHAPE) == (0, 0, 704, 720)                    # acquiring: the driver's half
+    drv = face(450, 120)
+    feed(lock, [[drv]] * 6)
+    x0, y0, x1, y1 = lock.roi(SHAPE)                              # tracked: around the face
+    assert x0 < 450 < x1 and x1 - x0 == pytest.approx(3.0 * 120, abs=2)
+    lock.update([], SHAPE, 10.0)                                  # lost: wider, around the seat
+    x0, _, x1, _ = lock.roi(SHAPE)
+    assert x1 - x0 == pytest.approx(4.5 * 120, abs=2)
+
+
+def test_crop_face_replaces_its_full_frame_copy():
+    a, b, crop = face(450, 120), face(1000, 120), face(455, 118)
+    merged = DriverLock.merge([a, b], crop)
+    assert merged[0] is crop and b in merged and a not in merged
+    assert DriverLock.merge([a], None) == [a]

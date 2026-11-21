@@ -87,8 +87,8 @@ PERCLOS_SCORE_MAX = 60.0         # PERCLOS is a slow 60 s trend: it can raise ca
 ACUTE_DECAY_S = 2.0              # eye-closure score fades with this time constant once eyes reopen
 YAWN_SCORE_EACH = 15.0           # drowsiness per yawn in the last 5 min (cap 60)
 PHONE_DISTRACTION = 80.0
-HAND_UP_S = 1.5                  # a hand held up at face/chest level this long...
-HAND_UP_DISTRACTION = 45.0       # ...means hands off the wheel: caution
+HAND_UP_S = 1.5                  # both hands off the wheel this long (pipeline decides "off";
+HAND_UP_DISTRACTION = 45.0       # one hand on the wheel is fine): caution
 LEVEL_CAUTION = 40.0
 LEVEL_DANGER = 70.0
 
@@ -457,7 +457,7 @@ class AttentionMonitor:
         if phone:
             reasons.append("phone in hand")
         elif hand_off:
-            reasons.append("hand off the wheel")
+            reasons.append("both hands off the wheel")
 
         worst = max(drowsiness, distraction)
         if microsleep or worst >= th["level_danger"]:

@@ -303,7 +303,7 @@ def test_hand_up_is_hand_off_wheel():
     for _ in range(40):
         t += 0.05
         out = mon.update(fake_face(), t, hand_up=True)
-    assert out["hand_off_wheel"] and "hand off the wheel" in out["reasons"] and out["level"] == "caution"
+    assert out["hand_off_wheel"] and "both hands off the wheel" in out["reasons"] and out["level"] == "caution"
 
 
 def test_head_lying_sideways_is_tilted_and_drowsy():

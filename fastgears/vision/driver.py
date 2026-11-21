@@ -14,6 +14,10 @@ In a car the driver never changes seat while driving, so the lock is *seat-based
    the learned seat position, similar size) re-acquires it.
 4. Recalibrate (dashboard button) forgets the lock and acquires again.
 
+Driver crop (roi/merge): a full-frame detector misses a face that is small in a wide view
+(camera between the front seats, ~1 m away). Each frame the pipeline also searches a crop
+around the driver's last position (or the seat half while acquiring) and merges that face in.
+
 Other faces are reported as passengers so the overlay can show them as ignored.
 """
 from __future__ import annotations
@@ -26,6 +30,13 @@ SIZE_RATIO_MAX = 1.8      # width can change at most this factor frame-to-frame 
 SEAT_TOL = 0.6            # re-acquire: |centre x - seat x| <= this many driver face widths
 SEAT_EMA = 0.02           # seat position follows the driver slowly while tracked
 MIN_FACE_FRAC = 0.04      # ignore faces narrower than 4 % of the frame (far background)
+ROI_TRACK = 3.0           # driver crop while tracked: this many face widths square
+ROI_LOST = 4.5            # wider crop around the seat while the driver is lost
+ROI_MIN_PX = 224
+SIDE_REACH = 1.5          # left/right seat: a hand or phone further than this many driver face
+                          # widths past the image midline (or past the face, if that is further)
+                          # is on the passenger's side - not the driver's, even with the
+                          # passenger's face unseen
 
 
 def _cx(f) -> float:
@@ -70,9 +81,11 @@ class DriverLock:
         self._last = None             # last driver face (bbox) while tracked
         self._seat_x: float | None = None
         self._seat_w: float | None = None
+        self._seat_y: float | None = None   # px, last driver face centre height
         self._cand = None
         self._cand_n = 0
         self._lost_since: float | None = None
+        self._frame_w: float | None = None
         self.state = DriverState()
 
     # -- selection --------------------------------------------------------------
@@ -105,6 +118,7 @@ class DriverLock:
     def update(self, faces: list, frame_shape, t: float):
         """Return the driver's face (or None) and update self.state."""
         W = float(frame_shape[1])
+        self._frame_w = W
         faces = list(faces or [])
         driver = None
 
@@ -120,6 +134,7 @@ class DriverLock:
                 if self._cand_n >= self.lock_frames:
                     driver = best
                     self._seat_x, self._seat_w = _cx(best) / W, _w(best)
+                    self._seat_y = _cy(best)
             else:
                 self._cand, self._cand_n = None, 0
         else:                                                    # ── locked
@@ -134,6 +149,7 @@ class DriverLock:
             if driver is not None:
                 self._seat_x += SEAT_EMA * (_cx(driver) / W - self._seat_x)
                 self._seat_w += SEAT_EMA * (_w(driver) - self._seat_w)
+                self._seat_y = _cy(driver)
 
         if driver is not None:
             self._last = driver
@@ -152,10 +168,50 @@ class DriverLock:
                                  seat_x=self._seat_x, passenger_boxes=[list(f.bbox) for f in others])
         return driver
 
+    # -- driver crop -------------------------------------------------------------------
+    def roi(self, frame_shape):
+        """Where to search for the driver's face this frame: (x0, y0, x1, y1) px, or None."""
+        H, W = float(frame_shape[0]), float(frame_shape[1])
+        if self._last is not None:                       # tracked: around the last face
+            cx, cy, side = _cx(self._last), _cy(self._last), ROI_TRACK * _w(self._last)
+        elif self._seat_x is not None:                   # lost: around the seat, wider
+            cx, cy, side = self._seat_x * W, self._seat_y or H / 2, ROI_LOST * self._seat_w
+        elif self.seat == "left":                        # acquiring: the driver's half
+            return (0, 0, int(W * 0.55), int(H))
+        elif self.seat == "right":
+            return (int(W * 0.45), 0, int(W), int(H))
+        else:
+            return None
+        half = max(side, ROI_MIN_PX) / 2.0
+        x0, y0 = max(0.0, cx - half), max(0.0, cy - half)
+        x1, y1 = min(W, cx + half), min(H, cy + half)
+        return int(x0), int(y0), int(x1), int(y1)
+
+    @staticmethod
+    def merge(faces: list, roi_face) -> list:
+        """Add the crop's face to the full-frame faces, replacing the same face found there."""
+        faces = list(faces or [])
+        if roi_face is None:
+            return faces
+        rx, ry, rw = _cx(roi_face), _cy(roi_face), _w(roi_face)
+        rest = [f for f in faces
+                if ((_cx(f) - rx) ** 2 + (_cy(f) - ry) ** 2) ** 0.5 > 0.5 * max(rw, _w(f))]
+        return [roi_face] + rest
+
     # -- ownership of things in the frame ----------------------------------------------
+    def _on_passenger_side(self, x: float, driver) -> bool:
+        """Beyond the driver's reach towards the passenger seat (left/right seat mode only)."""
+        W = self._frame_w
+        if W is None or self.seat == "auto":
+            return False
+        reach = SIDE_REACH * _w(driver)
+        if self.seat == "left":
+            return x > max(W / 2.0, _cx(driver)) + reach
+        return x < min(W / 2.0, _cx(driver)) - reach
+
     def owns_hand(self, hand, driver) -> bool:
         """The driver's hand if its forearm points at the driver rather than at a passenger."""
-        if driver is None:
+        if driver is None or self._on_passenger_side(hand.centre[0], driver):
             return False
         from .hands import owner_distance
         mine = owner_distance(hand, driver.bbox)
@@ -163,7 +219,7 @@ class DriverLock:
 
     def belongs_to_driver(self, x: float, y: float, driver, frame_shape) -> bool:
         """Is a point (phone / hand centre) the driver's rather than a passenger's?"""
-        if driver is None:
+        if driver is None or self._on_passenger_side(x, driver):
             return False
         dw = _w(driver)
         d_drv = abs(x - _cx(driver)) / dw

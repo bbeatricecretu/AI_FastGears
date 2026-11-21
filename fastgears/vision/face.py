@@ -159,6 +159,9 @@ def face_result_from_landmarks(lm_px: np.ndarray, frame_shape,
     )
 
 
+ROI_MIN_DETECTION = 0.4   # driver crop: we already know a face should be there
+
+
 def ensure_face_model(models_dir: str = "models") -> str:
     """Return the path to face_landmarker.task, downloading it if missing."""
     os.makedirs(models_dir, exist_ok=True)
@@ -194,6 +197,18 @@ class FaceTracker:
         )
         self._landmarker = vision.FaceLandmarker.create_from_options(opts)
         self._last_ts = -1
+        # second landmarker for a crop around the driver's seat (see process_roi). IMAGE mode:
+        # the crop moves with the driver, so there is no frame-to-frame tracking to go stale.
+        roi_opts = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
+            num_faces=1,
+            min_face_detection_confidence=ROI_MIN_DETECTION,
+            min_face_presence_confidence=ROI_MIN_DETECTION,
+            running_mode=vision.RunningMode.IMAGE,
+        )
+        self._roi_landmarker = vision.FaceLandmarker.create_from_options(roi_opts)
 
     def process(self, frame_bgr: np.ndarray, t_ms: int) -> FaceResult | None:
         """First face only (compatibility); the app uses process_all + DriverLock."""
@@ -212,9 +227,33 @@ class FaceTracker:
                                data=np.ascontiguousarray(rgb))
         result = self._landmarker.detect_for_video(image, ts)
         h, w = frame_bgr.shape[:2]
+        return self._results(result, frame_bgr.shape, 0, 0, w, h)
+
+    def process_roi(self, frame_bgr: np.ndarray, roi) -> FaceResult | None:
+        """The face inside roi=(x0, y0, x1, y1), in full-frame pixel coordinates.
+
+        The face detector sees the whole input shrunk to 128 px: a driver ~1 m from a
+        wide-angle camera is then only ~10 px wide and is missed in many frames. In a crop
+        a few face widths wide, the same face fills a quarter of the detector input."""
+        import cv2
+        h, w = frame_bgr.shape[:2]
+        x0, y0, x1, y1 = (int(v) for v in roi)
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+        if x1 - x0 < 32 or y1 - y0 < 32:
+            return None
+        rgb = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
+        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
+                               data=np.ascontiguousarray(rgb))
+        result = self._roi_landmarker.detect(image)
+        faces = self._results(result, frame_bgr.shape, x0, y0, x1 - x0, y1 - y0)
+        return faces[0] if faces else None
+
+    @staticmethod
+    def _results(result, frame_shape, ox, oy, cw, ch) -> list[FaceResult]:
+        """Landmarker output for an input of cw x ch px placed at (ox, oy) -> FaceResults."""
         out: list[FaceResult] = []
         for i, pts in enumerate(result.face_landmarks or []):
-            lm = np.array([(p.x * w, p.y * h, p.z * w) for p in pts],
+            lm = np.array([(ox + p.x * cw, oy + p.y * ch, p.z * cw) for p in pts],
                           dtype=np.float64)
             bs: dict[str, float] = {}
             if result.face_blendshapes and i < len(result.face_blendshapes):
@@ -227,11 +266,12 @@ class FaceTracker:
             mats = result.facial_transformation_matrixes
             if mats and i < len(mats):
                 mat = np.asarray(mats[i], dtype=np.float64)
-            out.append(face_result_from_landmarks(lm, frame_bgr.shape, bs, mat))
+            out.append(face_result_from_landmarks(lm, frame_shape, bs, mat))
         return out
 
     def close(self) -> None:
-        try:
-            self._landmarker.close()
-        except Exception:
-            pass
+        for lmk in (self._landmarker, self._roi_landmarker):
+            try:
+                lmk.close()
+            except Exception:
+                pass

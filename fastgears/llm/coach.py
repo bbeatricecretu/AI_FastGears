@@ -122,8 +122,8 @@ def local_message(state: dict) -> dict | None:
         return {"message": f"You're looking {where}. Eyes back on the road.", "severity": "warning",
                 "reason": f"looking {where}"}
     if a.get("hand_off_wheel"):
-        return {"message": "Please keep both hands on the wheel.", "severity": "warning",
-                "reason": "hand off the wheel"}
+        return {"message": "Please keep your hands on the wheel.", "severity": "warning",
+                "reason": "both hands off the wheel"}
     if a.get("yawning") or (a.get("perclos") or 0) > 0.15:
         return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": "warning",
                 "reason": "signs of fatigue"}

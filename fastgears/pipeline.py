@@ -127,15 +127,22 @@ class Pipeline:
 
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
         faces = self.face.process_all(frame, t_ms) if self.face else []
+        roi = self.driver.roi(frame.shape) if self.face else None
+        if roi is not None:                                # driver crop: small faces are missed
+            try:                                           # in the full frame
+                faces = self.driver.merge(faces, self.face.process_roi(frame, roi))
+            except Exception:
+                log.exception("driver crop face pass failed")
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t)
-        from .vision.hands import raised_hands, hand_crop
+        from .vision.hands import free_hands, hand_crop
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
             self._hands = self.hands.process(frame, t_ms)
         mine_hands = [h for h in self._hands if self.driver.owns_hand(h, face)]
-        up = raised_hands(mine_hands, face)               # hands off the wheel (caution)
+        up = free_hands(mine_hands, face, frame.shape)    # off the wheel: open / at the face
+        both_off = len(up) >= 2                           # one hand on the wheel is fine
         # phone search: around ANY of the driver's hands - a phone held low or at arm's length
         # to the side is not "raised" but is still in a hand
         crops = [(h, hand_crop(h, frame.shape)) for h in mine_hands]
@@ -165,7 +172,7 @@ class Pipeline:
             phone = self.phone_latch.update(hit, fresh, t, holding=holding)
             if not phone:
                 self._phone_xy = None
-        att = self.attention.update(face, t, phone=phone, hand_up=bool(up))
+        att = self.attention.update(face, t, phone=phone, hand_up=both_off)
         pulse = self.rppg.status() if self.rppg else {}
         state = {
             "t": time.time(),
@@ -176,7 +183,7 @@ class Pipeline:
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
             "driver": self.driver.state.as_dict(),
-            "hands": {"seen": len(self._hands), "raised": len(up), "phone_source": phone_src if phone else None,
+            "hands": {"seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
                       "vision_calls": self.vision.calls if self.vision else 0},
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
                        "proc_fps": round(self.proc_fps, 1), "size": [frame.shape[1], frame.shape[0]]},
@@ -184,7 +191,7 @@ class Pipeline:
                           "hands": self.hands is not None, "phone_vision": self.vision is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
-        self._jpeg = self._draw(frame, face, dets, att, pulse, up)
+        self._jpeg = self._draw(frame, face, dets, att, pulse, mine_hands, up)
         with self._lock:
             self._state = state
         if self.on_state:
@@ -196,17 +203,20 @@ class Pipeline:
                            "camera": {"connected": self.camera.connected}}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
-    def _draw(self, frame, face, dets, att, pulse, hands_up=()) -> bytes | None:
+    def _draw(self, frame, face, dets, att, pulse, hands=(), hands_free=()) -> bytes | None:
         img = frame.copy()
         for b in self.driver.state.passenger_boxes:
             x0, y0, x1, y1 = map(int, b)
             cv2.rectangle(img, (x0, y0), (x1, y1), (150, 150, 150), 1)
             cv2.putText(img, "passenger (ignored)", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (150, 150, 150), 1)
-        for hd in hands_up:
+        for hd in hands:                                   # the driver's hands only
+            free = any(hd is f for f in hands_free)
+            c = (255, 160, 0) if free else (80, 200, 80)
             x0, y0, x1, y1 = hd.bbox
-            cv2.rectangle(img, (x0, y0), (x1, y1), (255, 160, 0), 2)
-            cv2.putText(img, "hand", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 160, 0), 2)
+            cv2.rectangle(img, (x0, y0), (x1, y1), c, 2)
+            cv2.putText(img, "hand free" if free else "hand on wheel", (x0, max(15, y0 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
         level = att.get("level", "ok")
         col = COLORS.get(level, (255, 255, 255))
         for d in dets:
