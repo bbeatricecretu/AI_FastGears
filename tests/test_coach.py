@@ -39,7 +39,7 @@ class FakeLLM:
 def test_danger_alert_is_instant_and_not_said_again_by_the_llm():
     got = []
     llm = FakeLLM()
-    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=45)
+    c = Coach(llm, got.append)
     c.observe(st(microsleep=True, level="danger"), now=100.0)
     assert got[0]["source"] == "instant" and got[0]["severity"] == "alert"
     c.observe(st(microsleep=True, level="danger"), now=101.0)   # same episode: no repeat, no LLM echo
@@ -50,7 +50,7 @@ def test_danger_alert_is_instant_and_not_said_again_by_the_llm():
 def test_warning_is_worded_by_the_llm_once():
     got = []
     llm = FakeLLM()
-    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=1e9)
+    c = Coach(llm, got.append)
     c.observe(st(phone=True, level="caution"), now=100.0)
     time.sleep(0.3)
     assert [m["source"] for m in got] == ["fake"]                 # one message, in the LLM's words
@@ -65,7 +65,7 @@ class SlowLLM(FakeLLM):
 
 def test_slow_llm_warning_falls_back_to_rule_text_and_late_reply_is_dropped():
     got = []
-    c = Coach(SlowLLM(), got.append, min_interval_s=8, summary_every_s=1e9)
+    c = Coach(SlowLLM(), got.append)
     c.observe(st(phone=True, level="caution"), now=100.0)
     time.sleep(2.8)
     assert [m["source"] for m in got] == ["instant"]              # rule text after WARN_LLM_WAIT_S
@@ -74,16 +74,16 @@ def test_slow_llm_warning_falls_back_to_rule_text_and_late_reply_is_dropped():
 
 
 def test_coach_without_llm_uses_rules():
-    got, ev = [], threading.Event()
-    c = Coach(None, lambda m: (got.append(m), ev.set()), summary_every_s=0)
-    c.observe(st(), now=1.0)
-    assert ev.wait(2) and got[0]["source"] == "rules"
+    got = []
+    c = Coach(None, got.append)
+    c.observe(st(phone=True, level="caution"), now=1.0)
+    assert got[0]["source"] == "instant"
     assert "offline" in c.chat("how am I?", st())["message"]
 
 
 def test_flickering_phone_alerts_once():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(None, got.append)
     for i in range(20):                      # phone on/off every second for 20 s
         on = i % 2 == 0
         c.observe(st(phone=on, level="danger" if on else "ok"), now=100.0 + i)
@@ -99,14 +99,14 @@ def test_every_danger_is_spoken_instantly():
              dict(level="danger")]                                  # danger with no specific rule
     for a in cases:
         got = []
-        c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+        c = Coach(None, got.append)
         c.observe(st(**a), now=100.0)
         assert got and got[0]["source"] == "instant" and got[0]["severity"] == "alert", a
 
 
 def test_warning_spoken_once_then_escalation_spoken_again():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(None, got.append)
     for i in range(10):                                             # phone seen: warning, once
         c.observe(st(phone=True, level="caution"), now=100.0 + i)
     assert [m["severity"] for m in got] == ["warning"]
@@ -116,7 +116,7 @@ def test_warning_spoken_once_then_escalation_spoken_again():
 
 # ── closed-loop check-in ────────────────────────────────────────────────────────
 
-from fastgears.llm.intervention import CheckIn, merge_verdict, rule_verdict  # noqa: E402
+from fastgears.llm.intervention import PASS_MSG, CheckIn, merge_verdict, rule_verdict  # noqa: E402
 
 
 def road(**a):
@@ -139,12 +139,18 @@ def test_checkin_passes_with_answer_and_eyes_on_road():
 
 def test_checkin_no_answer_but_eyes_on_road_passes_quietly():
     ck = CheckIn(answer_timeout_s=10, max_rounds=3, cooldown_s=0)
-    ck.start("microsleep", 0.0)
+    ck.start("eyes off road", 0.0)
     job = None
     for i in range(1, 12):
         job = job or ck.observe(road(), float(i))
     assert job and job["answer"] is None                           # timed out, but awake
     assert ck.resolve(job, merge_verdict(rule_verdict(job), None), 11.0) == [] and not ck.active
+    ck.start("microsleep", 20.0)                                   # after a drowsy alert: no silent pass,
+    job = None                                                     # the break recommendation is said
+    for i in range(21, 32):
+        job = job or ck.observe(road(), float(i))
+    out = ck.resolve(job, merge_verdict(rule_verdict(job), None), 31.0)
+    assert [m["reason"] for m in out] == ["take a break"] and "Good answer" not in out[0]["message"]
 
 
 def test_checkin_asks_again_only_while_camera_says_unsafe_then_stops():
@@ -165,7 +171,7 @@ def test_checkin_asks_again_only_while_camera_says_unsafe_then_stops():
 
 def test_no_other_voice_messages_during_a_checkin():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, checkin=CheckIn(answer_timeout_s=60, cooldown_s=30))
+    c = Coach(None, got.append, checkin=CheckIn(answer_timeout_s=60, cooldown_s=30))
     c.observe(st(distracted=True, looking="left", level="danger"), now=100.0)
     n = len(got)                                                   # alert + question
     c.observe(st(distracted=True, looking="left", level="danger"), now=125.0)   # same hazard, past repeat
@@ -211,7 +217,7 @@ def test_coach_runs_the_closed_loop():
         if m.get("reason") == "check-in passed":
             done.set()
     llm = JudgeLLM()
-    c = Coach(llm, on, min_interval_s=1e9, summary_every_s=1e9, checkin=CheckIn(cooldown_s=30))
+    c = Coach(llm, on, checkin=CheckIn(cooldown_s=30))
     c.observe(st(distracted=True, looking="left", level="danger"), now=100.0)
     assert got[0]["source"] == "instant" and got[1]["expects_answer"]   # alert, then the question
     assert c.checkin_status()["active"] and c.checkin_status()["round"] == 1
@@ -219,7 +225,7 @@ def test_coach_runs_the_closed_loop():
         c.observe(road(), now=100.0 + i)
     assert c.chat("a truck ahead", road())["source"] == "check"      # the answer, not a chat
     assert done.wait(2) and llm.judged == 1
-    assert got[-1]["message"] == "Good, stay focused." and not c.checkin_status()["active"]
+    assert got[-1]["message"] == PASS_MSG and not c.checkin_status()["active"]   # fixed thanks, not the LLM's
 
 
 def test_local_message_head_dropping():
@@ -247,7 +253,7 @@ class EchoLLM:
 
 def test_conversation_remembers_previous_turns_and_keeps_the_mic_open():
     llm = EchoLLM()
-    c = Coach(llm, lambda m: None, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(llm, lambda m: None)
     first = c.chat("I'm driving to Cluj", st())
     assert first["expects_answer"]                                  # browser reopens the mic
     c.chat("about two hours left", st())
@@ -256,29 +262,39 @@ def test_conversation_remembers_previous_turns_and_keeps_the_mic_open():
 
 def test_tiredness_opens_a_conversation_instead_of_a_plain_warning():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(None, got.append)
     c.observe(st(tired=True, level="caution"), now=10.0)
     assert got[0]["expects_answer"] and got[0]["reason"] == "signs of fatigue"
 
 
-def test_calm_drive_gets_an_occasional_conversation_opener():
+def test_calm_drive_stays_silent():
+    """No summaries, praise or small talk: without a hazard nothing is said, even for a long time."""
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
-    c.observe(st(), now=0.0)
-    c.observe(st(), now=599.0)
-    assert not got
-    c.observe(st(), now=601.0)
-    assert got[-1]["reason"] == "conversation" and got[-1]["expects_answer"]
-    c.chat("all fine", st())                                       # talking resets the idle timer
-    c.observe(st(), now=900.0)
-    assert sum(m.get("reason") == "conversation" for m in got) == 1
+    c = Coach(FakeLLM(), got.append)
+    for i in range(0, 3600, 5):
+        c.observe(st(), now=float(i))
+    time.sleep(0.1)
+    assert got == []
+
+
+def test_no_praise_when_a_danger_flickers_to_ok():
+    """Regression (demo video): "You are doing great" between "head dropping" alerts."""
+    llm = FakeLLM()
+    got = []
+    c = Coach(llm, got.append)
+    for i in range(300):                                  # 60 s: head dropping, with ok frames in between
+        drop = i % 7 != 0
+        c.observe(st(looking="tilted", reasons=["head tilted"], level="danger") if drop else st(), now=100 + i * 0.2)
+    time.sleep(0.1)
+    assert llm.calls == 0
+    assert all(m["reason"] == "head tilted" for m in got)
 
 
 # ── message pacing ──────────────────────────────────────────────────────────────
 
 def test_warnings_are_spaced_by_message_gap():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, message_gap_s=12)
+    c = Coach(None, got.append, message_gap_s=12)
     c.observe(st(phone=True, level="caution"), now=100.0)                 # warning spoken
     c.observe(st(tired=True, level="caution"), now=103.0)                 # other warning: too soon
     assert [m["reason"] for m in got] == ["phone in use"]
@@ -288,7 +304,7 @@ def test_warnings_are_spaced_by_message_gap():
 
 def test_danger_alert_ignores_message_gap():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, message_gap_s=60)
+    c = Coach(None, got.append, message_gap_s=60)
     c.observe(st(phone=True, level="caution"), now=100.0)
     c.observe(st(microsleep=True, level="danger"), now=101.0)
     assert [m["severity"] for m in got] == ["warning", "alert"]
@@ -296,7 +312,7 @@ def test_danger_alert_ignores_message_gap():
 
 def test_flickering_warning_needs_hold_time():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, warn_hold_s=1.5)
+    c = Coach(None, got.append, warn_hold_s=1.5)
     c.observe(st(phone=True, level="caution"), now=100.0)
     c.observe(st(), now=100.5)
     assert got == []                                                      # a blip stays silent
@@ -316,7 +332,7 @@ def test_presets_and_custom_tuning():
 
 def test_questions_can_be_switched_off():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, checkin=CheckIn())
+    c = Coach(None, got.append, checkin=CheckIn())
     c.set_tuning(questions=False)
     c.observe(st(microsleep=True, level="danger"), now=100.0)
     assert [m["source"] for m in got] == ["instant"] and not c.checkin.active
@@ -326,9 +342,8 @@ def test_questions_can_be_switched_off():
 
 def test_open_question_silences_everything_but_microsleep():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
-    c.observe(st(), now=0.0)
-    c.observe(st(), now=601.0)                                         # opener: a question
+    c = Coach(None, got.append)
+    c.observe(st(tired=True, level="caution"), now=601.0)              # fatigue opener: a question
     assert got[-1]["expects_answer"] and c.awaiting_reply(601.0)
     n = len(got)
     c.observe(st(phone=True, level="caution"), now=603.0)              # warning: waits
@@ -340,9 +355,8 @@ def test_open_question_silences_everything_but_microsleep():
 
 def test_reply_closes_the_question_and_talk_resumes():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
-    c.observe(st(), now=0.0)
-    c.observe(st(), now=601.0)
+    c = Coach(None, got.append)
+    c.observe(st(tired=True, level="caution"), now=601.0)              # fatigue opener: a question
     c.observe(st(), now=602.0)
     c.chat("all fine, heading home", st())                             # answer -> co-pilot reply (asks again)
     assert got[-1]["reason"] == "chat"
@@ -354,8 +368,7 @@ def test_reply_closes_the_question_and_talk_resumes():
 
 def test_driver_talking_keeps_the_floor_and_the_checkin_open():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9,
-              checkin=CheckIn(answer_timeout_s=12, cooldown_s=30))
+    c = Coach(None, got.append, checkin=CheckIn(answer_timeout_s=12, cooldown_s=30))
     c.observe(st(distracted=True, looking="left", level="danger"), now=100.0)
     assert got[-1]["reason"] == "check-in"
     c.observe(road(), now=105.0)
@@ -364,17 +377,6 @@ def test_driver_talking_keeps_the_floor_and_the_checkin_open():
         c.observe(road(), now=float(t))
     assert c.checkin.waiting and got[-1]["reason"] == "check-in"       # no timeout, nothing said
     assert c.chat("a white van", road())["source"] == "check"          # the late answer still counts
-
-
-def test_llm_comment_arriving_during_a_question_is_dropped():
-    got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
-    c._t = 10.0
-    c._emit({"message": "Where are you heading?", "severity": "info", "reason": "conversation",
-             "source": "instant", "expects_answer": True})
-    c._submit(("react", {}, {"message": "Phone away.", "severity": "warning", "reason": "phone in use"}))
-    time.sleep(0.2)
-    assert [m["message"] for m in got] == ["Where are you heading?"]
 
 
 # ── ongoing danger after a passed check-in: no message jam ─────────────────────
@@ -386,7 +388,7 @@ def _off(level="danger"):
 def test_danger_flicker_is_one_message_not_a_stream():
     llm = FakeLLM()
     got = []
-    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=90, message_gap_s=0)
+    c = Coach(llm, got.append, message_gap_s=0)
     t = 100.0
     for i in range(90):                                    # 18 s of danger flickering with caution
         c.observe(_off("caution" if i % 10 >= 6 else "danger"), now=t)
@@ -398,8 +400,7 @@ def test_danger_flicker_is_one_message_not_a_stream():
 
 def test_ongoing_danger_gets_a_new_question_instead_of_repeated_alerts():
     got = []
-    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9,
-              checkin=CheckIn(answer_timeout_s=20, cooldown_s=90))
+    c = Coach(None, got.append, checkin=CheckIn(answer_timeout_s=20, cooldown_s=90))
     c.observe(_off(), now=5.0)                             # alert + question
     c.observe(road(), now=8.0)
     c.chat("a car ahead", road())                          # passes
@@ -461,3 +462,76 @@ def test_llm_judges_check_answers_in_any_wording_but_camera_floor_stays():
     assert merge_verdict(rule_verdict(job), llm)["ok"]              # ... the LLM accepts it
     job["reaction"]["on_road_share"] = 0.1                           # eyes off the road: still a fail
     assert not merge_verdict(rule_verdict(job), llm)["ok"]
+
+
+# ── demo-video regressions ─────────────────────────────────────────────────────
+
+def test_one_drowsy_episode_is_not_a_burst_of_alerts():
+    """Eyes closing, head dropping, generic danger... one after another used to be one alert each."""
+    got = []
+    c = Coach(None, got.append)
+    seq = [dict(eyes_closing=True, level="danger"),
+           dict(looking="tilted", reasons=["head tilted"], level="danger"),
+           dict(level="danger"),
+           dict(hand_off_wheel=True, level="danger")]
+    t = 100.0
+    for i in range(50):                                   # 10 s, the cause changes every 0.6 s
+        c.observe(st(**seq[(i // 3) % len(seq)]), now=t)
+        t += 0.2
+    assert len(got) == 1
+
+
+def test_microsleep_always_interrupts_the_alert_pace():
+    got = []
+    c = Coach(None, got.append)
+    c.observe(st(eyes_closing=True, level="danger"), now=100.0)
+    c.observe(st(microsleep=True, level="danger"), now=101.0)
+    assert [m["reason"] for m in got] == ["eyes closing", "microsleep"]
+
+
+def test_warning_waits_after_an_alert():
+    got = []
+    c = Coach(None, got.append, message_gap_s=12)
+    c.observe(st(microsleep=True, level="danger"), now=100.0)
+    c.observe(st(phone=True, level="caution"), now=103.0)
+    assert [m["reason"] for m in got] == ["microsleep"]
+
+
+def test_eyes_off_road_wording_is_grammatical():
+    for where in ("nodding", "tilted", "away", "road"):
+        m = local_message(st(distracted=True, looking=where))["message"]
+        assert "Stop looking" not in m and m.endswith("Look ahead."), m
+    assert "Stop looking up" in local_message(st(distracted=True, looking="up"))["message"]
+
+
+def test_drowsy_checkin_passes_only_with_a_break_never_alert():
+    job = {"answer": "twelve", "kind": "check", "expected": ["12", "twelve"], "hazard": "head tilted",
+           "reply_time_s": 1.0, "reaction": {"on_road_share": 1.0, "level_now": "ok", "microsleep": False,
+                                              "drowsiness_avg": 10.0, "distraction_avg": 0.0}}
+    v = rule_verdict(job)
+    assert v["ok"] and v["action"] == "break"
+    llm = {"ok": True, "action": "continue", "message": "Good response. You are alert.", "next_question": ""}
+    m = merge_verdict(v, llm)
+    assert m["action"] == "break" and "alert" not in m["message"].lower()
+
+
+def test_llm_pass_message_is_the_fixed_thanks():
+    from fastgears.llm.intervention import PASS_MSG
+    job = {"answer": "a red car", "kind": "road", "hazard": "eyes off road", "reply_time_s": 1.0,
+           "reaction": {"on_road_share": 1.0, "level_now": "ok", "microsleep": False,
+                        "drowsiness_avg": 0.0, "distraction_avg": 0.0}}
+    llm = {"ok": True, "action": "continue", "message": "You seem fully alert!", "next_question": ""}
+    assert merge_verdict(rule_verdict(job), llm)["message"] == PASS_MSG
+
+
+def test_phone_on_another_person_is_not_the_drivers():
+    from types import SimpleNamespace
+    from fastgears.vision.objects import ObjectDetector
+    face = SimpleNamespace(bbox=(250, 100, 330, 200))
+    dets = [{"label": "person", "conf": 0.8, "bbox": [150, 80, 450, 480]},   # the driver
+            {"label": "person", "conf": 0.6, "bbox": [480, 250, 640, 480]}]  # someone behind, face down
+    others = ObjectDetector.other_people(dets, face)
+    assert others == [[480, 250, 640, 480]]
+    own = [[150, 80, 450, 480]]
+    assert ObjectDetector.in_other_person([540, 330, 580, 400], others, own)       # their phone
+    assert not ObjectDetector.in_other_person([300, 300, 340, 360], others, own)   # the driver's phone

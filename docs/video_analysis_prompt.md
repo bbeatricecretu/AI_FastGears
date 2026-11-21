@@ -107,9 +107,11 @@ held flat/edge-on or mostly covered by fingers.
 
 ### 3.7 Co-pilot (LLM) messages
 - Danger-level situations (microsleep, phone, head tilted/dropping) get an `instant` message
-  immediately (no LLM wait), repeated at most every 20 s while the episode lasts.
-- A new episode or escalation triggers a `gemini` message (min. 8 s between LLM messages);
-  otherwise a summary roughly every 45 s while not ok.
+  immediately (no LLM wait); alerts stay at least 10 s apart whatever their cause (a microsleep
+  always interrupts) and repeat at most every 20 s while the episode lasts.
+- Caution-level warnings are worded by the LLM (`gemini`), with the rule text as fallback.
+- Without a hazard the co-pilot is silent: any praise or "all good" message is a bug, except the
+  thanks after a correctly answered alertness question.
 - Messages must match the situation, be ≤ 20 words, calm and concrete, and never diagnose.
   Flag messages that describe the wrong behaviour (e.g. "eyes on the road" when the driver is
   actually nodding off) or arrive more than ~3 s late for danger.

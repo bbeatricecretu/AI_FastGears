@@ -53,7 +53,7 @@ sensors.
 | `fastgears/vision/rppg.py` | Camera heart rate (POS) with trust score |
 | `fastgears/vision/identity.py` | Optional driver recognition (InsightFace) |
 | `fastgears/vision/filters.py` | One-Euro smoothing filter |
-| `fastgears/llm/coach.py` | LLM co-pilot: alerts, summaries, chat |
+| `fastgears/llm/coach.py` | LLM co-pilot: alerts, alertness questions, chat |
 | `fastgears/server.py` | FastAPI: dashboard, WebSocket, MJPEG, REST |
 | `fastgears/web/index.html` | The dashboard (no build step, no CDN) |
 | `tests/` | Unit tests (no camera or models needed) |
@@ -144,17 +144,20 @@ The dashboard shows the check (question, round, seconds left). Settings: `CHECKI
 
 ## Message frequency
 
-Danger alerts are always spoken at once. Everything else is paced so the co-pilot doesn't talk over
-itself: a warning must last a moment before it is spoken (flicker stays silent), two non-danger
-messages keep a minimum gap, and alertness questions have a pause between rounds. The dashboard's
+The co-pilot only speaks when something is wrong: caution (yellow) warnings, danger (red) alerts and
+the alertness questions that follow them. There are no calm summaries or praise; the one "good"
+message is the thanks after a correctly answered question. Danger alerts are spoken at once, but one
+danger episode is one stream of alerts, not one per cause: alerts stay 10 s apart (a microsleep
+always interrupts) and repeat at most every *Repeat danger*. A warning must last a moment before it
+is spoken (flicker stays silent) and keeps the minimum gap from the previous message. The dashboard's
 **Message frequency** card switches between **Quiet / Normal / Talkative** presets or tunes each value
 with a slider (also `GET/POST /api/tuning`). Start-up preset: `MESSAGE_PRESET` (default `normal`).
 
-| Preset | Gap between messages | Warning must last | Repeat danger | Calm check-in | Pause between questions |
-|---|---|---|---|---|---|
-| Quiet | 25 s | 3 s | 30 s | 180 s | 180 s |
-| Normal | 12 s | 1.5 s | 20 s | 90 s | 90 s |
-| Talkative | 5 s | 0.5 s | 12 s | 40 s | 30 s |
+| Preset | Gap between messages | Warning must last | Repeat danger | Pause between questions |
+|---|---|---|---|---|
+| Quiet | 25 s | 3 s | 30 s | 180 s |
+| Normal | 12 s | 1.5 s | 20 s | 90 s |
+| Talkative | 5 s | 0.5 s | 12 s | 30 s |
 
 ## Setup
 

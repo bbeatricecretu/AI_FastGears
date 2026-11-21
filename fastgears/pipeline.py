@@ -196,10 +196,13 @@ class Pipeline:
         boxes = [b for _, b in crops]
         dets = self.objects.detect(frame, face, boxes) if self.objects else []
         phone, phone_src = False, None
+        others = self.objects.other_people(dets, face) if self.objects else []
         if self.objects:
+            own = [d["bbox"] for d in dets if d.get("label") == "person" and list(d["bbox"]) not in others]
             mine = [d for d in dets if d.get("label") != "cell phone" or (
                 self.driver.belongs_to_driver((d["bbox"][0] + d["bbox"][2]) / 2,
                                               (d["bbox"][1] + d["bbox"][3]) / 2, face, frame.shape)
+                and not self.objects.in_other_person(d["bbox"], others, own)  # a passenger's phone
                 and not on_open_palm(d["bbox"], mine_hands)          # an open palm is not a phone
                 and not self.objects.covers_face(d["bbox"], face))]  # nor is the driver's head
             best = self.objects.phone_best(mine, face, frame.shape)
@@ -236,7 +239,8 @@ class Pipeline:
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
-            "driver": self.driver.state.as_dict(),
+            "driver": {**self.driver.state.as_dict(),     # a passenger looking down has no face: count bodies too
+                       "passengers": max(self.driver.state.passengers, len(others))},
             "hands": {"available": self.hands is not None, "seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
                       "vision_calls": self.vision.calls if self.vision else 0},
             "face_regions": regions,

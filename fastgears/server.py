@@ -58,12 +58,9 @@ async def lifespan(app: FastAPI):
     hub.loop = asyncio.get_running_loop()
     coach = Coach(make_client(settings),
                   on_message=lambda m: hub.publish_threadsafe({"type": "message", **m}),
-                  min_interval_s=settings.llm_min_interval_s,
-                  summary_every_s=settings.llm_summary_every_s,
                   language=settings.language,
                   checkin=CheckIn(settings.checkin_answer_s, settings.checkin_max_rounds,
-                                  settings.checkin_cooldown_s) if settings.checkin else None,
-                  convo_idle_s=settings.convo_idle_s)
+                                  settings.checkin_cooldown_s) if settings.checkin else None)
     try:
         coach.set_tuning(settings.message_preset)
     except ValueError:
@@ -133,7 +130,6 @@ class TuningIn(BaseModel):
     message_gap_s: float | None = None
     warn_hold_s: float | None = None
     alert_repeat_s: float | None = None
-    summary_every_s: float | None = None
     question_cooldown_s: float | None = None
     questions: bool | None = None
 

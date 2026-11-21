@@ -6,7 +6,10 @@ Design for a live demo:
       question that follows is where the LLM comes in (it judges the answer + behaviour).
     - warning: worded by the LLM for the situation; if it hasn't answered within
       WARN_LLM_WAIT_S the rule text is said instead, and a late LLM reply is dropped.
-  * Without a hazard the LLM gives a calm periodic summary (LLM_SUMMARY_EVERY_S).
+  * Without a hazard the co-pilot says nothing: no summaries, no praise, no small talk. The only
+    "good" message is the thanks after a correctly answered alertness question.
+  * One danger episode is one stream of alerts, not one per cause: alerts are at least ALERT_GAP_S
+    apart (a microsleep may always interrupt), repeats at least alert_repeat_s apart.
   * Calls run on a worker thread; the video pipeline never waits for the network.
   * Every provider failure falls back to rule-based text, so the demo never goes silent.
 Providers: Gemini (google-genai, default), Anthropic (optional), or none.
@@ -15,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
 import time
 from collections import deque
@@ -28,31 +30,30 @@ from .intervention import JUDGE_PROMPT, CheckIn, evidence, merge_verdict, parse_
 log = logging.getLogger("coach")
 
 ALERT_REPEAT_S = 20.0   # an ongoing danger episode is re-announced at most this often
+ALERT_GAP_S = 10.0      # two danger alerts (even for different causes) are at least this far apart
 EPISODE_GAP_S = 10.0    # a reason must be gone this long before it counts as a new episode
-RATE_LIMIT_PAUSE_S = 30.0
 AWAIT_REPLY_S = 20.0    # after a question the co-pilot stays quiet this long, waiting for the reply
 ANSWER_MAX_S = 30.0     # a reply being spoken/transcribed holds the floor at most this long
-INTERRUPTS_REPLY = {"microsleep"}
-WARN_LLM_WAIT_S = 2.5   # a warning waits this long for the LLM's wording, then the rule text is said   # the only hazard that may talk over an open question
+INTERRUPTS_REPLY = {"microsleep"}   # the only hazard that may talk over an open question
+WARN_LLM_WAIT_S = 2.5   # a warning waits this long for the LLM's wording, then the rule text is said
 
 # Message pacing, adjustable live from the dashboard (Coach.set_tuning / POST /api/tuning).
 # Danger alerts ignore message_gap_s and warn_hold_s: they are always spoken at once.
-#   message_gap_s       minimum quiet time between two non-danger messages (warnings, LLM, summaries)
+#   message_gap_s       a warning waits this long after the previous message (warning or alert)
 #   warn_hold_s         a warning must last this long before it is spoken (flicker stays silent)
 #   alert_repeat_s      an ongoing danger is re-announced at most this often
-#   summary_every_s     calm periodic check-in text while all is fine
 #   question_cooldown_s after an alertness-question round ends, no new question for this long
 #   questions           ask alertness questions after danger alerts at all
 PRESETS = {
     "quiet":     {"message_gap_s": 25.0, "warn_hold_s": 3.0, "alert_repeat_s": 30.0,
-                  "summary_every_s": 180.0, "question_cooldown_s": 180.0, "questions": True},
+                  "question_cooldown_s": 180.0, "questions": True},
     "normal":    {"message_gap_s": 12.0, "warn_hold_s": 1.5, "alert_repeat_s": 20.0,
-                  "summary_every_s": 90.0, "question_cooldown_s": 90.0, "questions": True},
+                  "question_cooldown_s": 90.0, "questions": True},
     "talkative": {"message_gap_s": 5.0, "warn_hold_s": 0.5, "alert_repeat_s": 12.0,
-                  "summary_every_s": 40.0, "question_cooldown_s": 30.0, "questions": True},
+                  "question_cooldown_s": 30.0, "questions": True},
 }
 TUNING_LIMITS = {"message_gap_s": (0.0, 120.0), "warn_hold_s": (0.0, 10.0), "alert_repeat_s": (5.0, 120.0),
-                 "summary_every_s": (10.0, 600.0), "question_cooldown_s": (0.0, 600.0)}
+                 "question_cooldown_s": (0.0, 600.0)}
 
 SYSTEM_PROMPT = """You are FastGears, an in-car driver-safety co-pilot. You receive live readings
 from a driver-monitoring camera (eyes, head pose, phone use, yawns, camera-measured pulse).
@@ -61,7 +62,8 @@ aloud while driving. Never more than 20 words. Never diagnose medical conditions
 Escalate with the danger: info = friendly, warning = firm, alert = urgent imperative.
 Suggest a concrete action when useful (eyes on the road, put the phone away, take a break
 at the next rest area, open a window, talk to the passenger). Pulse readings with trust
-'unreliable' must be ignored.
+'unreliable' must be ignored. You only speak because something is wrong: never praise or
+reassure ("doing great", "you are alert", "all good").
 "primary_hazard" is what matters right now: talk about that one thing only and do not mix in
 other readings (e.g. no fatigue advice while the hazard is the phone). Only when it is null may
 you comment on slower trends such as yawns or tiredness.
@@ -74,6 +76,9 @@ You see the live driver-monitoring state and the conversation so far. Keep the t
 Talking keeps a tired driver alert: if the state shows tiredness, end with one short, easy question
 (about the trip, music, plans), never one that needs looking at a screen.
 Safety first: if the state shows danger, tell them to focus on the road before anything else.
+Never praise or reassure them ("doing great", "you seem alert", "driving well"): you can't know that.
+If the driver mentions being sleepy, wanting to sleep, being exhausted, drunk or unwell, that comes
+first: tell them plainly to stop at the next safe place and rest; don't just carry on chatting.
 Treat discomfort_grimace as facial movement only. Never diagnose medical conditions."""
 
 CONVO_TURNS = 8          # conversation lines the LLM sees (driver + co-pilot)
@@ -81,9 +86,6 @@ FOLLOW_UP_MSG = "Stay with me. Count down from ten for me, out loud."
 BREAK_MSG = "Your answers sound tired. Please plan a break at the next rest area."
 STOP_MSG = "You don't sound fit to drive. Please stop at the next safe place."
 FATIGUE_OPENER = "You look a bit tired. Talk to me for a moment: where are you heading?"
-OPENERS = ("How is the drive going so far?",
-           "How are you feeling? Need a break soon?",
-           "Long stretch of road. What are you listening to?")
 
 
 class LLMClient(Protocol):
@@ -217,8 +219,8 @@ def local_message(state: dict) -> dict | None:
                 "reason": "eyes closing"}
     if a.get("distracted"):
         where = a.get("looking", "away")
-        where = "away from the road" if where in ("away", "road") else where
-        return {"message": f"Too much time with your eyes off the road. Stop looking {where}, look ahead.",
+        tail = f"Stop looking {where}, look ahead." if where in ("left", "right", "up", "down") else "Look ahead."
+        return {"message": f"Too much time with your eyes off the road. {tail}",
                 "severity": sev, "reason": "eyes off road"}
     if a.get("hand_off_wheel"):
         return {"message": "Please keep your hands on the wheel.", "severity": sev,
@@ -276,43 +278,30 @@ class Coach:
     """Watches the state stream and emits messages via on_message(dict)."""
 
     def __init__(self, client: LLMClient | None, on_message: Callable[[dict], None],
-                 min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English",
-                 checkin: CheckIn | None = None, convo_idle_s: float = 0.0,
+                 language: str = "English", checkin: CheckIn | None = None,
                  message_gap_s: float = 0.0, warn_hold_s: float = 0.0,
                  alert_repeat_s: float = ALERT_REPEAT_S, await_reply_s: float = AWAIT_REPLY_S):
         self.client, self.on_message = client, on_message
-        self.min_interval_s, self.summary_every_s = min_interval_s, summary_every_s
         self.message_gap_s, self.warn_hold_s, self.alert_repeat_s = message_gap_s, warn_hold_s, alert_repeat_s
         self.questions = checkin is not None
         self.preset = "custom"
         self._last_said = -1e9          # last non-danger message (observe clock); message_gap_s counts from it
+        self._last_alert = -1e9         # last danger alert (observe clock); ALERT_GAP_S counts from it
         self._episode_start: dict = {}  # reason -> when its current episode began (for warn_hold_s)
         self._llm_episode: dict = {}    # reason -> episode start the LLM already spoke about
         self.language = language
         self.checkin = checkin          # closed-loop alertness check after danger alerts (optional)
         self._t = 0.0                   # time of the last observe(): the clock for answers/verdicts
-        self.convo_idle_s = convo_idle_s  # co-pilot opens a conversation after this long without one (0 = never)
         self._convo: deque = deque(maxlen=CONVO_TURNS)   # (who, text) lines the LLM sees
-        self._last_talk: float | None = None
-        self._opener_i = 0
         self.history: deque = deque(maxlen=50)
         self.engagement = Engagement()   # how alert the driver's replies sound, over the last few
-        self._jobs: queue.Queue = queue.Queue(maxsize=1)
-        self._last_llm = 0.0
         self._last_local = {}
         self._last_seen: dict = {}
-        self._prev_seen: dict = {}
-        self._pending = False
-        self._pause_until = -1e9
-        self._last_level = "ok"
-        self._last_key = None
-        self._last_discomfort_id = None
         self.llm_errors = 0
         self.last_latency_ms: int | None = None
         self.await_reply_s = await_reply_s
         self._await_until = -1e9        # a question is open until then (observe clock)
         self._answering_since: float | None = None
-        threading.Thread(target=self._worker, name="coach", daemon=True).start()
 
     @property
     def provider(self) -> str:
@@ -322,7 +311,7 @@ class Coach:
     def tuning(self) -> dict:
         return {"preset": self.preset, "presets": PRESETS, "limits": TUNING_LIMITS,
                 "values": {"message_gap_s": self.message_gap_s, "warn_hold_s": self.warn_hold_s,
-                           "alert_repeat_s": self.alert_repeat_s, "summary_every_s": self.summary_every_s,
+                           "alert_repeat_s": self.alert_repeat_s,
                            "question_cooldown_s": self.checkin.cooldown_s if self.checkin else None,
                            "questions": self.questions and self.checkin is not None}}
 
@@ -370,8 +359,15 @@ class Coach:
                 self._await_until = max(self._await_until, self._t + 3.0)
 
     def _quiet(self, now: float) -> bool:
-        """True while the last non-danger message is younger than message_gap_s."""
-        return now - self._last_said < self.message_gap_s
+        """True while the last message (warning or alert) is younger than message_gap_s."""
+        return now - max(self._last_said, self._last_alert) < self.message_gap_s
+
+    def _alert_ready(self, key: str, new: bool, now: float) -> bool:
+        """Danger alerts share one pace, whatever their cause: a new cause waits ALERT_GAP_S after the
+        last alert, a repeat alert_repeat_s. A microsleep is never held back."""
+        if key in INTERRUPTS_REPLY:
+            return True
+        return now - self._last_alert >= (ALERT_GAP_S if new else self.alert_repeat_s)
 
     # called by the pipeline at ~5 Hz
     def observe(self, state: dict, now: float | None = None) -> None:
@@ -380,7 +376,6 @@ class Coach:
         a = state.get("attention", {})
         if not a.get("calibrated", True):
             return
-        level = a.get("level", "ok")
         loc = local_message(state)
         key = loc["reason"] if loc else None
 
@@ -389,7 +384,8 @@ class Coach:
         #    episode; an episode ends when its reason has been gone EPISODE_GAP_S. The key holds
         #    the severity too, so a warning that escalates to danger is announced again.
         #    Warnings are paced too: held for warn_hold_s (flicker stays silent) and kept
-        #    message_gap_s away from the previous non-danger message.
+        #    message_gap_s away from the previous message. All alerts share one pace (_alert_ready),
+        #    so one drowsy episode can't fire "eyes closing", "head dropping", "danger" back to back.
         if key:
             if now - self._last_seen.get(key, -1e9) > EPISODE_GAP_S:
                 self._episode_start[key] = now
@@ -407,8 +403,9 @@ class Coach:
             ek = f"{key}|{loc['severity']}"
             is_alert = loc["severity"] == "alert"
             repeat = self.alert_repeat_s if is_alert else float("inf")
-            ready = is_alert or (now - self._episode_start.get(key, now) >= self.warn_hold_s
-                                 and not self._quiet(now))
+            new = ek not in self._last_local
+            ready = (self._alert_ready(key, new, now) if is_alert
+                     else now - self._episode_start.get(key, now) >= self.warn_hold_s and not self._quiet(now))
             if ready and (ek not in self._last_local or now - self._last_local[ek] > repeat):
                 repeated = ek in self._last_local
                 self._last_local[ek] = now
@@ -433,53 +430,7 @@ class Coach:
             job = self.checkin.observe(state, now, hold=self.answering(now))
             if job:
                 self._judge_async(job)
-        if (self.checkin and self.checkin.active) or self.awaiting_reply(now):
-            # the dialogue owns the voice: no LLM summaries, openers or comments meanwhile. Nothing is
-            # queued either: after the reply the co-pilot speaks about the state as it is then.
-            self._pending = False
-            self._last_key, self._last_level = key, level
-            if key:
-                self._prev_seen[key] = now
-            return
-
-        # 3) a quiet, calm drive: the co-pilot starts a short conversation now and then
-        if self._last_talk is None:
-            self._last_talk = now
-        if self.convo_idle_s and level == "ok" and now - self._last_talk >= self.convo_idle_s:
-            self._open_conversation(OPENERS[self._opener_i % len(OPENERS)], now)
-            self._opener_i += 1
-
-        # 4) LLM on change, or periodic summary
-        # ask the LLM on a NEW episode (reason not seen in the last EPISODE_GAP_S) or an escalation,
-        # not on every flicker of the same situation
-        rank = {"ok": 0, "caution": 1, "danger": 2}
-        new_episode = bool(key) and now - self._prev_seen.get(key, -1e9) > EPISODE_GAP_S
-        changed = new_episode or rank.get(level, 0) > rank.get(self._last_level, 0)
-        if key:
-            self._prev_seen[key] = now
-        self._pending = (self._pending or changed) and level != "ok"   # waits for min_interval if needed
-        due = now - self._last_llm >= (self.min_interval_s if self._pending else self.summary_every_s)
-        # the LLM follow-up of a danger alert just spoken may come at once; anything else waits its turn
-        due = due and (alerted or not self._quiet(now))
-        self._last_key, self._last_level = key, level
-        event = (state.get("discomfort") or {}).get("event")
-        if (event and event["id"] != self._last_discomfort_id and now - self._last_llm >= self.min_interval_s
-                and not self._quiet(now)):
-            self._last_discomfort_id = event["id"]
-            if loc is None:
-                loc = {"message": "Are you comfortable? If needed, take a break when safe.",
-                       "severity": "info", "reason": "facial movement"}
-            due = True
-        # a hazard already has its one message (instant alert, or the LLM-worded warning): the LLM
-        # must not say the same thing again in its own words
-        if key and not event:
-            due = False
-        if due and now >= self._pause_until:
-            self._last_llm = now
-            self._pending = False
-            if key:
-                self._llm_episode[key] = self._episode_start.get(key)
-            self._submit(("react", compact_state(state), loc))
+        # nothing else: without a hazard the co-pilot stays silent (no summaries, praise or small talk)
 
     def _warn_async(self, loc: dict, compact: dict, asked: float) -> None:
         """Say a warning in the LLM's words, or the rule text if the LLM is slow or fails. Exactly one
@@ -518,15 +469,8 @@ class Coach:
                 finish({**out, "severity": loc["severity"], "reason": key, "source": self.provider})
         threading.Thread(target=run, name="coach-warn", daemon=True).start()
 
-    def _submit(self, job) -> None:
-        try:
-            self._jobs.put_nowait(job)
-        except queue.Full:          # one in flight is enough; drop stale requests
-            pass
-
     def _open_conversation(self, text: str, now: float, severity: str = "info",
                            reason: str = "conversation") -> None:
-        self._last_talk = now
         self._convo.append(("co-pilot", text))
         self._emit({"message": text, "severity": severity, "reason": reason, "source": "instant",
                     "expects_answer": True})
@@ -566,7 +510,6 @@ class Coach:
                 self.engagement.add(merge_assessment(rule, None), reply_time_s)
                 self._judge_async(job)
                 return {"message": "", "severity": "info", "reason": "check-in answer", "source": "check"}
-        self._last_talk = self._t
         talk = "\n".join(f"{who}: {line}" for who, line in self._convo) or "(none)"
         self._convo.append(("driver", text))
         llm = None
@@ -632,40 +575,11 @@ class Coach:
     def checkin_status(self) -> dict:
         return self.checkin.status(self._t) if self.checkin else {"active": False}
 
-    def _worker(self) -> None:
-        while True:
-            _, compact, loc = self._jobs.get()
-            out = None
-            if self.client:
-                t0 = time.monotonic()
-                try:
-                    txt = self.client.complete(SYSTEM_PROMPT.format(language=self.language),
-                                               "Driver state now:\n" + json.dumps(compact), json_mode=True)
-                    out = parse_reply(txt)
-                    self.last_latency_ms = int((time.monotonic() - t0) * 1000)
-                except Exception as e:
-                    self.llm_errors += 1
-                    log.warning("LLM call failed: %s", e)
-                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                        self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_S
-                        continue            # rate-limited: stay quiet, instant alerts still work
-            if self.awaiting_reply(self._t) or (self.checkin and self.checkin.active):
-                continue                    # a question was asked meanwhile: this comment would talk over it
-            if loc and out is not None:     # the LLM spoke about this hazard: it counts as its announcement,
-                for sev in ("warning", "alert"):   # so the instant repeat waits (existing keys only:
-                    ek = f"{loc['reason']}|{sev}"  # observe() iterates this dict on its own thread)
-                    if ek in self._last_local:
-                        self._last_local[ek] = self._t
-            if out is None:
-                out = loc or {"message": "All good. Keep your eyes on the road.", "severity": "info", "reason": "ok"}
-                out = {**out, "source": "rules"}
-            else:
-                out["source"] = self.provider
-            self._emit(out)
-
     def _emit(self, msg: dict) -> None:
-        if not (msg.get("severity") == "alert" and msg.get("source") == "instant"):
-            self._last_said = self._t   # a danger alert doesn't make the next warning wait
+        if msg.get("severity") == "alert":
+            self._last_alert = self._t  # alerts pace each other (ALERT_GAP_S) and hold warnings back
+        else:
+            self._last_said = self._t
         if msg.get("expects_answer"):
             self._await_until = self._t + self.await_reply_s   # quiet until the driver replies
         msg = {**msg, "t": time.time()}

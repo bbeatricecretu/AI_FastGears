@@ -146,6 +146,24 @@ class ObjectDetector:
         return sum(1 for d in dets if d.get("label") == label)
 
     @staticmethod
+    def other_people(dets: list[dict], face) -> list[list[float]]:
+        """Person boxes that are not the driver (their box doesn't hold the driver's face centre).
+        A passenger looking down has no face for MediaPipe, but YOLO still sees the body."""
+        if face is None:
+            return []
+        fx0, fy0, fx1, fy1 = face.bbox
+        cx, cy = (fx0 + fx1) / 2.0, (fy0 + fy1) / 2.0
+        return [list(d["bbox"]) for d in dets if d.get("label") == PERSON_LABEL
+                and not (d["bbox"][0] <= cx <= d["bbox"][2] and d["bbox"][1] <= cy <= d["bbox"][3])]
+
+    @staticmethod
+    def in_other_person(bbox, others: list, driver_people: list | None = None) -> bool:
+        """The phone's centre lies on another person (and not on the driver's own body box)."""
+        x, y = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+        inside = lambda b: b[0] <= x <= b[2] and b[1] <= y <= b[3]
+        return any(inside(b) for b in others) and not any(inside(b) for b in (driver_people or []))
+
+    @staticmethod
     def covers_face(bbox, face, frac: float = PHONE_FACE_COVER) -> bool:
         """The box contains most of the driver's face: YOLO read the head as a phone. A phone at
         the ear sits beside the face; one held over the face would hide it from the tracker."""

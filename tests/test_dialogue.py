@@ -64,7 +64,7 @@ class AssessLLM:
 def test_chat_sends_voice_and_reply_time_to_the_llm_and_acts_on_it():
     llm = AssessLLM('{"message": "Pull over at the next safe place.", "alertness": "poor", '
                     '"signals": ["confused"], "action": "stop"}')
-    c = Coach(llm, lambda m: None, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(llm, lambda m: None)
     out = c.chat("what road", st(), {"clarity": "mumbled"}, 7.5)
     assert '"reply_time_s": 7.5' in llm.users[0] and "mumbled" in llm.users[0]
     assert out["severity"] == "alert" and not out["expects_answer"]
@@ -73,7 +73,7 @@ def test_chat_sends_voice_and_reply_time_to_the_llm_and_acts_on_it():
 
 
 def test_chat_offline_follows_up_on_a_weak_reply():
-    c = Coach(None, lambda m: None, min_interval_s=1e9, summary_every_s=1e9)
+    c = Coach(None, lambda m: None)
     out = c.chat("uh", st(), {"clarity": "slurred"}, 9.0)
     assert out["expects_answer"] and "Count down" in out["message"]
     out = c.chat("hm", st(), {"clarity": "slurred"}, 9.0)
@@ -139,9 +139,9 @@ def test_rules_fast_answer_passes_tired_behaviour_recommends_a_break():
 
 
 def test_llm_reading_is_kept_but_never_below_the_measured_floor():
-    from fastgears.llm.intervention import merge_verdict, parse_judge, rule_verdict
+    from fastgears.llm.intervention import PASS_MSG, merge_verdict, parse_judge, rule_verdict
     llm = parse_judge('{"action": "continue", "message": "Thanks, you seem alert."}')
-    assert merge_verdict(rule_verdict(_job()), llm)["message"] == "Thanks, you seem alert."
+    assert merge_verdict(rule_verdict(_job()), llm)["message"] == PASS_MSG   # never "you seem alert"
     v = merge_verdict(rule_verdict(_job(on_road_share=0.2)), llm)          # camera says not back: no pass
     assert not v["ok"] and v["action"] == "follow_up"
     v = merge_verdict(rule_verdict(_job(tired=True)), llm)                 # measured tiredness keeps its break

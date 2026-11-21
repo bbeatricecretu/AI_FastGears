@@ -88,6 +88,10 @@ Reply ONLY with JSON: {{"action": "continue|break|follow_up|stop",
 
 PASS_MSG = "Thanks, you're back with me. Keep your eyes on the road."
 BREAK_MSG = "Good answer. Your eyes still show tiredness, so plan a break soon."
+BREAK_MSG_NO_ANSWER = "Your eyes still show tiredness. Plan a break soon."
+# a check-in after one of these never ends in "continue": answering a question in a 20 s window doesn't
+# undo a drowsy episode (the driver sits up to answer), so the best outcome is a break recommendation
+DROWSY_HAZARDS = frozenset({"microsleep", "head tilted", "eyes closing", "signs of fatigue"})
 STOP_MSG = "You don't seem alert. Please stop at the next safe place and take a break."
 SLOW_ANSWER_S, VERY_SLOW_ANSWER_S = 4.0, 8.0   # browser-measured: end of the question -> first word
 STAT_CAUTION, STAT_DANGER = 40.0, 70.0          # dashboard score bands (attention.py level_caution / level_danger)
@@ -163,8 +167,10 @@ def rule_verdict(job: dict) -> dict:
                 "next_question": ""}
     # slow statistics (PERCLOS, yawns over 5 min) can't recover in a 20 s check: they don't fail it,
     # they turn the pass into a break recommendation
-    if r.get("tired") or r.get("drowsiness_avg", 0.0) >= STAT_CAUTION:
-        v = {"ok": True, "cv_ok": True, "action": "break", "message": BREAK_MSG, "next_question": ""}
+    if (r.get("tired") or r.get("drowsiness_avg", 0.0) >= STAT_CAUTION
+            or job.get("hazard") in DROWSY_HAZARDS):
+        v = {"ok": True, "cv_ok": True, "action": "break",
+             "message": BREAK_MSG if answered else BREAK_MSG_NO_ANSWER, "next_question": ""}
     else:
         v = {"ok": True, "cv_ok": True, "action": "continue", "message": PASS_MSG if answered else "",
              "next_question": ""}
@@ -211,6 +217,8 @@ def merge_verdict(rule: dict, llm: dict | None) -> dict:
         msg = llm["message"] if not llm["ok"] and llm["message"] else rule["message"]
     elif action == "break" and rule.get("action") == "break" and llm["action"] != "break":
         msg = rule["message"]                # the LLM's thanks would hide the measured tiredness
+    elif action == "continue":
+        msg = PASS_MSG                       # fixed thanks: the LLM must not claim "you are alert"
     else:
         msg = llm["message"] or rule["message"]
     ok = action in ("continue", "break")

@@ -361,6 +361,21 @@ let lastMine = null;       // the driver's last bubble, tagged with how alert th
 const LEVEL_TEXT = { ok: 'ATTENTIVE', caution: 'CAUTION', danger: 'DANGER' };
 const LABEL = { 'check-in': 'Alertness check', chat: 'Co-pilot', conversation: 'Co-pilot', 'check-in passed': 'Check passed' };
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+// Orb colour and label show one level: a rise shows at once, a drop only once it has held
+// LEVEL_DROP_MS, so a one-frame flicker can't paint the orb red and the label "ATTENTIVE".
+const LEVEL_RANK = { ok: 0, caution: 1, danger: 2 }, LEVEL_DROP_MS = 1500;
+let levelShown = null, levelLowerSince = null;
+function shownLevel(lvl) {
+  const now = performance.now();
+  if (lvl == null || levelShown == null || LEVEL_RANK[lvl] >= LEVEL_RANK[levelShown]) {
+    levelShown = lvl; levelLowerSince = null;
+  } else if (levelLowerSince == null) {
+    levelLowerSince = now;
+  } else if (now - levelLowerSince >= LEVEL_DROP_MS) {
+    levelShown = lvl; levelLowerSince = null;
+  }
+  return levelShown;
+}
 function setOrb(mode) { orb.className = 'orb' + (mode ? ' ' + mode : ''); }
 function status(t) { $('orb').title = t; }   // no text under the orb: the chat already says it
 function tile(id, value, state) {           // state: '' | 'warn' | 'bad'
@@ -375,7 +390,7 @@ function bar(id, v) {
 function onState(s) {
   const a = s.attention || {}, p = s.pulse || {}, c = s.camera || {}, d = s.driver || {}, h = s.hands || {};
   const ds = s.driver_signals || {}, ck = s.check || {};
-  const lvl = a.calibrated === false ? null : (a.level || 'ok');
+  const lvl = shownLevel(a.calibrated === false ? null : (a.level || 'ok'));
   document.body.classList.toggle('caution', lvl === 'caution');
   document.body.classList.toggle('danger', lvl === 'danger');
   $('level').textContent = lvl ? LEVEL_TEXT[lvl] : (a.face_present === false ? 'LOOKING FOR THE DRIVER' : 'CALIBRATING · LOOK AT THE ROAD');
