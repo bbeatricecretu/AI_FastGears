@@ -48,6 +48,25 @@
   .badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 6px;
            border-radius: 999px; background: var(--c1); color: #fff; font-size: 11px; font-weight: 600; }
   .badge[hidden] { display: none; }
+  /* message-frequency panel: drops from the header, same glass as the cards */
+  .freq-panel { position: fixed; top: 3.6rem; right: 1.4rem; z-index: 20; width: min(380px, calc(100vw - 2rem));
+                background: linear-gradient(180deg, rgba(26,30,40,.92), rgba(14,16,23,.9));
+                box-shadow: 0 24px 70px rgba(0,0,0,.6); transform-origin: top right; animation: pop .18s ease-out; }
+  .freq-panel[hidden] { display: none; }
+  @keyframes pop { from { opacity: 0; transform: scale(.96) translateY(-4px); } }
+  .freq-panel h2 span { text-transform: none; letter-spacing: 0; color: var(--text); font-weight: 600; }
+  .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; border-radius: 999px;
+         background: rgba(255,255,255,.06); margin-bottom: 14px; }
+  .seg button { background: none; border: 0; border-radius: 999px; color: var(--muted); font: inherit; font-size: 13px;
+                padding: 6px 0; cursor: pointer; transition: background .2s, color .2s; }
+  .seg button.on { background: color-mix(in srgb, var(--c1) 70%, transparent); color: #fff; }
+  .tune { display: grid; grid-template-columns: 1fr 120px 44px; gap: 10px 10px; align-items: center; font-size: 13px; color: #c7cedb; }
+  .tune output { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .tune input[type=range] { width: 100%; accent-color: var(--c2); }
+  .tune label.chk { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; cursor: pointer; }
+  .tune label.chk input { accent-color: var(--c2); }
+  .freq-panel .note { margin: 12px 0 0; font-size: 12px; color: var(--muted); }
+  #freq.on { color: var(--text); border-color: color-mix(in srgb, var(--c2) 60%, transparent); }
   :focus-visible { outline: 2px solid var(--c2); outline-offset: 2px; }
 
   /* two columns, one screen: camera + the three detection cards on the left, the voice chat on the right */
@@ -240,9 +259,20 @@
   <div class="chips">
     <span class="chip" id="fps">–</span>
     <button class="ghost on" id="voice" aria-pressed="true">Voice on</button>
+    <button class="ghost" id="freq" aria-haspopup="dialog" aria-expanded="false" aria-controls="freq-panel" title="How often the co-pilot speaks">Messages</button>
     <button class="ghost" id="recal" title="Look at the road for a few seconds">Recalibrate</button>
   </div>
 </header>
+<div class="card freq-panel" id="freq-panel" role="dialog" aria-label="Message frequency" hidden>
+  <h2>Message frequency <span id="freq-preset"></span></h2>
+  <div class="seg" role="group" aria-label="Preset">
+    <button type="button" data-preset="quiet" title="Fewest messages and questions">Quiet</button>
+    <button type="button" data-preset="normal">Normal</button>
+    <button type="button" data-preset="talkative" title="More frequent messages and questions">Talkative</button>
+  </div>
+  <div class="tune" id="tune"></div>
+  <p class="note">Danger alerts are always spoken at once; these settings pace everything else.</p>
+</div>
 
 <main>
   <section class="left" aria-label="Camera and detections">
@@ -288,8 +318,6 @@
   <section class="col center" aria-label="Co-pilot">
     <div class="orb" id="orb" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
     <div class="level" id="level">CALIBRATING</div>
-    <div id="reasons"></div>
-    <div id="status">Hello, driver</div>
     <ol class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation with the co-pilot">
       <li class="bubble ai latest instant">How can I help you on the road?</li>
     </ol>
@@ -318,7 +346,7 @@ const LEVEL_TEXT = { ok: 'ATTENTIVE', caution: 'CAUTION', danger: 'DANGER' };
 const LABEL = { 'check-in': 'Alertness check', chat: 'Co-pilot', conversation: 'Co-pilot', 'check-in passed': 'Check passed' };
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
 function setOrb(mode) { orb.className = 'orb' + (mode ? ' ' + mode : ''); }
-function status(t) { $('status').textContent = t; }
+function status(t) { $('orb').title = t; }   // no text under the orb: the chat already says it
 function tile(id, value, state) {           // state: '' | 'warn' | 'bad'
   const el = $(id); el.querySelector('span').textContent = value; el.className = 'm' + (state ? ' ' + state : '');
 }
@@ -335,7 +363,7 @@ function onState(s) {
   document.body.classList.toggle('caution', lvl === 'caution');
   document.body.classList.toggle('danger', lvl === 'danger');
   $('level').textContent = lvl ? LEVEL_TEXT[lvl] : (a.face_present === false ? 'LOOKING FOR THE DRIVER' : 'CALIBRATING · LOOK AT THE ROAD');
-  $('reasons').textContent = (a.reasons || []).join(' · ');
+  $('level').title = (a.reasons || []).join(' · ');
   $('fps').textContent = c.connected ? `${c.fps ?? '–'} cam · ${c.proc_fps ?? '–'} proc fps` : 'no camera';
 
   const drow = a.drowsiness || 0, dist = a.distraction || 0;
@@ -508,6 +536,56 @@ $('chat').onsubmit = async e => {
   await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
 };
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
+// ── message frequency panel (same /api/tuning as the dashboard) ──
+const TUNE = [
+  ['message_gap_s', 'Min. gap between messages', 1],
+  ['warn_hold_s', 'Warning must last', 0.5],
+  ['alert_repeat_s', 'Repeat a danger every', 1],
+  ['question_cooldown_s', 'Pause between questions', 5],
+];
+let tuneTimer = null;
+function renderTuning(t) {
+  const box = $('tune');
+  $('freq-preset').textContent = cap(t.preset);
+  for (const b of document.querySelectorAll('[data-preset]')) b.classList.toggle('on', b.dataset.preset === t.preset);
+  if (!box.children.length) {
+    for (const [k, label, step] of TUNE) {
+      const [lo, hi] = t.limits[k];
+      const l = document.createElement('label'); l.textContent = label; l.htmlFor = 'tune-' + k;
+      const r = Object.assign(document.createElement('input'), { type: 'range', id: 'tune-' + k, min: lo, max: hi, step });
+      const o = document.createElement('output'); o.id = 'tune-o-' + k;
+      r.oninput = () => { o.textContent = r.value + ' s'; clearTimeout(tuneTimer); tuneTimer = setTimeout(() => postTuning({ [k]: +r.value }), 250); };
+      box.append(l, r, o);
+    }
+    const c = document.createElement('label'); c.className = 'chk';
+    c.innerHTML = '<input type="checkbox" id="tune-questions"> Ask alertness questions after a danger alert';
+    box.append(c);
+    $('tune-questions').onchange = e => postTuning({ questions: e.target.checked });
+  }
+  for (const [k] of TUNE) {
+    const v = t.values[k], r = $('tune-' + k);
+    r.disabled = v == null;
+    if (v != null && document.activeElement !== r) { r.value = v; $('tune-o-' + k).textContent = v + ' s'; }
+  }
+  $('tune-questions').checked = !!t.values.questions;
+  $('tune-questions').disabled = t.values.question_cooldown_s == null;
+}
+async function postTuning(body) {
+  const r = await fetch('/api/tuning', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (r.ok) renderTuning(await r.json());
+}
+for (const b of document.querySelectorAll('[data-preset]')) b.onclick = () => postTuning({ preset: b.dataset.preset });
+function openFreq(open) {
+  $('freq-panel').hidden = !open;
+  $('freq').classList.toggle('on', open); $('freq').setAttribute('aria-expanded', open);
+  if (open) fetch('/api/tuning').then(r => r.json()).then(renderTuning).catch(() => {});   // fresh values each time
+}
+$('freq').onclick = e => { e.stopPropagation(); openFreq($('freq-panel').hidden); };
+document.addEventListener('pointerdown', e => {
+  if (!$('freq-panel').hidden && !$('freq-panel').contains(e.target) && e.target !== $('freq')) openFreq(false);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('freq-panel').hidden) { openFreq(false); $('freq').focus(); } });
+
 // ── voice switch: one setting shared with the dashboard, remembered across reloads ──
 const VOICE_KEY = 'fastgears.voice';
 const voiceBus = 'BroadcastChannel' in window ? new BroadcastChannel('fastgears-voice') : null;
