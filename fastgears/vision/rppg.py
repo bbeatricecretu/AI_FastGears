@@ -61,6 +61,7 @@ MOTION_GATE = 0.08          # window motion (eye-midpoint spread / eye distance)
 SNR_GATE_DB = 0.0           # below 0 dB the pulse is weaker than the noise: reject
 SLEW_BPM_PER_S = 3.0        # the shown pulse changes at most this fast (a real heart rate is smooth)
 HOLD_MAX_S = 12.0           # keep the last good value this long while rejected, then "measuring"
+TRUSTED_METHODS = ("regional_consensus", "pooled")   # may drive the shown pulse
 STEP_GATE = 0.25            # eye-midpoint displacement within STEP_SPAN_S (x eye distance): a posture
 STEP_SPAN_S = 0.5           # jump; the window restarts after it so the pulse returns after MIN_WINDOW_S.
                             # Measured over 0.5 s, not per sample: landmark ROIs follow the skin and
@@ -545,7 +546,13 @@ class RPPG:
             snr = _spectral_snr(freqs, power, peak)
             if power.sum() <= 1e-12 or not np.isfinite(snr):
                 return base
-            method = "provisional"
+            # Main's original (validated) estimator: forehead + cheeks pooled before POS, accepted
+            # at SNR >= 0 dB. Pooling averages out per-region noise, so it still reads a small or
+            # backlit face whose regions are each too weak for a regional consensus. Not used when
+            # the regions clearly disagree, nor from a single region.
+            pooled_ok = (not low_sample_rate and base["reason"] == "insufficient_regions"
+                         and len(signals) >= 2 and snr >= SNR_GATE_DB)
+            method = "pooled" if pooled_ok else "provisional"
         bpm = round(peak * 60)
         cxs, cys, ds = arr[:, 1], arr[:, 2], arr[:, 3]
         motion = float(np.sqrt(cxs.var() + cys.var()) / max(ds.mean(), 1.0))
@@ -556,6 +563,8 @@ class RPPG:
         if method == "provisional":
             trust.update(score=min(trust["score"], 39), label="unreliable")
             trust["reasons"].append("low sample rate" if low_sample_rate else "no qualified regional consensus")
+        elif method == "pooled":
+            trust["reasons"].append("pooled regions (each too weak alone)")
         elif any(secondary):
             trust["reasons"].append("shared secondary spectral peak")
             if trust["label"] == "reliable":
@@ -591,7 +600,7 @@ class RPPG:
                     return
                 if self._result["reason"] == "sampling_gap" and result["reason"] == "collecting":
                     result["reason"] = "sampling_gap"
-                if result["method"] == "regional_consensus":
+                if result["method"] in TRUSTED_METHODS:
                     self._history.append(result["bpm"])
                     self._last_consensus_t = pts[-1][0]
                     self._provisional_bpms.clear()
@@ -616,7 +625,7 @@ class RPPG:
         why = None
         if bpm is None:
             why = "settling after movement" if res.get("reason") == "settling" else "no estimate"
-        elif res.get("method") != "regional_consensus":
+        elif res.get("method") not in TRUSTED_METHODS:
             why = "no regional consensus"
         elif motion is not None and motion > MOTION_GATE:
             why = "head moving"

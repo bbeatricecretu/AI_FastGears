@@ -275,3 +275,16 @@ def test_pipeline_samples_the_pulse_on_every_camera_frame():
     p._rppg_face = (face, t + 1 - RPPG_FACE_MAX_AGE_S - 0.1)
     p._feed_rppg(frame, t + 1)
     assert p.rppg.status()["face"] is False
+
+
+def test_weak_regions_fall_back_to_main_pooled_estimate():
+    """Each region alone is below 0 dB (noise), pooled over three regions the pulse is clear:
+    main's original pooled estimator is accepted instead of showing nothing."""
+    rng = np.random.default_rng(3)
+    samples = np.array(list(_signals((72, 72, 72), seconds=10)))
+    samples[:, 4:13] += rng.normal(0, 2.2, samples[:, 4:13].shape)   # independent noise per region
+    result = RPPG()._estimate(samples.tolist(), {})
+    assert result["reason"] == "insufficient_regions", result["region_quality"]
+    assert result["method"] == "pooled" and abs(result["bpm"] - 72) <= 3 and result["snr"] >= 0
+    out = RPPG()._filter(result, 10.0)
+    assert out["pulse_state"] == "tracking" and out["bpm"] == result["bpm"]
