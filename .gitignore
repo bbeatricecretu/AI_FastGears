@@ -3,12 +3,14 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
-models/*
-!models/.gitkeep
-data/*
-!data/.gitkeep
+models/
+data/
 *.pt
 *.task
 *.onnx
 .claude/settings.local.json
 .claude/worktrees/
+# locally installed agent skills (not part of the app)
+.agents/
+.claude/skills/
+skills-lock.json
