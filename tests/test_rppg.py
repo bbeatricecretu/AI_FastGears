@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastgears.vision.rppg import (  # noqa: E402
-    RPPG, _display_provisional_bpm, _region_pixels, pos_spectrum, trust_score,
+    RPPG, _display_provisional_bpm, _pooled_accepted, _region_pixels, pos_spectrum, trust_score,
 )
 from fastgears.vision.face import (  # noqa: E402
     FACE_REGION_CONTOURS, PULSE_REGIONS, FaceResult, face_region_contours,
@@ -302,3 +302,15 @@ def test_shown_pulse_is_held_through_a_face_loss():
     assert held["bpm"] == first["bpm"] and held["pulse_state"] == "held"
     r.update(frame, None, t + 20.0)                      # longer than HOLD_MAX_S
     assert r.status()["bpm"] is None
+
+
+@pytest.mark.parametrize("snr,bpm,regions,ok", [
+    (0.5, 72, [None, None, 90], True),      # main's 0 dB gate
+    (-1.1, 71, [70, 74, 65], True),         # weak, but two regions agree (live recording)
+    (-1.9, 70, [67, 73, 70], True),
+    (-5.1, 120, [45, 120, 90], False),      # too weak
+    (-2.3, 50, [74, 50, 79], False),        # only one region agrees: junk peak
+    (-5.2, 45, [73, 92, 62], False),
+])
+def test_pooled_gate_needs_snr_or_regional_agreement(snr, bpm, regions, ok):
+    assert _pooled_accepted(snr, bpm, regions) is ok
