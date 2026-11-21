@@ -19,6 +19,8 @@ import time
 from collections import deque
 from typing import Callable, Protocol
 
+from .intervention import JUDGE_PROMPT, CheckIn, merge_verdict, parse_judge, rule_verdict
+
 log = logging.getLogger("coach")
 
 ALERT_REPEAT_S = 20.0   # an ongoing danger episode is re-announced at most this often
@@ -108,27 +110,40 @@ def make_client(settings) -> LLMClient | None:
 # ── rule-based fallback / instant alerts ────────────────────────────────────
 
 def local_message(state: dict) -> dict | None:
-    """Immediate message for the current state (no network). None when all is fine."""
+    """Immediate message for the current state (no network). None when all is fine.
+    Severity follows the attention level: anything in danger is an "alert"."""
     a = state.get("attention", {})
+    danger = a.get("level") == "danger"
+    sev = "alert" if danger else "warning"
     if a.get("microsleep"):
         return {"message": "Wake up! Eyes on the road now.", "severity": "alert", "reason": "microsleep"}
     if a.get("phone"):
-        return {"message": "Put the phone down and keep both hands on the wheel.", "severity": "alert",
+        if danger:
+            return {"message": "Put the phone down now and keep both hands on the wheel.", "severity": "alert",
+                    "reason": "phone in use"}
+        return {"message": "Phone detected. Put it away and keep your eyes on the road.", "severity": "warning",
                 "reason": "phone in use"}
     if a.get("looking") in ("tilted", "nodding") and any(
             r.startswith(("head tilted", "head dropping")) for r in a.get("reasons", [])):
         return {"message": "Your head is dropping. Sit up, and take a break if you're tired.",
-                "severity": "alert" if a.get("level") == "danger" else "warning", "reason": "head tilted"}
+                "severity": sev, "reason": "head tilted"}
+    if a.get("eyes_closing"):
+        return {"message": "Open your eyes and stay focused on the road.", "severity": sev,
+                "reason": "eyes closing"}
     if a.get("distracted"):
         where = a.get("looking", "away")
-        return {"message": f"You're looking {where}. Eyes back on the road.", "severity": "warning",
-                "reason": f"looking {where}"}
+        where = "away from the road" if where in ("away", "road") else where
+        return {"message": f"Too much time with your eyes off the road. Stop looking {where}, look ahead.",
+                "severity": sev, "reason": "eyes off road"}
     if a.get("hand_off_wheel"):
-        return {"message": "Please keep your hands on the wheel.", "severity": "warning",
+        return {"message": "Please keep your hands on the wheel.", "severity": sev,
                 "reason": "both hands off the wheel"}
-    if a.get("yawning") or (a.get("perclos") or 0) > 0.15:
-        return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": "warning",
+    if a.get("tired"):
+        return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": sev,
                 "reason": "signs of fatigue"}
+    if danger:   # a danger with no specific rule above must still be spoken
+        return {"message": "Danger! Eyes on the road and both hands on the wheel.", "severity": "alert",
+                "reason": "danger"}
     return None
 
 
@@ -136,8 +151,9 @@ def compact_state(state: dict) -> dict:
     """The part of the state the LLM needs (small prompt = fast + cheap)."""
     a = state.get("attention", {})
     p = state.get("pulse", {}) or {}
-    keep = ("level", "reasons", "looking", "off_road_s", "eyes_closed", "eye_closed_s", "perclos",
-            "blinks_per_min", "yawns_5min", "microsleep", "phone", "drowsiness", "distraction", "face_present")
+    keep = ("level", "reasons", "looking", "off_road_s", "off_road_total_s", "eyes_closed", "eye_closed_s",
+            "eyes_closing", "perclos", "tired", "blinks_per_min", "yawns_5min", "microsleep", "phone", "phone_s",
+            "drowsiness", "distraction", "face_present")
     out = {k: a.get(k) for k in keep if k in a}
     loc = local_message(state)
     out["primary_hazard"] = loc["reason"] if loc else None   # one topic per message
@@ -175,10 +191,13 @@ class Coach:
     """Watches the state stream and emits messages via on_message(dict)."""
 
     def __init__(self, client: LLMClient | None, on_message: Callable[[dict], None],
-                 min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English"):
+                 min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English",
+                 checkin: CheckIn | None = None):
         self.client, self.on_message = client, on_message
         self.min_interval_s, self.summary_every_s = min_interval_s, summary_every_s
         self.language = language
+        self.checkin = checkin          # closed-loop alertness check after danger alerts (optional)
+        self._t = 0.0                   # time of the last observe(): the clock for answers/verdicts
         self.history: deque = deque(maxlen=50)
         self._jobs: queue.Queue = queue.Queue(maxsize=1)
         self._last_llm = 0.0
@@ -201,6 +220,7 @@ class Coach:
     # called by the pipeline at ~5 Hz
     def observe(self, state: dict, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
+        self._t = now
         a = state.get("attention", {})
         if not a.get("calibrated", True):
             return
@@ -208,18 +228,40 @@ class Coach:
         loc = local_message(state)
         key = loc["reason"] if loc else None
 
-        # 1) instant local alert once per danger episode (re-announced every ALERT_REPEAT_S
-        #    while it lasts); an episode ends when its reason disappears
+        # 1) instant spoken message, no network: every danger ("alert") and every new warning.
+        #    Alerts are re-announced every ALERT_REPEAT_S while they last, a warning once per
+        #    episode; an episode ends when its reason has been gone EPISODE_GAP_S. The key holds
+        #    the severity too, so a warning that escalates to danger is announced again.
         if key:
             self._last_seen[key] = now
-        for k in [k for k in self._last_local if now - self._last_seen.get(k, -1e9) > EPISODE_GAP_S]:
+        for k in [k for k in self._last_local if now - self._last_seen.get(k.split("|")[0], -1e9) > EPISODE_GAP_S]:
             del self._last_local[k]
-        if loc and loc["severity"] == "alert":
-            if now - self._last_local.get(key, -1e9) > ALERT_REPEAT_S:
-                self._last_local[key] = now
+        alerted = False
+        if loc:
+            ek = f"{key}|{loc['severity']}"
+            repeat = ALERT_REPEAT_S if loc["severity"] == "alert" else float("inf")
+            if ek not in self._last_local or now - self._last_local[ek] > repeat:
+                self._last_local[ek] = now
                 self._emit({**loc, "source": "instant"})
+                alerted = loc["severity"] == "alert"
 
-        # 2) LLM on change, or periodic summary
+        # 2) closed loop: after a danger alert ask the driver a question, then judge the reaction
+        if self.checkin:
+            if alerted and self.checkin.can_start(now):
+                q = self.checkin.start(key, now)
+                if q:
+                    self._emit(q)
+            job = self.checkin.observe(state, now)
+            if job:
+                self._judge_async(job)
+            if self.checkin.active:     # the dialogue owns the voice: no LLM summaries meanwhile
+                self._pending = False
+                self._last_key, self._last_level = key, level
+                if key:
+                    self._prev_seen[key] = now
+                return
+
+        # 3) LLM on change, or periodic summary
         # ask the LLM on a NEW episode (reason not seen in the last EPISODE_GAP_S) or an escalation,
         # not on every flicker of the same situation
         rank = {"ok": 0, "caution": 1, "danger": 2}
@@ -249,9 +291,15 @@ class Coach:
             pass
 
     def chat(self, text: str, state: dict) -> dict:
-        """Synchronous Q&A for the dashboard's 'talk to the co-pilot' box."""
+        """Synchronous Q&A for the dashboard's 'talk to the co-pilot' box. While a check-in waits
+        for an answer, whatever the driver says is that answer."""
         msg = {"role": "user", "message": text[:500], "severity": "info", "source": "user", "t": time.time()}
         self.history.append(msg)
+        if self.checkin and self.checkin.waiting:
+            job = self.checkin.answer(text[:500], self._t)
+            if job:
+                self._judge_async(job)
+                return {"message": "", "severity": "info", "reason": "check-in answer", "source": "check"}
         if not self.client:
             reply = "I'm in offline mode (no LLM key). " + (local_message(state) or {"message": "All looks fine — drive safe."})["message"]
         else:
@@ -265,6 +313,31 @@ class Coach:
         out = {"message": reply.strip()[:400], "severity": "info", "reason": "chat", "source": self.provider}
         self._emit(out)
         return out
+
+    # -- closed-loop check-in ---------------------------------------------------------------
+    def judge(self, job: dict) -> dict:
+        """Verdict for one check-in round: camera rules, made stricter by the LLM when present."""
+        rule = rule_verdict(job)
+        llm = None
+        if self.client:
+            try:
+                txt = self.client.complete(JUDGE_PROMPT.format(language=self.language, hazard=job["hazard"]),
+                                           "Check-in round:\n" + json.dumps(job), json_mode=True)
+                llm = parse_judge(txt)
+            except Exception as e:
+                self.llm_errors += 1
+                log.warning("check-in judge failed: %s", e)
+        return merge_verdict(rule, llm)
+
+    def _judge_async(self, job: dict) -> None:
+        def run():
+            verdict = self.judge(job)
+            for m in self.checkin.resolve(job, verdict, self._t):
+                self._emit(m)
+        threading.Thread(target=run, name="checkin-judge", daemon=True).start()
+
+    def checkin_status(self) -> dict:
+        return self.checkin.status(self._t) if self.checkin else {"active": False}
 
     def _worker(self) -> None:
         while True:

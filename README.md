@@ -93,17 +93,20 @@ measurements, and only the driver's hands and phone count. Passengers get a grey
   neutral head pose, so glasses, face shape and camera position don't matter. The *Recalibrate*
   button repeats it.
 - **Eyes closed:** EAR below 60 % of the driver's baseline, or the MediaPipe eyeBlink blendshape ≥ 0.5.
-- **Microsleep:** eyes closed ≥ 1.5 s → **danger**. The closure score fades within ~2 s once the eyes reopen.
-- **PERCLOS:** the share of time with the eyes ≥ 80 % closed, as an exponentially weighted average
-  (time constant 20 s: recent seconds weigh most). ≥ 15 % means tired. It is a trend, so it can raise
-  **caution** but never holds **danger**; after a long closure it fades back in ~15–20 s.
+- **Eyes closed too long:** ≥ 2 s → **caution** and a spoken warning; ≥ 5 s → **microsleep, danger**.
+  The closure score fades within ~2 s once the eyes reopen.
+- **PERCLOS:** the share of time with the eyes ≥ 80 % closed over the **last 5 min**. ≥ 15 % means
+  **tired** (caution), judged only once 60 s of history exist. It is a trend: it can raise caution but
+  never holds danger.
 - **Head tilted (nodding off):** head rolled ≥ 35° from the driver's normal pose, e.g. lying on a
   shoulder. Counts as drowsiness after 1 s and reaches **danger** at 3 s. Pitch/yaw are unreliable
   while the head is rolled that far, so it is not reported as "looking up/down".
 - **Yawns:** mouth wide open (MAR / jawOpen ≥ 0.6) for ≥ 1.5 s, only while the head is near neutral
-  (a tilted head distorts the mouth shape). Each yawn adds 15 drowsiness, fading to 0 over 5 min.
+  (a tilted head distorts the mouth shape). **More than 6 yawns in 5 min = tired** (caution); a single yawn is shown but raises nothing.
 - **Looking:** head yaw/pitch relative to the baseline, plus iris position → road / left / right /
-  down / up / away. **Distracted** = off the road ≥ 2 s.
+  down / up / away. Off-road seconds are **summed over the last 60 s**: **distracted (danger)** when the total reaches
+  **20 s**, so many short glances add up while one glance doesn't trigger an alarm. 2 s back on the
+  road clears the danger; the total stays in the window, so the next glance re-triggers sooner.
 - **Phone:** three layers, steadied by an on/off latch (on after 2 hits in 1.5 s, off after 1.5 s
   without one):
   1. YOLOv8n on the full frame, and a phone-only pass on a high-resolution crop **around each raised
@@ -111,6 +114,7 @@ measurements, and only the driver's hands and phone count. Passengers get a grey
      phones visible.
   2. If a hand is up but YOLO sees no phone, **Gemini vision** looks at the driver crop (at most every
      5 s, `PHONE_VISION_CHECK=1`).
+  Phone seen → **caution** and a spoken warning at once; **in use for 10 s → danger**.
   3. Even without a recognised phone, a hand held at face/chest level for ≥ 1.5 s = **hand off the
      wheel** (caution).
 - **Pulse:** windows where the head moved or the signal is below the noise are rejected, and the last
@@ -119,6 +123,24 @@ measurements, and only the driver's hands and phone count. Passengers get a grey
   3 BPM/s.
 
 Thresholds are constants at the top of `fastgears/vision/attention.py`.
+
+## Closed-loop alertness check (R2)
+
+Every **danger** is spoken at once (no network), and every new warning once. After a danger alert the
+co-pilot runs a short **check-in** (`fastgears/llm/intervention.py`):
+
+1. **Alert + question:** "Eyes on the road!", then a question about the road, e.g. *"What is directly
+   ahead of you right now?"*. Once it has been read out, the browser opens the microphone (or type).
+2. **Measure the reaction:** while waiting (up to 12 s) the camera records how fast the eyes came back
+   to the road, the share of time they stayed there, and whether the danger is still on.
+3. **Judge:** Gemini judges the answer (a real, coherent answer about the road?) together with that
+   reaction. The camera rules are a hard floor: the LLM can make the verdict stricter, never pass a
+   driver who is still in danger or whose eyes are off the road. Without an LLM the rules decide.
+4. **Decide:** ok → thanks, back to the neutral state (30 s cooldown). Not ok → it says why and asks a
+   new question. After 3 failed questions: *"Please stop at the next safe place and take a break."*
+
+The dashboard shows the check (question, round, seconds left). Settings: `CHECKIN`,
+`CHECKIN_ANSWER_S`, `CHECKIN_MAX_ROUNDS`, `CHECKIN_COOLDOWN_S`.
 
 ## Setup
 
@@ -223,10 +245,11 @@ Panoul semnalează punctele regionale în afara imaginii, capul prea rotit, faț
 ### Demo script (≈2 min, for the jury)
 
 1. Sit normally: the banner says **ATTENTIVE**, the pulse appears after about 10 s.
-2. Look left or at your lap for 3 s: **looking left/down → CAUTION**, and the voice tells you to look
+2. Look left or at your lap, on and off, until 20 s of off-road time add up: **eyes off road → DANGER**,
+   the voice alert, then the **alertness check** (answer the question by voice). The voice tells you to look
    at the road.
-3. Hold up a phone: **phone in use → DANGER**, an instant alert, then the LLM's message.
-4. Close your eyes for 2 s: **microsleep → DANGER** ("Wake up!").
+3. Hold up a phone: a warning at once, **DANGER after 10 s**, then the alertness check.
+4. Close your eyes: a warning at 2 s, **microsleep → DANGER at 5 s** ("Wake up!").
 5. Yawn a few times or keep your eyes half-closed: PERCLOS rises and the co-pilot suggests a break.
 6. Ask the co-pilot "How am I doing?" (mic or text). It answers from the live state.
 

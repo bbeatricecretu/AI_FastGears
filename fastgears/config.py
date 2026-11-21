@@ -64,6 +64,11 @@ class Settings:
     llm_min_interval_s: float = float(os.getenv("LLM_MIN_INTERVAL_S", "8"))
     llm_summary_every_s: float = float(os.getenv("LLM_SUMMARY_EVERY_S", "45"))
     language: str = os.getenv("ASSISTANT_LANGUAGE", "English")
+    # closed-loop check-in after a danger alert: question -> answer + camera reaction -> verdict
+    checkin: bool = _bool("CHECKIN", True)
+    checkin_answer_s: float = float(os.getenv("CHECKIN_ANSWER_S", "12"))
+    checkin_max_rounds: int = int(os.getenv("CHECKIN_MAX_ROUNDS", "3"))
+    checkin_cooldown_s: float = float(os.getenv("CHECKIN_COOLDOWN_S", "30"))
 
 
 settings = Settings()

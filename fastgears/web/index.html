@@ -45,6 +45,9 @@
   .msg.warning { border-color: var(--caution); } .msg.alert { border-color: var(--danger); }
   .msg.user { border-color: var(--muted); color: var(--muted); }
   .msg small { color: var(--muted); font-size: 11px; display: block; }
+  #check { border: 1px solid var(--caution); color: var(--caution); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+  #check b { color: var(--text); }
+  #mic.listening { border-color: var(--danger); color: var(--danger); }
   form { display: flex; gap: 8px; margin-top: 8px; }
   input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: inherit; }
   .legend { color: var(--muted); font-size: 12px; } .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin: 0 4px 0 10px; }
@@ -146,6 +149,7 @@
     </div>
     <div class="card">
       <h2>Co-pilot</h2>
+      <div id="check" role="status" hidden></div>
       <div id="feed"></div>
       <form id="chat">
         <input id="q" placeholder="Ask the co-pilot… (e.g. how am I doing?)" autocomplete="off">
@@ -165,13 +169,28 @@ $('voice').onclick = () => { voice = !voice; $('voice').classList.toggle('on', v
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 
 function speak(m) {
-  if (!voice || !('speechSynthesis' in window)) return;
+  // a check-in question opens the mic once it has been read out (at once when voice is off)
+  if (!voice || !('speechSynthesis' in window)) { if (m.expects_answer) listenForAnswer(); return; }
   const now = Date.now();
-  if (m.severity === 'info' && now - lastSpoken < 4000) return;
+  if (m.severity === 'info' && !(m.reason || '').startsWith('check-in') && now - lastSpoken < 4000) return;
   if (m.severity === 'alert') speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(m.message);
   u.rate = m.severity === 'alert' ? 1.15 : 1.0;
+  if (m.expects_answer) u.onend = () => listenForAnswer();
   speechSynthesis.speak(u); lastSpoken = now;
+}
+
+function renderCheck(c) {
+  const el = $('check');
+  if (!c || !c.active) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = '';
+  const head = document.createElement('div');
+  head.textContent = `Alertness check · question ${c.round}/${c.max_rounds}`
+    + (c.phase === 'judging' ? ' · checking your answer…' : c.seconds_left != null ? ` · ${Math.ceil(c.seconds_left)} s to answer` : '');
+  const q = document.createElement('b');
+  q.textContent = c.question || '';
+  el.append(head, q);
 }
 
 function addMsg(m) {
@@ -225,6 +244,7 @@ function onState(s) {
   const extra = dr.passengers ? ` · ${dr.passengers} ignored` : '';
   set('m-face', (dr.status === 'locked' ? 'locked' : dr.status === 'lost' ? `lost ${dr.lost_s}s` : 'searching') + extra,
       dr.status !== 'locked');
+  renderCheck(s.check);
   renderGestures(s.discomfort || {});
   renderRgb(s.rgb || {});
   const now = Date.now() / 1000;
@@ -451,10 +471,18 @@ $('chat').onsubmit = async e => {
 };
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false;
+function listenForAnswer() {
+  $('q').placeholder = 'Answer the co-pilot…'; $('q').focus();
+  if (!rec || listening) return;
+  try { rec.start(); } catch (e) { /* already started */ }
+}
 if (SR) {
-  const rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
+  rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
+  rec.onstart = () => { listening = true; $('mic').classList.add('listening'); };
+  rec.onend = () => { listening = false; $('mic').classList.remove('listening'); $('q').placeholder = 'Ask the co-pilot… (e.g. how am I doing?)'; };
   rec.onresult = e => { $('q').value = e.results[0][0].transcript; $('chat').requestSubmit(); };
-  $('mic').onclick = () => rec.start();
+  $('mic').onclick = () => listenForAnswer();
 } else { $('mic').disabled = true; $('mic').title = 'Speech input not supported in this browser'; }
 </script>
 </body>

@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from .config import settings
 from .llm import Coach, make_client
+from .llm.intervention import CheckIn
 from .pipeline import Pipeline
 
 log = logging.getLogger("server")
@@ -58,7 +59,9 @@ async def lifespan(app: FastAPI):
                   on_message=lambda m: hub.publish_threadsafe({"type": "message", **m}),
                   min_interval_s=settings.llm_min_interval_s,
                   summary_every_s=settings.llm_summary_every_s,
-                  language=settings.language)
+                  language=settings.language,
+                  checkin=CheckIn(settings.checkin_answer_s, settings.checkin_max_rounds,
+                                  settings.checkin_cooldown_s) if settings.checkin else None)
     pipeline = Pipeline(settings, on_state=_on_state).start()
     task = asyncio.create_task(_state_pump())
     log.info("dashboard: http://%s:%d  (LLM: %s)", settings.host, settings.port, coach.provider)
@@ -75,6 +78,7 @@ async def _state_pump():
             st = pipeline.state()
             st["llm"] = {"provider": coach.provider, "errors": coach.llm_errors,
                          "latency_ms": coach.last_latency_ms} if coach else None
+            st["check"] = coach.checkin_status() if coach else {"active": False}
             await hub.broadcast({"type": "state", **st})
 
 
