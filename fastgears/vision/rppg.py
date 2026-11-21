@@ -362,6 +362,11 @@ class RPPG:
         if exposure is not None and self._v4l2:
             self._maybe_gain(*exposure, t)
 
+    def reset(self) -> None:
+        """Discard pulse samples when recalibration can select a different driver."""
+        with self._lock:
+            self._reset_window("collecting")
+
     def _reset_window(self, reason):
         """Reset sampling state with the buffer lock held."""
         self._gen += 1

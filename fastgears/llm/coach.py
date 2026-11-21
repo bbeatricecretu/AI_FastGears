@@ -107,12 +107,23 @@ def local_message(state: dict) -> dict | None:
     if a.get("phone"):
         return {"message": "Put the phone down and keep both hands on the wheel.", "severity": "alert",
                 "reason": "phone in use"}
+    posture = state.get("driver_posture", {})
+    if posture.get("active"):
+        return {"message": "Your head is dropping. Pull over safely if you feel tired.",
+                "severity": posture["severity"], "reason": "head dropping"}
+    extra_warning = (state.get("driver_attention") or {}).get("active_warning")
+    if extra_warning and extra_warning["voice"] and extra_warning["reason"] in ("nod", "severe", "eyes"):
+        return {"message": extra_warning["message"], "severity": extra_warning["severity"],
+                "reason": "driver drowsiness"}
     if a.get("distracted"):
         where = a.get("looking", "away")
         return {"message": f"You're looking {where}. Eyes back on the road.", "severity": "warning",
                 "reason": f"looking {where}"}
     if a.get("level") == "danger":
         return {"message": "Danger: please focus on the road.", "severity": "alert", "reason": "danger"}
+    if (state.get("driver_alerts", {}).get("hands") or {}).get("active"):
+        return {"message": "Please keep your hands on the wheel.", "severity": "warning",
+                "reason": "both hands off the wheel"}
     if a.get("yawning") or (a.get("perclos") or 0) > 0.15:
         return {"message": "You seem tired. Plan a break at the next rest stop.", "severity": "warning",
                 "reason": "signs of fatigue"}
@@ -132,6 +143,9 @@ def compact_state(state: dict) -> dict:
     event = (state.get("discomfort") or {}).get("event")
     if event:
         out["discomfort_grimace"] = {k: event[k] for k in ("duration_ms", "evidence", "coverage")}
+    alerts = state.get("driver_alerts", {})
+    if alerts:
+        out["driver_alerts"] = {kind: item["active"] for kind, item in alerts.items()}
     out["driving_minutes"] = round(state.get("uptime_s", 0) / 60, 1)
     return out
 
@@ -192,6 +206,8 @@ class Coach:
             if now - self._last_local.get(key, -1e9) > 6:
                 self._last_local[key] = now
                 self._emit({**loc, "source": "instant"})
+        elif loc and key != self._last_key and key in ("both hands off the wheel", "head dropping", "driver drowsiness"):
+            self._emit({**loc, "source": "instant"})
 
         # 2) LLM on change, or periodic summary
         changed = key != self._last_key or level != self._last_level

@@ -15,6 +15,7 @@ import numpy as np
 
 from .camera import Camera
 from .config import Settings
+from .vision.driver_assistance import DriverAssistance
 from .vision.driver_signals import assess_driver
 from .vision.face import FACE_REGION_CONTOURS, PULSE_REGIONS, face_region_contours
 
@@ -33,6 +34,8 @@ class Pipeline:
         self.face = self.rppg = self.objects = self.rgb = None
         self.errors: dict[str, str] = {}
         self._load_detectors()
+        self.assistance = DriverAssistance(settings, self.errors)
+        self._last_frame_shape = None
         self._jpeg: bytes | None = None
         self._last_preview_t: float | None = None
         self._state: dict = {"attention": {}, "pulse": {}, "objects": [], "status": "starting"}
@@ -89,6 +92,8 @@ class Pipeline:
     def stop(self) -> None:
         self._stop.set()
         self.camera.stop()
+        if self.objects:
+            self.objects.stop_live()
 
     def recalibrate(self) -> None:
         self._recalibrate.set()
@@ -108,8 +113,13 @@ class Pipeline:
         while not self._stop.is_set():
             if self._recalibrate.is_set():
                 self._recalibrate.clear()
+                self.assistance.reset()
                 self.attention.reset_calibration()
                 self.discomfort.reset()
+                if self.rppg:
+                    self.rppg.reset()
+                if self.objects:
+                    self.objects.reset_live()
                 if self.rgb:
                     self.rgb.reset()
             seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
@@ -128,15 +138,16 @@ class Pipeline:
                 self.proc_fps, n, t_fps = n / (t - t_fps), 0, t
 
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
-        face = self.face.process(frame, t_ms) if self.face else None
+        self._last_frame_shape = frame.shape
+        face = self.assistance.select_face(self.face, frame, t, t_ms)
         regions = face_region_contours(face, frame.shape)
         rgb_state = self._rgb_state(frame, face, regions, t)
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t,
                              landmarks=face.landmarks_px if face else None)
-        dets = self.objects.detect(frame) if self.objects else []
-        phone = bool(self.objects and self.objects.phone_in_use(dets, face, frame.shape))
+        dets, phone = self.assistance.update_objects(self.objects, frame, face, t, t_ms)
         att = self.attention.update(face, t, phone=phone)
+        objects_available = self.objects is not None and not self.assistance.objects_failed
         gestures = self.discomfort.update(face, t, frame.shape,
                                           missing_reason="face_model_unavailable" if self.face is None else "face_not_visible")
         pulse = self.rppg.status() if self.rppg else {}
@@ -145,6 +156,7 @@ class Pipeline:
             "uptime_s": round(t - self._t0, 1),
             "status": "running",
             "attention": att,
+            **self.assistance.state(face, att, t, phone, objects_available),
             "discomfort": gestures,
             "rgb": rgb_state,
             "driver_signals": assess_driver(t, att, gestures, rgb_state, pulse),
@@ -155,7 +167,9 @@ class Pipeline:
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
                        "proc_fps": round(self.proc_fps, 1), "size": [frame.shape[1], frame.shape[0]]},
             "detectors": {"face": self.face is not None, "rppg": self.rppg is not None,
-                          "objects": self.objects is not None, "errors": self.errors},
+                          "hands": self.assistance.hands is not None,
+                          "phone_vision": self.assistance.phone_vision is not None,
+                          "objects": objects_available, "errors": self.errors},
         }
         preview_due = self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S
         masks_current = (not self.rgb or not self.s.rgb_overlay or not rgb_state.get("regions")
@@ -171,6 +185,10 @@ class Pipeline:
     def _publish_no_camera(self) -> None:
         t = time.monotonic()
         attention = self.attention.update(None, t)
+        if self._last_frame_shape is not None:
+            self.assistance.driver.update([], self._last_frame_shape, t)
+        self.assistance.clear_hands()
+        assistance = self.assistance.state(None, attention, t, False, False)
         gestures = self.discomfort.update(None, t, missing_reason="no_camera_frame")
         if self.rppg:
             self.rppg.update(None, None, t)
@@ -179,6 +197,7 @@ class Pipeline:
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
                            "attention": attention,
+                           **assistance,
                            "discomfort": gestures,
                            "rgb": rgb_state,
                            "driver_signals": {"finding": "camera_unavailable"},
@@ -209,6 +228,7 @@ class Pipeline:
                 cv2.rectangle(img, (x0, y0), (x1, y1), c, 2)
                 cv2.putText(img, f'{d["label"]} {d["conf"]:.2f}', (x0, max(15, y0 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
+        self.assistance.draw(img)
         if face is not None:
             x0, y0, x1, y1 = map(int, face.bbox)
             cv2.rectangle(img, (x0, y0), (x1, y1), col, 2)

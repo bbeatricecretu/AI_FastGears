@@ -303,8 +303,10 @@ def test_options_and_pipeline_preserve_gestures_when_rgb_cannot_measure():
     frame, face, _ = sample()
     gray = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
     with patch("fastgears.vision.face.FaceTracker") as tracker:
-        tracker.return_value.process.return_value = face
-        p = Pipeline(Settings(enable_rppg=False, enable_objects=False, enable_rgb=True))
+        tracker.return_value.process_all.return_value = [face]
+        tracker.return_value.process_scene.return_value = [face]
+        p = Pipeline(Settings(enable_rppg=False, enable_objects=False, enable_rgb=True, enable_hands=False))
+        p.assistance.driver.lock_frames = 1
         p._step(gray, p._t0 + 0.1, 100)
     state = p.state()
     assert state["rgb"]["lighting"] == "color_unavailable"
@@ -313,15 +315,17 @@ def test_options_and_pipeline_preserve_gestures_when_rgb_cannot_measure():
 
 
 def test_pipeline_detects_a_colour_change_without_a_reference_rectangle():
-    config = Settings(enable_rppg=False, enable_objects=False, enable_rgb=True, rgb_reference="",
+    config = Settings(enable_rppg=False, enable_objects=False, enable_rgb=True, enable_hands=False, rgb_reference="",
                       rgb_calibration_s="0.4", rgb_persistence_s="0.4")
     with patch("fastgears.vision.face.FaceTracker") as tracker, \
             patch("fastgears.pipeline.face_region_contours", return_value=CONTOURS):
         pipeline = Pipeline(config)
+        pipeline.assistance.driver.lock_frames = 1
         for index in range(15):
             cheek = ORIGINAL if index < 8 else (58, 29, 22)
             frame, face, _ = sample(right=cheek, left=cheek)
-            tracker.return_value.process.return_value = face
+            tracker.return_value.process_all.return_value = [face]
+            tracker.return_value.process_scene.return_value = [face]
             pipeline._step(frame, pipeline._t0 + index / 10, index * 100)
     state = pipeline.state()
     assert state["rgb"]["lighting_source"] == "forehead" and state["rgb"]["reference_rect"] is None

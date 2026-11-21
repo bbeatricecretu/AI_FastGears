@@ -211,10 +211,10 @@ def ensure_face_model(models_dir: str = "models") -> str:
 
 
 class FaceTracker:
-    """MediaPipe Face Landmarker (VIDEO mode, one face) on full BGR frames."""
+    """MediaPipe face landmarks with optional multi-face and driver crop passes."""
 
     def __init__(self, model_path: str | None = None,
-                 models_dir: str = "models", max_input_side: int = 768):
+                 models_dir: str = "models", max_input_side: int = 768, num_faces: int = 1):
         self._max_input_side = max_input_side
         if model_path is None or not os.path.exists(model_path):
             model_path = ensure_face_model(models_dir)
@@ -230,13 +230,31 @@ class FaceTracker:
             base_options=BaseOptions(model_asset_path=model_path),
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=True,
-            num_faces=1,
+            num_faces=num_faces,
             running_mode=vision.RunningMode.VIDEO,
         )
         self._landmarker = vision.FaceLandmarker.create_from_options(opts)
         self._last_ts = -1
+        self._roi_landmarker = None
+        self._scene_landmarker = None
+        self._roi_options = vision.FaceLandmarkerOptions(
+            base_options=opts.base_options, output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True, num_faces=1,
+            min_face_detection_confidence=0.4, min_face_presence_confidence=0.4,
+            running_mode=vision.RunningMode.IMAGE,
+        )
+        self._scene_options = vision.FaceLandmarkerOptions(
+            base_options=opts.base_options, output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True, num_faces=3,
+            running_mode=vision.RunningMode.IMAGE,
+        )
+        self._create_landmarker = vision.FaceLandmarker.create_from_options
 
     def process(self, frame_bgr: np.ndarray, t_ms: int) -> FaceResult | None:
+        faces = self.process_all(frame_bgr, t_ms)
+        return faces[0] if faces else None
+
+    def process_all(self, frame_bgr: np.ndarray, t_ms: int) -> list[FaceResult]:
         import cv2
         # VIDEO mode requires strictly increasing integer timestamps.
         ts = int(t_ms)
@@ -253,26 +271,57 @@ class FaceTracker:
         image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
                                data=np.ascontiguousarray(rgb))
         result = self._landmarker.detect_for_video(image, ts)
-        if not result.face_landmarks:
+        return self._results(result, frame_bgr.shape, 0, 0, w, h)
+
+    def process_roi(self, frame_bgr: np.ndarray, roi) -> FaceResult | None:
+        import cv2
+
+        x0, y0, x1, y1 = roi
+        if x1 - x0 < 32 or y1 - y0 < 32:
             return None
-        pts = result.face_landmarks[0]
-        lm = np.array([(p.x * w, p.y * h, p.z * w) for p in pts],
-                      dtype=np.float64)
-        bs: dict[str, float] = {}
-        if result.face_blendshapes:
-            for c in result.face_blendshapes[0]:
-                name = getattr(c, "category_name", None) or \
-                    getattr(c, "name", None)
-                if name:
-                    bs[name] = float(c.score)
-        mat = None
-        if result.facial_transformation_matrixes:
-            mat = np.asarray(result.facial_transformation_matrixes[0],
-                             dtype=np.float64)
-        return face_result_from_landmarks(lm, frame_bgr.shape, bs, mat)
+        if self._roi_landmarker is None:
+            self._roi_landmarker = self._create_landmarker(self._roi_options)
+        rgb = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
+        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        result = self._roi_landmarker.detect(image)
+        faces = self._results(result, frame_bgr.shape, x0, y0, x1 - x0, y1 - y0)
+        return faces[0] if faces else None
+
+    def process_scene(self, frame_bgr: np.ndarray) -> list[FaceResult]:
+        """Detect passengers periodically without slowing the single-face video tracker."""
+        import cv2
+
+        if self._scene_landmarker is None:
+            self._scene_landmarker = self._create_landmarker(self._scene_options)
+        h, w = frame_bgr.shape[:2]
+        scale = min(1.0, self._max_input_side / max(h, w))
+        scene = cv2.resize(frame_bgr, (max(1, round(w * scale)), max(1, round(h * scale)))) if scale < 1 else frame_bgr
+        rgb = cv2.cvtColor(scene, cv2.COLOR_BGR2RGB)
+        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        return self._results(self._scene_landmarker.detect(image), frame_bgr.shape, 0, 0, w, h)
+
+    @staticmethod
+    def _results(result, frame_shape, x0, y0, width, height) -> list[FaceResult]:
+        faces = []
+        for index, points in enumerate(result.face_landmarks or []):
+            landmarks = np.array([(x0 + p.x * width, y0 + p.y * height, p.z * width)
+                                  for p in points], dtype=np.float64)
+            shapes = result.face_blendshapes or []
+            blendshapes = {}
+            if index < len(shapes):
+                for category in shapes[index]:
+                    name = getattr(category, "category_name", None) or getattr(category, "name", None)
+                    if name:
+                        blendshapes[name] = float(category.score)
+            matrices = result.facial_transformation_matrixes or []
+            matrix = np.asarray(matrices[index], dtype=np.float64) if index < len(matrices) else None
+            faces.append(face_result_from_landmarks(landmarks, frame_shape, blendshapes, matrix))
+        return faces
 
     def close(self) -> None:
-        try:
-            self._landmarker.close()
-        except Exception:
-            pass
+        for landmarker in (self._landmarker, self._roi_landmarker, self._scene_landmarker):
+            if landmarker is not None:
+                try:
+                    landmarker.close()
+                except Exception:
+                    pass

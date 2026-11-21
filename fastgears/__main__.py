@@ -6,7 +6,7 @@ import os
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="FastGears driver monitor")
-    ap.add_argument("--camera", help="webcam index (0,1,..) or a video file for dev replay")
+    ap.add_argument("--camera", help="webcam index, Windows dshow:device name, or video file for dev replay")
     ap.add_argument("--camera-backend", choices=("auto", "dshow", "msmf"),
                     help="Windows camera capture backend")
     ap.add_argument("--port", type=int)

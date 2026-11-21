@@ -60,7 +60,7 @@ def test_camera_loss_clears_stale_attention_and_combined_finding(monkeypatch):
     from fastgears.pipeline import Pipeline
 
     monkeypatch.setattr("fastgears.vision.face.FaceTracker", lambda **kwargs: None)
-    pipeline = Pipeline(Settings(enable_rppg=False, enable_objects=False, enable_rgb=False))
+    pipeline = Pipeline(Settings(enable_rppg=False, enable_objects=False, enable_rgb=False, enable_hands=False))
     pipeline._state["attention"] = {"face_present": True, "microsleep": True}
     pipeline._state["driver_signals"] = {"finding": "possible_presyncope", "stop_safely": True}
     pipeline._publish_no_camera()

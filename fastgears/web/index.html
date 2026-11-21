@@ -57,6 +57,10 @@
   #driver-signals .m span { font-size: 14px; overflow-wrap: anywhere; }
   #driver-signals[data-stop="true"] { border-color: var(--caution); }
   #signals-action { color: var(--caution); font-weight: 600; }
+  #driver-alerts .grid + .grid { margin-top: 8px; }
+  #driver-alerts .m span { font-size: 14px; }
+  #driver-alerts .m[data-active="true"] { border-color: var(--caution); }
+  #driver-alert-details { margin: 0 0 8px; color: var(--caution); }
 </style>
 </head>
 <body>
@@ -103,6 +107,26 @@
         <div class="m" id="m-face"><small>Face</small><span>–</span></div>
       </div>
     </div>
+    <section class="card" id="driver-alerts" aria-labelledby="driver-alerts-title">
+      <h2 id="driver-alerts-title">Alerte șofer</h2>
+      <p id="driver-alert-details" role="status" hidden></p>
+      <div class="grid">
+        <div class="m" id="driver-alert-attention"><small>Oboseală / neatenție</small><span>–</span></div>
+        <div class="m" id="driver-alert-hands"><small>Ambele mâini ridicate</small><span>–</span></div>
+        <div class="m" id="driver-alert-phone"><small>Telefon în mână</small><span>–</span></div>
+      </div>
+      <div class="grid">
+        <div class="m" id="driver-lock"><small>Șofer / pasageri</small><span>–</span></div>
+        <div class="m" id="driver-hands"><small>Mâinile șoferului</small><span>–</span></div>
+        <div class="m" id="driver-eyes"><small>Ochi stâng / drept</small><span>–</span></div>
+        <div class="m" id="driver-coverage"><small>Acoperire PERCLOS</small><span>–</span></div>
+        <div class="m" id="driver-blink"><small>Ultima clipire</small><span>–</span></div>
+        <div class="m" id="driver-nods"><small>Coborâri ale capului</small><span>–</span></div>
+        <div class="m" id="driver-glances"><small>Priviri scurte în afara drumului</small><span>–</span></div>
+        <div class="m" id="driver-yawns"><small>Căscaturi observate</small><span>–</span></div>
+        <div class="m" id="driver-droop"><small>Pleoape lăsate</small><span>–</span></div>
+      </div>
+    </section>
     <section class="card" id="driver-signals" aria-labelledby="signals-title">
       <h2 id="signals-title">Diagnosticele</h2>
       <p id="signals-finding" role="status">Se așteaptă datele camerei.</p>
@@ -189,6 +213,7 @@ function addMsg(m) {
 
 function onState(s) {
   const a = s.attention || {}, p = s.pulse || {}, c = s.camera || {};
+  renderDriverAlerts(s);
   renderDriverSignals(s.driver_signals || {}, s);
   $('fps').textContent = c.connected ? `${c.fps ?? '–'} cam / ${c.proc_fps ?? '–'} proc fps` : 'no camera';
   if (s.llm) $('llm').textContent = `LLM ${s.llm.provider}` + (s.llm.latency_ms ? ` · ${s.llm.latency_ms} ms` : '');
@@ -222,6 +247,40 @@ function onState(s) {
   const now = Date.now() / 1000;
   hist.push({ t: now, drow, dist, bpm: trust.label && trust.label !== 'unreliable' ? p.bpm : null });
   while (hist.length && now - hist[0].t > 120) hist.shift();
+}
+
+function renderDriverAlerts(s) {
+  const live = s.status === 'running';
+  const alerts = live ? s.driver_alerts || {} : {};
+  for (const key of ['attention', 'hands', 'phone']) {
+    const active = alerts[key]?.active;
+    const id = `driver-alert-${key}`;
+    set(id, active == null ? 'Indisponibil' : active ? 'Alertă' : 'Fără alertă');
+    $(id).dataset.active = active === true;
+  }
+  const messages = (alerts.attention?.messages || []).join(' ');
+  const detail = $('driver-alert-details');
+  if (detail.textContent !== messages) detail.textContent = messages;
+  detail.hidden = !messages;
+  const driver = live ? s.driver || {} : {};
+  const lock = { searching: 'Se caută șoferul', locked: 'Șofer urmărit', lost: 'Șoferul a ieșit din cadru' };
+  set('driver-lock', driver.status ? `${lock[driver.status]} · ${driver.passengers} pasageri` : '–');
+  const hands = live ? s.hands || {} : {};
+  set('driver-hands', hands.available && driver.status === 'locked' ? `${hands.driver} vizibile · ${hands.free} ridicate` : '–');
+  $('driver-alert-phone').title = { yolo: 'YOLO', 'gemini-vision': 'Gemini Vision' }[hands.phone_source] || '';
+  const metrics = live ? s.driver_attention || {} : {};
+  const visible = metrics.face_present;
+  const eye = closed => closed ? 'închis' : 'deschis';
+  const duration = seconds => seconds == null ? '–' : `${Math.round(seconds * 1000)} ms`;
+  set('driver-eyes', visible && metrics.eyes ? metrics.eyes.map(eye).join(' / ') : '–');
+  set('driver-coverage', visible ? `${Math.round((metrics.perclos_coverage || 0) * 100)}%` : '–');
+  set('driver-blink', visible ? duration(metrics.blink_duration_s) : '–');
+  $('driver-blink').title = visible && metrics.blink_baseline_s != null
+    ? `Reper ${duration(metrics.blink_baseline_s)} · media ${duration(metrics.average_blink_s)}` : '';
+  set('driver-nods', visible ? metrics.recent_nods ?? '–' : '–');
+  set('driver-glances', visible ? metrics.inattention?.short_glances ?? '–' : '–');
+  set('driver-yawns', visible ? metrics.recent_yawns ?? '–' : '–');
+  set('driver-droop', visible && metrics.drooping != null ? (metrics.drooping ? 'Observate' : 'Fără semne') : '–');
 }
 
 const signalFindings = {
@@ -420,6 +479,7 @@ function connect() {
   ws.onopen = () => { $('conn').textContent = 'live'; };
   ws.onclose = () => {
     $('conn').textContent = 'reconnecting…';
+    renderDriverAlerts({});
     renderDriverSignals({finding: 'disconnected'});
     setTimeout(connect, 1000);
   };
