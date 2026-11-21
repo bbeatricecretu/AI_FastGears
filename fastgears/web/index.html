@@ -217,8 +217,7 @@ function onState(s) {
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
   const pulseStatus = pulseProgress(p);
-  set('m-pulse', p.bpm ? p.bpm + ' bpm' + (p.pulse_state === 'held' ? ` · held (${p.rejected})`
-                       : p.pulse_state === 'provisional' ? ' · provisional' : '')
+  set('m-pulse', p.bpm ? p.bpm + ' bpm' + (p.pulse_state === 'held' ? ` · held (${p.rejected})` : '')
                        : pulseStatus);
   $('m-pulse').title = p.reason ? pulseStatus : '';
   set('m-trust', trust.label ? `${trust.label} ${trust.score}` : '–', trust.label === 'unreliable');

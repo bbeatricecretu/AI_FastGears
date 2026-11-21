@@ -22,6 +22,10 @@ log = logging.getLogger("pipeline")
 
 COLORS = {"ok": (80, 200, 80), "caution": (0, 190, 255), "danger": (60, 60, 255)}
 PREVIEW_INTERVAL_S = 1 / 12
+# The pulse is sampled on every camera frame (~30 fps) in its own thread, with the driver's
+# latest landmarks from the (slower, ~8 fps) detector loop. The estimator needs >= 12 samples/s
+# for a trusted reading; the detector loop alone can't give that on a laptop CPU.
+RPPG_FACE_MAX_AGE_S = 0.5        # landmarks older than this: no face for the pulse
 
 
 class Pipeline:
@@ -44,6 +48,8 @@ class Pipeline:
         self.proc_fps = 0.0
         self._stop = threading.Event()
         self._recalibrate = threading.Event()
+        self._rppg_face: tuple | None = None   # (driver FaceResult, its frame time) for the pulse thread
+        self._rppg_lock = threading.Lock()
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
@@ -105,6 +111,8 @@ class Pipeline:
     def start(self) -> "Pipeline":
         self.camera.start()
         threading.Thread(target=self._loop, name="pipeline", daemon=True).start()
+        if self.rppg:
+            threading.Thread(target=self._rppg_loop, name="rppg", daemon=True).start()
         return self
 
     def stop(self) -> None:
@@ -161,9 +169,8 @@ class Pipeline:
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         regions = face_region_contours(face, frame.shape)
         rgb_state = self._rgb_state(frame, face, regions, t)
-        if self.rppg:
-            self.rppg.update(frame, face.eyes if face else None, t,
-                             landmarks=face.landmarks_px if face else None)
+        with self._rppg_lock:                             # the pulse thread samples every frame
+            self._rppg_face = (face, t) if face is not None else None
         from .vision.hands import free_hands, hand_crop, on_open_palm
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
@@ -238,6 +245,27 @@ class Pipeline:
             self._state = state
         if self.on_state:
             self.on_state(state)
+
+    def _rppg_loop(self) -> None:
+        seq = -1
+        while not self._stop.is_set():
+            seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
+            if frame is None or t is None or seq2 == seq:
+                continue
+            seq = seq2
+            try:
+                self._feed_rppg(frame, t)
+            except Exception:
+                log.exception("pulse sampling failed")
+
+    def _feed_rppg(self, frame: np.ndarray, t: float) -> None:
+        """One camera frame into the pulse estimator, with the newest driver landmarks."""
+        with self._rppg_lock:
+            face, face_t = self._rppg_face or (None, None)
+        if face is not None and abs(t - face_t) > RPPG_FACE_MAX_AGE_S:
+            face = None
+        self.rppg.update(frame, face.eyes if face else None, t,
+                         landmarks=face.landmarks_px if face else None)
 
     def _publish_no_camera(self) -> None:
         t = time.monotonic()

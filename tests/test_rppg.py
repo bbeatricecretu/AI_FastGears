@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -103,7 +105,7 @@ def test_filter_rejects_motion_holds_and_slew_limits():
 def test_filter_never_promotes_a_provisional_reading():
     r = RPPG()
     out = r._filter({"bpm": 80, "snr": 4.0, "motion": 0.01, "method": "provisional", "raw_bpm": 81}, 10.0)
-    assert out == {"bpm": 80, "bpm_raw": 81, "pulse_state": "provisional", "rejected": "no regional consensus"}
+    assert out == {"bpm": None, "bpm_raw": 81, "pulse_state": "provisional", "rejected": "no regional consensus"}
     r._filter({"bpm": 70, "snr": 4.0, "motion": 0.01, "method": "regional_consensus"}, 11.0)
     out = r._filter({"bpm": 95, "snr": 4.0, "motion": 0.01, "method": "provisional"}, 12.0)
     assert out["bpm"] == 70 and out["pulse_state"] == "held"
@@ -248,3 +250,28 @@ def test_subpixel_region_sampling_has_stable_support_across_integer_boundaries()
     shifted, _ = _region_pixels(gradient, contour + (0.4, 0))
     assert len(first) == len(shifted)
     assert shifted.mean() - first.mean() == pytest.approx(1.2, abs=0.1)
+
+
+def test_pipeline_samples_the_pulse_on_every_camera_frame():
+    """The detector loop runs at ~8 fps; the pulse thread feeds every 30 fps camera frame
+    with the newest driver landmarks, so the estimator reaches a trusted reading."""
+    from fastgears.pipeline import RPPG_FACE_MAX_AGE_S, Pipeline
+
+    p = Pipeline.__new__(Pipeline)
+    import threading
+    p._rppg_lock = threading.Lock()
+    p.rppg = RPPG()
+    face = SimpleNamespace(eyes=FACE, landmarks_px=None)
+    frames = list(_frames(seconds=10.0))
+    for i, (frame, t) in enumerate(frames):
+        if i % 4 == 0:                                   # detector loop: every 4th frame (~8 fps)
+            p._rppg_face = (face, t)
+        p._feed_rppg(frame, t)
+    s = p.rppg.status()
+    assert s["fps"] >= 15 and s["method"] == "regional_consensus"
+    assert s["pulse_state"] == "tracking" and abs(s["bpm"] - 72) <= 3
+    # landmarks too old: the pulse thread treats the face as gone
+    frame, t = frames[-1]
+    p._rppg_face = (face, t + 1 - RPPG_FACE_MAX_AGE_S - 0.1)
+    p._feed_rppg(frame, t + 1)
+    assert p.rppg.status()["face"] is False

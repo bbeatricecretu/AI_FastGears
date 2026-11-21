@@ -637,9 +637,10 @@ class RPPG:
         else:
             self._shown = None
             self._accepted.clear()
-            # nothing trusted yet: pass the indicative (unreliable) reading through as-is
+            # nothing trusted yet: an indicative (provisional) reading is kept in bpm_raw only,
+            # it jumps too much to be shown as the pulse
             state = "provisional" if bpm is not None else "measuring"
-            return {"bpm": bpm, "bpm_raw": raw, "pulse_state": state, "rejected": why}
+            return {"bpm": None, "bpm_raw": raw, "pulse_state": state, "rejected": why}
         return {"bpm": round(self._shown), "bpm_raw": raw, "pulse_state": state, "rejected": why}
 
     # ── outputs ───────────────────────────────────────────────────────
