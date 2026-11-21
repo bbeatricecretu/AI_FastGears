@@ -23,6 +23,7 @@ from statistics import median
 
 from .drowsiness import DrowsinessSignals, THRESHOLDS
 from .filters import OneEuroAxis
+from .inattention import INATTENTION_THRESHOLDS, InattentionMonitor
 
 # --- calibration ---------------------------------------------------------------
 CALIB_MIN_SAMPLES = 5            # face frames needed to finish calibration
@@ -57,7 +58,7 @@ PITCH_DOWN_DEG = 20.0            # gaze pitch beyond this -> down (lap, phone)
 PITCH_UP_DEG = 20.0              # -> up
 IRIS_YAW_GAIN = 25.0             # deg of gaze per unit iris offset (x)
 IRIS_PITCH_GAIN = 20.0           # deg of gaze per unit iris offset (y)
-FACE_MISSING_AWAY_S = 1.0        # face lost this long -> "away"
+FACE_MISSING_AWAY_S = 1.0        # accepted for compatibility with existing settings
 DISTRACTED_S = 2.0               # continuous off-road seconds -> distracted
 OFF_ROAD_REASON_S = 1.0
 MIRRORED = True                  # frames are horizontally flipped (selfie view)
@@ -81,7 +82,7 @@ _THRESHOLD_NAMES = (
     "PERCLOS_FULL", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
 )
-DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES} | THRESHOLDS
+DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES} | THRESHOLDS | INATTENTION_THRESHOLDS
 
 
 def _r(x: float | None, nd: int = 3) -> float | None:
@@ -96,13 +97,13 @@ class AttentionMonitor:
         self.calib_s = float(calib_s)
         self.th = {**DEFAULT_THRESHOLDS, **thresholds}
         self.signals = DrowsinessSignals(self.th)
+        self.inattention = InattentionMonitor(self.th)
         self.reset_calibration()
 
     def reset_calibration(self) -> None:
         """Forget the driver baseline; the next calib_s seconds re-learn it."""
         self.signals.reset()
-        self._face_missing_since = self._off_road_since = None
-        self._looking = "road"
+        self.inattention.reset()
         self._ear_filter = OneEuroAxis(self.th["ear_min_cutoff"], self.th["ear_beta"])
         self.calibrated = False
         self._calib_start: float | None = None
@@ -184,25 +185,22 @@ class AttentionMonitor:
         eyes_closed = all(eyes) if eyes is not None else None
         eye_closed_s = metrics["eye_closed_s"] or 0.0
 
-        if face is not None:
-            self._face_missing_since = None
-            self._looking = self._gaze_label(rp, ry, None if eyes_closed else face.iris_offset)
+        direction = None
+        unavailable = None
+        if face is None:
+            unavailable = "face_not_visible"
+        elif not self.calibrated:
+            unavailable = "calibrating"
+        elif eyes_closed:
+            unavailable = "eyes_closed"
+        elif face.iris_offset is None and (rp is None or ry is None):
+            unavailable = "gaze_not_available"
         else:
-            if self._face_missing_since is None:
-                self._face_missing_since = t
-            if t - self._face_missing_since >= th["face_missing_away_s"]:
-                self._looking = "away"
-                if self._off_road_since is None:
-                    self._off_road_since = self._face_missing_since
-            # else: hold the last label for brief dropouts
-
-        looking = self._looking
-        if looking == "road":
-            self._off_road_since = None
-        elif self._off_road_since is None:
-            self._off_road_since = t
-        off_road_s = 0.0 if self._off_road_since is None else t - self._off_road_since
-        distracted = off_road_s >= th["distracted_s"]
+            direction = self._gaze_label(rp, ry, face.iris_offset)
+        gaze = self.inattention.update(direction, t, unavailable)
+        looking = gaze["looking"]
+        off_road_s = gaze["off_road_s"]
+        distracted = gaze["distracted"]
 
         microsleep = eye_closed_s + 1e-9 >= th["microsleep_s"]
         perclos = metrics["perclos"]
@@ -261,7 +259,12 @@ class AttentionMonitor:
             if kind not in (warning_type, "prolonged_eye_closure"):
                 self.signals.event(kind, event["start_s"], t, "ended", event["severity"])
 
-        distraction = min(100.0, 70.0 * off_road_s / th["distracted_s"])
+        gaze_warning = gaze["warning"]
+        if not phone and gaze_warning and (
+            not warning or (gaze_warning["severity"] == "alert" and warning["severity"] != "alert")
+        ):
+            warning = gaze_warning
+        distraction = gaze["score"]
         if phone:
             distraction = max(distraction, th["phone_distraction"])
 
@@ -278,11 +281,12 @@ class AttentionMonitor:
             reasons.append("head nod")
         if yawns >= th["repeated_yawns"]:
             reasons.append(f"{yawns} yawns in the recent window")
-        if off_road_s >= th["off_road_reason_s"]:
-            if face is None:
-                reasons.append(f"face not visible {off_road_s:.1f} s")
-            else:
-                reasons.append(f"looking {looking} {off_road_s:.1f} s")
+        if unavailable == "face_not_visible":
+            reasons.append("driver not visible")
+        if off_road_s is not None and off_road_s >= th["off_road_reason_s"]:
+            reasons.append(f"looking {looking} {off_road_s:.1f} s")
+        if gaze["repeated"]:
+            reasons.append(f"{gaze['short_glances']} off-road glances in the recent window")
         if phone:
             reasons.append("phone in hand")
 
@@ -308,14 +312,20 @@ class AttentionMonitor:
             "microsleep": microsleep,
             "drowsiness_level": risk,
             "active_warning": warning,
-            "events": [dict(event) for event in self.signals.active.values()],
-            "event_transitions": self.signals.transitions,
+            "events": [dict(event) for event in self.signals.active.values()] + gaze["events"],
+            "event_transitions": self.signals.transitions + gaze["event_transitions"],
+            "inattention": {
+                "state": "unavailable" if unavailable else "road" if looking == "road" else "off_road",
+                "unavailable_reason": unavailable,
+                "short_glances": gaze["short_glances"],
+                "repeated": gaze["repeated"],
+            },
             "notification_cooldown_s": th["notification_cooldown_s"],
             "pitch": _r(rp, 1),
             "yaw": _r(ry, 1),
             "roll": _r(rr, 1),
             "looking": looking,
-            "off_road_s": round(off_road_s, 2),
+            "off_road_s": _r(off_road_s, 2),
             "distracted": bool(distracted),
             "phone": bool(phone),
             "drowsiness": _r(drowsiness, 1),

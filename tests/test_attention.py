@@ -155,22 +155,50 @@ def test_yawn():
     assert out["yawning"] is False and out["yawns_5min"] == 1
 
 
-def test_face_missing_goes_away_after_1s():
-    mon, out, t = calibrated()
-    out = mon.update(None, t + 0.5)
-    assert out["face_present"] is False
-    assert out["looking"] == "road" and out["off_road_s"] == 0
-    out = mon.update(None, t + 1.2)
-    assert out["looking"] == "road"          # missing only 0.7 s
-    out = mon.update(None, t + 1.6)
-    assert out["looking"] == "away"
-    assert out["off_road_s"] == pytest.approx(1.1)  # counted from first missing frame
-    assert out["distracted"] is False
-    out = mon.update(None, t + 2.6)
+def test_face_missing_is_unavailable_without_distraction():
+    mon, _, t = calibrated()
+    out, t = run(mon, t, 2.3, lambda: fake_face(yaw=35.0))
+    event_id = out["active_warning"]["event_id"]
     assert out["distracted"] is True
-    assert any(r.startswith("face not visible") for r in out["reasons"])
-    out = mon.update(fake_face(), t + 2.7)
+
+    out = mon.update(None, t)
+    assert out["looking"] == "unavailable"
+    assert out["off_road_s"] is None
+    assert out["event_transitions"][0]["id"] == event_id
+    assert out["event_transitions"][0]["status"] == "interrupted"
+    out = mon.update(None, t + 3)
+    assert out["distraction"] == 0
+    assert out["level"] == "ok"
+    assert out["inattention"]["unavailable_reason"] == "face_not_visible"
+    out = mon.update(fake_face(), t + 3.1)
     assert out["looking"] == "road" and out["distracted"] is False
+
+
+def test_repeated_short_glances_ignore_quick_mirror_checks():
+    mon, _, t = calibrated()
+    for _ in range(3):
+        out, t = run(mon, t, 0.3, lambda: fake_face(yaw=35.0))
+        out, t = run(mon, t, 0.4, fake_face)
+    assert out["inattention"]["short_glances"] == 0
+
+    for _ in range(3):
+        out, t = run(mon, t, 0.8, lambda: fake_face(yaw=35.0))
+        out, t = run(mon, t, 0.3, fake_face)
+        out, t = run(mon, t, 0.1, lambda: fake_face(ear=0.08))
+        out, t = run(mon, t, 0.2, fake_face)
+    assert out["looking"] == "road"
+    assert out["inattention"]["short_glances"] == 3
+    assert out["level"] == "caution"
+    assert out["active_warning"]["reason"] == "repeated_off_road"
+
+
+def test_tracking_gap_restarts_the_off_road_timer():
+    mon, _, t = calibrated()
+    out, t = run(mon, t, 1.5, lambda: fake_face(yaw=35.0))
+    out = mon.update(fake_face(yaw=35.0), t + 2)
+    assert out["looking"] == "right"
+    assert out["off_road_s"] == 0
+    assert out["active_warning"] is None
 
 
 def test_output_json_serialisable():
@@ -188,7 +216,7 @@ def test_phone_in_use():
     phone_low = {"label": "cell phone", "conf": 0.6, "bbox": [600, 500, 680, 640]}
     phone_top_far = {"label": "cell phone", "conf": 0.6, "bbox": [10, 10, 60, 90]}
     phone_at_ear = {"label": "cell phone", "conf": 0.6, "bbox": [700, 150, 760, 230]}
-    person = {"label": "person", "conf": 0.9, "bbox": [400, 120, 900, 720]}
+    person = {"label": "person", "conf": 0.9, "bbox": [400, 100, 900, 720]}
     face = fake_face(bbox=(500, 120, 680, 340))
     pu = ObjectDetector.phone_in_use
     assert pu([], face, FRAME) is False

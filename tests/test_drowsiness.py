@@ -176,4 +176,4 @@ def test_blink_speed_requires_valid_open_and_closed_samples():
     for i, ear in enumerate([0.30, 0.12, 0.07, 0.30]):
         out = mon.update(fake_face(ear=ear), i / 30)
     assert out["closing_speed"] == pytest.approx((0.30 - 0.07) / (2 / 30))
-    assert out["opening_speed"] == pytest.approx((0.30 - 0.07) / (1 / 30))
+    assert out["opening_speed"] == pytest.approx((0.30 - 0.07) / (1 / 30))  
