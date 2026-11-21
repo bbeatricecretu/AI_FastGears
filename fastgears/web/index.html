@@ -56,6 +56,12 @@
   #rgb-observations .rgb-finding { margin: 4px 0 0; }
   #rgb-observations .rgb-evidence { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
   .rgb-evaluations { margin-top: 12px; }
+  .presets { display: flex; gap: 6px; margin-bottom: 8px; }
+  .presets button { flex: 1; }
+  .tune { display: grid; grid-template-columns: 1fr 120px 48px; gap: 4px 8px; align-items: center; font-size: 13px; }
+  .tune output { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .tune input[type=range] { padding: 0; }
+  .tune label.chk { grid-column: 1 / -1; display: flex; gap: 6px; align-items: center; }
 </style>
 </head>
 <body>
@@ -72,7 +78,7 @@
   <section class="side">
     <div class="card video"><img src="/video.mjpg" alt="Live camera with detections"></div>
     <div class="card">
-      <h2>Last 2 minutes <span class="legend"><i style="background:var(--caution)"></i>drowsiness<i style="background:var(--accent)"></i>distraction<i style="background:var(--danger)"></i>pulse (bpm/2)</span></h2>
+      <h2>Last 2 minutes <span class="legend"><i style="background:var(--caution)"></i>drowsiness<i style="background:var(--accent)"></i>distraction<i style="background:var(--danger)"></i>pulse (bpm/2, faded = low trust)</span></h2>
       <canvas id="chart"></canvas>
     </div>
   </section>
@@ -95,7 +101,7 @@
         <div class="m" id="m-perclos"><small>PERCLOS (5 min)</small><span>–</span></div>
         <div class="m" id="m-blinks"><small>Blinks/min</small><span>–</span></div>
         <div class="m" id="m-yawn"><small>Yawns 5 min</small><span>–</span></div>
-        <div class="m" id="m-offroad"><small>Off-road now · last 60 s</small><span>–</span></div>
+        <div class="m" id="m-offroad"><small>Off-road now · last 30 s</small><span>–</span></div>
         <div class="m" id="m-head"><small>Yaw / pitch</small><span>–</span></div>
         <div class="m" id="m-pulse"><small>Pulse (camera)</small><span>–</span></div>
         <div class="m" id="m-trust"><small>Pulse trust</small><span>–</span></div>
@@ -140,6 +146,16 @@
         <button type="button" id="mic" title="Speak">🎤</button>
         <button>Send</button>
       </form>
+    </div>
+    <div class="card">
+      <h2>Message frequency <span class="legend" id="tune-preset"></span></h2>
+      <div class="presets">
+        <button type="button" data-preset="quiet" title="Fewest messages and questions">Quiet</button>
+        <button type="button" data-preset="normal">Normal</button>
+        <button type="button" data-preset="talkative" title="More frequent messages and questions">Talkative</button>
+      </div>
+      <div class="tune" id="tune"></div>
+      <small class="legend">Danger alerts are always spoken at once; these settings pace everything else.</small>
     </div>
   </section>
 </main>
@@ -215,7 +231,7 @@ function onState(s) {
   set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', a.tired);
   set('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–');
   set('m-yawn', a.yawns_5min ?? '–', a.yawning);
-  set('m-offroad', a.off_road_s != null ? `${a.off_road_s.toFixed(1)}s · ${Math.round(a.off_road_total_s || 0)}/20s` : '–', a.distracted);
+  set('m-offroad', a.off_road_s != null ? `${a.off_road_s.toFixed(1)}s · ${(a.off_road_total_s || 0).toFixed(1)}/${a.distracted_after_s ?? 5}s` : '–', a.distracted);
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
   const pulseStatus = pulseProgress(p);
@@ -230,7 +246,8 @@ function onState(s) {
   renderGestures(s.discomfort || {});
   renderRgb(s.rgb || {});
   const now = Date.now() / 1000;
-  hist.push({ t: now, drow, dist, bpm: trust.label && trust.label !== 'unreliable' ? p.bpm : null });
+  const bpm = p.bpm || null, sure = bpm && trust.label && trust.label !== 'unreliable';
+  hist.push({ t: now, drow, dist, bpm, bpmOk: sure ? bpm : null });
   while (hist.length && now - hist[0].t > 120) hist.shift();
 }
 
@@ -351,11 +368,13 @@ function draw() {
   const now = Date.now() / 1000, x = t => W - (now - t) / 120 * W, y = v => H - v / 100 * H;
   ctx.strokeStyle = '#2a313c'; ctx.lineWidth = 1;
   for (const v of [40, 70]) { ctx.beginPath(); ctx.moveTo(0, y(v)); ctx.lineTo(W, y(v)); ctx.stroke(); }
-  for (const [key, col, f] of [['drow', '#f0b429', v => v], ['dist', '#58a6ff', v => v], ['bpm', '#f85149', v => v / 2]]) {
-    ctx.strokeStyle = col; ctx.lineWidth = 2 * devicePixelRatio; ctx.beginPath(); let pen = false;
+  for (const [key, col, f, alpha] of [['drow', '#f0b429', v => v, 1], ['dist', '#58a6ff', v => v, 1],
+                                      ['bpm', '#f85149', v => v / 2, .35], ['bpmOk', '#f85149', v => v / 2, 1]]) {
+    ctx.globalAlpha = alpha; ctx.strokeStyle = col; ctx.lineWidth = 2 * devicePixelRatio; ctx.beginPath(); let pen = false;
     for (const h of hist) { if (h[key] == null) { pen = false; continue; } const X = x(h.t), Y = y(f(h[key])); pen ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); pen = true; }
     ctx.stroke();
   }
+  ctx.globalAlpha = 1;
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
@@ -371,6 +390,48 @@ function connect() {
   setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
 }
 connect();
+
+// ── message frequency (coach pacing) ─────────────────────────────────────────
+const TUNE = [
+  ['message_gap_s', 'Min. gap between messages', 1],
+  ['warn_hold_s', 'Warning must last', 0.5],
+  ['alert_repeat_s', 'Repeat a danger every', 1],
+  ['summary_every_s', 'Calm check-in every', 5],
+  ['question_cooldown_s', 'Pause between questions', 5],
+];
+let tuneTimer = null;
+function renderTuning(t) {
+  const box = $('tune');
+  $('tune-preset').textContent = '· ' + t.preset;
+  for (const b of document.querySelectorAll('[data-preset]')) b.classList.toggle('on', b.dataset.preset === t.preset);
+  if (!box.children.length) {
+    for (const [k, label, step] of TUNE) {
+      const [lo, hi] = t.limits[k];
+      const l = document.createElement('label'); l.textContent = label; l.htmlFor = 'tune-' + k;
+      const r = Object.assign(document.createElement('input'), { type: 'range', id: 'tune-' + k, min: lo, max: hi, step });
+      const o = document.createElement('output'); o.id = 'tune-o-' + k;
+      r.oninput = () => { o.textContent = r.value + ' s'; clearTimeout(tuneTimer); tuneTimer = setTimeout(() => postTuning({ [k]: +r.value }), 250); };
+      box.append(l, r, o);
+    }
+    const c = document.createElement('label'); c.className = 'chk';
+    c.innerHTML = '<input type="checkbox" id="tune-questions"> Ask alertness questions after a danger alert';
+    box.append(c);
+    $('tune-questions').onchange = e => postTuning({ questions: e.target.checked });
+  }
+  for (const [k] of TUNE) {
+    const v = t.values[k], r = $('tune-' + k);
+    r.disabled = v == null;
+    if (v != null && document.activeElement !== r) { r.value = v; $('tune-o-' + k).textContent = v + ' s'; }
+  }
+  $('tune-questions').checked = !!t.values.questions;
+  $('tune-questions').disabled = t.values.question_cooldown_s == null;
+}
+async function postTuning(body) {
+  const r = await fetch('/api/tuning', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (r.ok) renderTuning(await r.json());
+}
+for (const b of document.querySelectorAll('[data-preset]')) b.onclick = () => postTuning({ preset: b.dataset.preset });
+fetch('/api/tuning').then(r => r.json()).then(renderTuning).catch(() => {});
 
 $('chat').onsubmit = async e => {
   e.preventDefault();

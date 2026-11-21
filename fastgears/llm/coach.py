@@ -27,6 +27,25 @@ ALERT_REPEAT_S = 20.0   # an ongoing danger episode is re-announced at most this
 EPISODE_GAP_S = 10.0    # a reason must be gone this long before it counts as a new episode
 RATE_LIMIT_PAUSE_S = 30.0
 
+# Message pacing, adjustable live from the dashboard (Coach.set_tuning / POST /api/tuning).
+# Danger alerts ignore message_gap_s and warn_hold_s: they are always spoken at once.
+#   message_gap_s       minimum quiet time between two non-danger messages (warnings, LLM, summaries)
+#   warn_hold_s         a warning must last this long before it is spoken (flicker stays silent)
+#   alert_repeat_s      an ongoing danger is re-announced at most this often
+#   summary_every_s     calm periodic check-in text while all is fine
+#   question_cooldown_s after an alertness-question round ends, no new question for this long
+#   questions           ask alertness questions after danger alerts at all
+PRESETS = {
+    "quiet":     {"message_gap_s": 25.0, "warn_hold_s": 3.0, "alert_repeat_s": 30.0,
+                  "summary_every_s": 180.0, "question_cooldown_s": 180.0, "questions": True},
+    "normal":    {"message_gap_s": 12.0, "warn_hold_s": 1.5, "alert_repeat_s": 20.0,
+                  "summary_every_s": 90.0, "question_cooldown_s": 90.0, "questions": True},
+    "talkative": {"message_gap_s": 5.0, "warn_hold_s": 0.5, "alert_repeat_s": 12.0,
+                  "summary_every_s": 40.0, "question_cooldown_s": 30.0, "questions": True},
+}
+TUNING_LIMITS = {"message_gap_s": (0.0, 120.0), "warn_hold_s": (0.0, 10.0), "alert_repeat_s": (5.0, 120.0),
+                 "summary_every_s": (10.0, 600.0), "question_cooldown_s": (0.0, 600.0)}
+
 SYSTEM_PROMPT = """You are FastGears, an in-car driver-safety co-pilot. You receive live readings
 from a driver-monitoring camera (eyes, head pose, phone use, yawns, camera-measured pulse).
 Speak directly to the driver, in {language}. Be short, calm and concrete — the text is read
@@ -192,9 +211,15 @@ class Coach:
 
     def __init__(self, client: LLMClient | None, on_message: Callable[[dict], None],
                  min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English",
-                 checkin: CheckIn | None = None):
+                 checkin: CheckIn | None = None, message_gap_s: float = 0.0, warn_hold_s: float = 0.0,
+                 alert_repeat_s: float = ALERT_REPEAT_S):
         self.client, self.on_message = client, on_message
         self.min_interval_s, self.summary_every_s = min_interval_s, summary_every_s
+        self.message_gap_s, self.warn_hold_s, self.alert_repeat_s = message_gap_s, warn_hold_s, alert_repeat_s
+        self.questions = checkin is not None
+        self.preset = "custom"
+        self._last_said = -1e9          # last non-danger message (observe clock); message_gap_s counts from it
+        self._episode_start: dict = {}  # reason -> when its current episode began (for warn_hold_s)
         self.language = language
         self.checkin = checkin          # closed-loop alertness check after danger alerts (optional)
         self._t = 0.0                   # time of the last observe(): the clock for answers/verdicts
@@ -217,6 +242,42 @@ class Coach:
     def provider(self) -> str:
         return self.client.name if self.client else "rules"
 
+    # -- message pacing ---------------------------------------------------------------------
+    def tuning(self) -> dict:
+        return {"preset": self.preset, "presets": PRESETS, "limits": TUNING_LIMITS,
+                "values": {"message_gap_s": self.message_gap_s, "warn_hold_s": self.warn_hold_s,
+                           "alert_repeat_s": self.alert_repeat_s, "summary_every_s": self.summary_every_s,
+                           "question_cooldown_s": self.checkin.cooldown_s if self.checkin else None,
+                           "questions": self.questions and self.checkin is not None}}
+
+    def set_tuning(self, preset: str | None = None, **values) -> dict:
+        """Apply a preset and/or individual values (numbers clamped to TUNING_LIMITS)."""
+        if preset is not None and preset not in PRESETS:
+            raise ValueError(f"unknown preset {preset!r}")
+        unknown = set(values) - set(TUNING_LIMITS) - {"questions"}
+        if unknown:
+            raise ValueError(f"unknown setting(s) {sorted(unknown)}")
+        merged = {**(PRESETS[preset] if preset else {}), **{k: v for k, v in values.items() if v is not None}}
+        for k, v in merged.items():
+            if k == "questions":
+                self.questions = bool(v)
+                continue
+            lo, hi = TUNING_LIMITS[k]
+            v = min(hi, max(lo, float(v)))
+            if k == "question_cooldown_s":
+                if self.checkin:
+                    self.checkin.cooldown_s = v
+            else:
+                setattr(self, k, v)
+        now = self.tuning()["values"]
+        self.preset = next((n for n, pv in PRESETS.items()
+                            if all(now[k] == pv[k] for k in pv if now[k] is not None)), "custom")
+        return self.tuning()
+
+    def _quiet(self, now: float) -> bool:
+        """True while the last non-danger message is younger than message_gap_s."""
+        return now - self._last_said < self.message_gap_s
+
     # called by the pipeline at ~5 Hz
     def observe(self, state: dict, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -232,22 +293,29 @@ class Coach:
         #    Alerts are re-announced every ALERT_REPEAT_S while they last, a warning once per
         #    episode; an episode ends when its reason has been gone EPISODE_GAP_S. The key holds
         #    the severity too, so a warning that escalates to danger is announced again.
+        #    Warnings are paced too: held for warn_hold_s (flicker stays silent) and kept
+        #    message_gap_s away from the previous non-danger message.
         if key:
+            if now - self._last_seen.get(key, -1e9) > EPISODE_GAP_S:
+                self._episode_start[key] = now
             self._last_seen[key] = now
         for k in [k for k in self._last_local if now - self._last_seen.get(k.split("|")[0], -1e9) > EPISODE_GAP_S]:
             del self._last_local[k]
         alerted = False
         if loc:
             ek = f"{key}|{loc['severity']}"
-            repeat = ALERT_REPEAT_S if loc["severity"] == "alert" else float("inf")
-            if ek not in self._last_local or now - self._last_local[ek] > repeat:
+            is_alert = loc["severity"] == "alert"
+            repeat = self.alert_repeat_s if is_alert else float("inf")
+            ready = is_alert or (now - self._episode_start.get(key, now) >= self.warn_hold_s
+                                 and not self._quiet(now))
+            if ready and (ek not in self._last_local or now - self._last_local[ek] > repeat):
                 self._last_local[ek] = now
                 self._emit({**loc, "source": "instant"})
-                alerted = loc["severity"] == "alert"
+                alerted = is_alert
 
         # 2) closed loop: after a danger alert ask the driver a question, then judge the reaction
         if self.checkin:
-            if alerted and self.checkin.can_start(now):
+            if alerted and self.questions and self.checkin.can_start(now):
                 q = self.checkin.start(key, now)
                 if q:
                     self._emit(q)
@@ -271,9 +339,12 @@ class Coach:
             self._prev_seen[key] = now
         self._pending = (self._pending or changed) and level != "ok"   # waits for min_interval if needed
         due = now - self._last_llm >= (self.min_interval_s if self._pending else self.summary_every_s)
+        # the LLM follow-up of a danger alert just spoken may come at once; anything else waits its turn
+        due = due and (alerted or not self._quiet(now))
         self._last_key, self._last_level = key, level
         event = (state.get("discomfort") or {}).get("event")
-        if event and event["id"] != self._last_discomfort_id and now - self._last_llm >= self.min_interval_s:
+        if (event and event["id"] != self._last_discomfort_id and now - self._last_llm >= self.min_interval_s
+                and not self._quiet(now)):
             self._last_discomfort_id = event["id"]
             if loc is None:
                 loc = {"message": "Are you comfortable? If needed, take a break when safe.",
@@ -364,6 +435,8 @@ class Coach:
             self._emit(out)
 
     def _emit(self, msg: dict) -> None:
+        if not (msg.get("severity") == "alert" and msg.get("source") == "instant"):
+            self._last_said = self._t   # a danger alert doesn't make the next warning wait
         msg = {**msg, "t": time.time()}
         self.history.append(msg)
         try:

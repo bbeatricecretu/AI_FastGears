@@ -69,6 +69,8 @@ class Settings:
     checkin_answer_s: float = float(os.getenv("CHECKIN_ANSWER_S", "12"))
     checkin_max_rounds: int = int(os.getenv("CHECKIN_MAX_ROUNDS", "3"))
     checkin_cooldown_s: float = float(os.getenv("CHECKIN_COOLDOWN_S", "30"))
+    # message pacing preset at start-up (quiet | normal | talkative); tunable live on the dashboard
+    message_preset: str = os.getenv("MESSAGE_PRESET", "normal").strip().lower()
 
 
 settings = Settings()

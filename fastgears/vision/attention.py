@@ -78,8 +78,8 @@ PITCH_UP_DEG = 20.0              # -> up
 IRIS_YAW_GAIN = 25.0             # deg of gaze per unit iris offset (x)
 IRIS_PITCH_GAIN = 20.0           # deg of gaze per unit iris offset (y)
 FACE_MISSING_AWAY_S = 1.0        # face lost this long -> "away"
-OFF_ROAD_WINDOW_S = 60.0         # distraction = off-road seconds summed over this window...
-DISTRACTED_TOTAL_S = 20.0        # ...reaching this total -> distracted (danger), not one short glance
+OFF_ROAD_WINDOW_S = 30.0         # distraction = off-road seconds summed over this window...
+DISTRACTED_TOTAL_S = 5.0         # ...reaching this total -> distracted (danger): caution at ~3 s, danger at 5 s
 OFF_ROAD_RECOVER_S = 2.0         # back on the road this long clears "distracted" (the total stays,
                                  # so the next glance re-triggers sooner)
 OFF_ROAD_REASON_S = 1.0
@@ -561,6 +561,8 @@ class AttentionMonitor:
             "off_road_s": round(off_road_s, 2),
             "off_road_total_s": round(off_total, 1),
             "distracted": bool(distracted),
+            "distracted_after_s": th["distracted_total_s"],
+            "off_road_window_s": th["off_road_window_s"],
             "phone": bool(phone),
             "phone_s": round(phone_s, 1),
             "hand_off_wheel": bool(hand_off),

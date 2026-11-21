@@ -104,8 +104,8 @@ measurements, and only the driver's hands and phone count. Passengers get a grey
 - **Yawns:** mouth wide open (MAR / jawOpen ≥ 0.6) for ≥ 1.5 s, only while the head is near neutral
   (a tilted head distorts the mouth shape). **More than 6 yawns in 5 min = tired** (caution); a single yawn is shown but raises nothing.
 - **Looking:** head yaw/pitch relative to the baseline, plus iris position → road / left / right /
-  down / up / away. Off-road seconds are **summed over the last 60 s**: **distracted (danger)** when the total reaches
-  **20 s**, so many short glances add up while one glance doesn't trigger an alarm. 2 s back on the
+  down / up / away. Off-road seconds are **summed over the last 30 s**: caution at about 3 s, **distracted (danger)** when the total reaches
+  **5 s**, so a few short glances add up while one quick glance doesn't trigger an alarm. 2 s back on the
   road clears the danger; the total stays in the window, so the next glance re-triggers sooner.
 - **Phone:** three layers, steadied by an on/off latch (on after 2 hits in 1.5 s, off after 1.5 s
   without one):
@@ -140,7 +140,21 @@ co-pilot runs a short **check-in** (`fastgears/llm/intervention.py`):
    new question. After 3 failed questions: *"Please stop at the next safe place and take a break."*
 
 The dashboard shows the check (question, round, seconds left). Settings: `CHECKIN`,
-`CHECKIN_ANSWER_S`, `CHECKIN_MAX_ROUNDS`, `CHECKIN_COOLDOWN_S`.
+`CHECKIN_ANSWER_S`, `CHECKIN_MAX_ROUNDS`.
+
+## Message frequency
+
+Danger alerts are always spoken at once. Everything else is paced so the co-pilot doesn't talk over
+itself: a warning must last a moment before it is spoken (flicker stays silent), two non-danger
+messages keep a minimum gap, and alertness questions have a pause between rounds. The dashboard's
+**Message frequency** card switches between **Quiet / Normal / Talkative** presets or tunes each value
+with a slider (also `GET/POST /api/tuning`). Start-up preset: `MESSAGE_PRESET` (default `normal`).
+
+| Preset | Gap between messages | Warning must last | Repeat danger | Calm check-in | Pause between questions |
+|---|---|---|---|---|---|
+| Quiet | 25 s | 3 s | 30 s | 180 s | 180 s |
+| Normal | 12 s | 1.5 s | 20 s | 90 s | 90 s |
+| Talkative | 5 s | 0.5 s | 12 s | 40 s | 30 s |
 
 ## Setup
 
@@ -249,7 +263,7 @@ Panoul semnalează punctele regionale în afara imaginii, capul prea rotit, faț
 ### Demo script (≈2 min, for the jury)
 
 1. Sit normally: the banner says **ATTENTIVE**, the pulse appears after about 10 s.
-2. Look left or at your lap, on and off, until 20 s of off-road time add up: **eyes off road → DANGER**,
+2. Look left or at your lap, on and off, until 5 s of off-road time add up: **eyes off road → DANGER**,
    the voice alert, then the **alertness check** (answer the question by voice). The voice tells you to look
    at the road.
 3. Hold up a phone: a warning at once, **DANGER after 10 s**, then the alertness check.
