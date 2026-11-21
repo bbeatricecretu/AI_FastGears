@@ -19,6 +19,7 @@ PHONE_COCO_ID = 67
 CROP_IMGSZ = 480          # driver-crop pass: the phone gets ~2x more pixels than in the full frame
 PHONE_CONFIRM_S = 1.5     # latch ON: 2 phone hits within this window (or one hit >= PHONE_SURE)
 PHONE_SURE = 0.5
+PHONE_FACE_COVER = 0.6    # a "phone" box holding this much of the driver's face is the face
 PHONE_HOLD_S = 1.5        # latch OFF: no phone hit for this long...
 PHONE_HAND_HOLD_S = 4.0   # ...or this long while the driver's hand is still where the phone was
                           # (YOLOv8n loses edge-on / half-covered phones for seconds at a time)
@@ -143,6 +144,17 @@ class ObjectDetector:
     @staticmethod
     def count(dets: list[dict], label: str = PERSON_LABEL) -> int:
         return sum(1 for d in dets if d.get("label") == label)
+
+    @staticmethod
+    def covers_face(bbox, face, frac: float = PHONE_FACE_COVER) -> bool:
+        """The box contains most of the driver's face: YOLO read the head as a phone. A phone at
+        the ear sits beside the face; one held over the face would hide it from the tracker."""
+        if face is None:
+            return False
+        fx0, fy0, fx1, fy1 = face.bbox
+        ix = max(0.0, min(bbox[2], fx1) - max(bbox[0], fx0))
+        iy = max(0.0, min(bbox[3], fy1) - max(bbox[1], fy0))
+        return ix * iy >= frac * max(1.0, (fx1 - fx0) * (fy1 - fy0))
 
     @classmethod
     def phone_best(cls, dets: list[dict], face, frame_shape) -> dict | None:

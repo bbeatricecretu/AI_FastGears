@@ -48,3 +48,21 @@ def test_one_hand_on_wheel_is_not_both_free():
     assert len(free_hands(hands, FACE, SHAPE)) == 1
     assert len(free_hands([_hand(True, x=250), _hand(True, x=650)], FACE, SHAPE)) == 2
     assert free_hands(hands, None, SHAPE) == []
+
+
+def test_phone_hit_on_open_palm_is_vetoed_but_not_on_gripping_hand():
+    from fastgears.vision.hands import on_open_palm
+    palm, grip = _hand(True, x=300), _hand(False, x=300)
+    hit = (285, 520, 320, 570)                                   # on the hand
+    assert on_open_palm(hit, [palm])
+    assert not on_open_palm(hit, [grip])                         # a hand around a real phone
+    assert not on_open_palm((900, 520, 940, 570), [palm])        # elsewhere
+    warped = Hand(palm.bbox, 0.9, openness=2.8)                  # phone hides fingers: landmarks warp
+    assert not on_open_palm(hit, [warped])
+
+
+def test_phone_box_around_the_drivers_head_is_not_a_phone():
+    from fastgears.vision.objects import ObjectDetector
+    assert ObjectDetector.covers_face((380, 100, 540, 330), FACE)      # tall box over the head
+    assert not ObjectDetector.covers_face((520, 160, 580, 280), FACE)  # phone at the ear, beside it
+    assert not ObjectDetector.covers_face((380, 100, 540, 330), None)

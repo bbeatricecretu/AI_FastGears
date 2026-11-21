@@ -26,6 +26,9 @@ HAND_NEAR_FACE_W = 2.5     # and horizontally within this many face widths of th
 HAND_OPEN_RATIO = 1.55     # fingertip->wrist / knuckle->wrist above this = fingers stretched (not gripping)
 HAND_AT_FACE_BELOW = 0.5   # hand centre above chin + this x face height...
 HAND_AT_FACE_W = 1.5       # ...and within this many face widths of the face centre = at the face
+PALM_MAX_RATIO = 2.1       # open palm band: HAND_OPEN_RATIO..this. A hand around a phone reads
+                           # lower (gripping) or higher (the phone hides fingers: landmarks warp)
+PALM_MARGIN = 0.25         # a phone hit within this fraction of the hand size of an open palm
 HAND_EDGE_PX = 6           # a hand cut off by the frame edge: its fingers are guessed, not seen
 _TIPS, _KNUCKLES = (8, 12, 16, 20), (5, 9, 13, 17)
 
@@ -114,6 +117,20 @@ def hand_free(hand: Hand, face, frame_shape=None) -> bool:
         if x0 <= HAND_EDGE_PX or y0 <= HAND_EDGE_PX or x1 >= w - 1 - HAND_EDGE_PX or y1 >= h - 1 - HAND_EDGE_PX:
             return False
     return hand.openness is not None and hand.openness >= HAND_OPEN_RATIO
+
+
+def on_open_palm(bbox, hands: list[Hand]) -> bool:
+    """A "phone" detection on a flat open hand: YOLO reads the palm itself as a phone. Fingers
+    stretched out can't hold one."""
+    cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+    for hd in hands:
+        if hd.openness is None or not HAND_OPEN_RATIO <= hd.openness <= PALM_MAX_RATIO:
+            continue
+        x0, y0, x1, y1 = hd.bbox
+        m = PALM_MARGIN * max(x1 - x0, y1 - y0)
+        if x0 - m <= cx <= x1 + m and y0 - m <= cy <= y1 + m:
+            return True
+    return False
 
 
 def free_hands(hands: list[Hand], face, frame_shape=None) -> list[Hand]:

@@ -70,7 +70,8 @@ class Pipeline:
                 log.exception("object detector unavailable")
             try:
                 from .vision.hands import HandTracker
-                self.hands = HandTracker(models_dir=self.s.models_dir)
+                # 4: the passenger's two hands must not use up the driver's slots
+                self.hands = HandTracker(models_dir=self.s.models_dir, num_hands=4)
             except Exception as e:
                 self.errors["hands"] = str(e)
                 log.exception("hand tracker unavailable")
@@ -136,7 +137,7 @@ class Pipeline:
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t)
-        from .vision.hands import free_hands, hand_crop
+        from .vision.hands import free_hands, hand_crop, on_open_palm
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
             self._hands = self.hands.process(frame, t_ms)
@@ -151,8 +152,11 @@ class Pipeline:
         dets = self.objects.detect(frame, face, boxes) if self.objects else []
         phone, phone_src = False, None
         if self.objects:
-            mine = [d for d in dets if d.get("label") != "cell phone" or self.driver.belongs_to_driver(
-                (d["bbox"][0] + d["bbox"][2]) / 2, (d["bbox"][1] + d["bbox"][3]) / 2, face, frame.shape)]
+            mine = [d for d in dets if d.get("label") != "cell phone" or (
+                self.driver.belongs_to_driver((d["bbox"][0] + d["bbox"][2]) / 2,
+                                              (d["bbox"][1] + d["bbox"][3]) / 2, face, frame.shape)
+                and not on_open_palm(d["bbox"], mine_hands)          # an open palm is not a phone
+                and not self.objects.covers_face(d["bbox"], face))]  # nor is the driver's head
             best = self.objects.phone_best(mine, face, frame.shape)
             hit = None if best is None else float(best["conf"])
             fresh = self.objects.fresh
