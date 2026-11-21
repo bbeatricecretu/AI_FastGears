@@ -175,7 +175,11 @@ function applyVoice(on, share) {
   voice = on;
   $('voice').classList.toggle('on', on); $('voice').textContent = on ? '🔊 Voice on' : '🔈 Voice off';
   if (!on) { if ('speechSynthesis' in window) speechSynthesis.cancel(); try { stopListening(); } catch (e) { /* page still loading */ } }
-  if (share) { try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {} voiceBus?.postMessage({ voice: on }); }
+  if (share) {
+    try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {}
+    voiceBus?.postMessage({ voice: on });
+    fetch('/api/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on }) }).catch(() => {});
+  }
 }
 if (voiceBus) voiceBus.onmessage = e => {
   if (!e.data) return;
@@ -184,6 +188,7 @@ if (voiceBus) voiceBus.onmessage = e => {
 };
 window.addEventListener('storage', e => { if (e.key === VOICE_KEY) applyVoice(e.newValue !== 'off', false); });
 try { applyVoice(localStorage.getItem(VOICE_KEY) !== 'off', false); } catch (e) { applyVoice(true, false); }
+fetch('/api/voice').then(r => r.json()).then(v => applyVoice(v.on, false)).catch(() => {});   // the server's switch wins
 $('voice').onclick = () => applyVoice(!voice, true);
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 
@@ -411,7 +416,12 @@ function connect() {
     $('conn').textContent = 'reconnecting…';
     setTimeout(connect, 1000);
   };
-  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.type === 'state') onState(m); else if (m.type === 'message') addMsg(m); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'state') { onState(m); if (m.voice != null && m.voice !== voice) applyVoice(m.voice, false); }
+    else if (m.type === 'message') addMsg(m);
+    else if (m.type === 'voice') applyVoice(m.on, false);
+  };
   setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
 }
 connect();

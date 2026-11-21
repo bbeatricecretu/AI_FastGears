@@ -175,6 +175,10 @@
   .m small { display: block; font-size: .68rem; font-weight: 500; color: #b4bccb; letter-spacing: .02em; }
   .m span { font-size: 1rem; font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
   .m.warn { border-color: color-mix(in srgb, var(--warn) 60%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+  /* live graph inside Driver & vitals: scrolls continuously, one full-width row */
+  .m.chart { grid-column: 1 / -1; }
+  .m.chart small i { display: inline-block; width: 9px; height: 3px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 8px; }
+  .m.chart canvas { width: 100%; height: 34px; display: block; margin-top: 3px; }
   .m.bad  { border-color: color-mix(in srgb, var(--bad) 70%, transparent);  background: color-mix(in srgb, var(--bad) 14%, transparent); }
 
   /* header chips never push the page wider: they scroll sideways on narrow screens */
@@ -275,6 +279,7 @@
           <div class="m" id="m-expr"><small>Expression</small><span>–</span></div>
           <div class="m" id="m-driver"><small>Driver</small><span>–</span></div>
           <div class="m" id="m-people"><small>Passengers</small><span>–</span></div>
+          <div class="m chart"><small>Live<i style="background:var(--warn)"></i>drowsiness<i style="background:#7cc8ff"></i>distraction<i style="background:var(--bad)"></i>pulse</small><canvas id="chart" aria-label="Live graph of drowsiness, distraction and pulse"></canvas></div>
         </div>
       </div>
     </div>
@@ -352,12 +357,39 @@ function onState(s) {
   tile('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–', '');
   tile('m-check', ck.active ? (ck.phase === 'judging' ? 'checking…' : `Q ${ck.round}/${ck.max_rounds} · ${Math.ceil(ck.seconds_left ?? 0)} s`) : 'idle', ck.active ? 'warn' : '');
 
-  tile('m-pulse', p.bpm ? `${Math.round(p.bpm)} bpm` : pulseProgress(p), '');
+  const trust = p.trust || {};
+  tile('m-pulse', p.bpm ? `${Math.round(p.bpm)} bpm${trust.label ? ' · ' + trust.label : ''}` : pulseProgress(p), p.bpm && trust.label === 'unreliable' ? 'warn' : '');
   $('m-pulse').title = p.reason ? pulseProgress(p) : '';
   tile('m-expr', ds.expression || '–', '');
   tile('m-driver', d.status || '–', d.locked ? '' : 'warn');
   tile('m-people', d.passengers ?? 0, '');
+
+  const now = Date.now() / 1000, bpm = p.bpm || null;
+  hist.push({ t: now, drow, dist, bpm, bpmOk: bpm && trust.label && trust.label !== 'unreliable' ? bpm : null });
+  while (hist.length && now - hist[0].t > GRAPH_S) hist.shift();
+  if (s.voice != null && s.voice !== voice) applyVoice(s.voice, false);   // the server owns the switch
 }
+
+// ── live graph (same lines as the dashboard): drowsiness, distraction, pulse/2; scrolls continuously ──
+const GRAPH_S = 60, hist = [];
+function draw() {
+  const cv = $('chart'), ctx = cv.getContext('2d');
+  const W = cv.width = cv.clientWidth * devicePixelRatio, H = cv.height = cv.clientHeight * devicePixelRatio;
+  ctx.clearRect(0, 0, W, H);
+  const now = Date.now() / 1000, x = t => W - (now - t) / GRAPH_S * W, y = v => H - Math.min(100, v) / 100 * (H - 2) - 1;
+  ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 1;
+  for (const v of [40, 70]) { ctx.beginPath(); ctx.moveTo(0, y(v)); ctx.lineTo(W, y(v)); ctx.stroke(); }
+  for (const [key, col, f, alpha] of [['drow', '#ffb547', v => v, 1], ['dist', '#7cc8ff', v => v, 1],
+                                      ['bpm', '#ff4d5e', v => v / 2, .35], ['bpmOk', '#ff4d5e', v => v / 2, 1]]) {
+    ctx.globalAlpha = alpha; ctx.strokeStyle = col; ctx.lineWidth = 1.6 * devicePixelRatio; ctx.lineJoin = 'round';
+    ctx.beginPath(); let pen = false;
+    for (const h of hist) { if (h[key] == null) { pen = false; continue; } const X = x(h.t), Y = y(f(h[key])); pen ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); pen = true; }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
 
 // pulse progress text, same wording as the dashboard (main_final's estimator reasons)
 function pulseProgress(p) {
@@ -429,6 +461,9 @@ function speak(m) {
   stopListening();                                  // the mic must not hear the co-pilot's own voice
   const u = new SpeechSynthesisUtterance(m.message);
   u.rate = m.severity === 'alert' ? 1.15 : 1.0;
+  u.lang = 'en-US';
+  const en = speechSynthesis.getVoices().find(v => v.lang && v.lang.startsWith('en'));
+  if (en) u.voice = en;
   u.onstart = () => setOrb('speaking');
   u.onend = u.onerror = () => {
     if (speechSynthesis.speaking) return;
@@ -436,6 +471,7 @@ function speak(m) {
     if (m.expects_answer) listenForAnswer();
   };
   window._utterances = [...(window._utterances || []).slice(-5), u];   // Chrome drops onend of unreferenced utterances
+  if (speechSynthesis.paused) speechSynthesis.resume();               // Chrome can leave the queue paused: nothing would play
   speechSynthesis.speak(u); lastSpoken = now;
 }
 
@@ -452,7 +488,11 @@ function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.onopen = () => { document.body.classList.remove('offline'); };
   ws.onclose = () => { document.body.classList.add('offline'); setTimeout(connect, 1000); };
-  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.type === 'state') onState(m); else if (m.type === 'message') onMessage(m); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'state') onState(m); else if (m.type === 'message') onMessage(m);
+    else if (m.type === 'voice') applyVoice(m.on, false);
+  };
   setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
 }
 connect();
@@ -477,12 +517,25 @@ function applyVoice(on, share) {
   $('voice').textContent = on ? 'Voice on' : 'Voice off';
   $('voice').title = on ? 'Messages are read aloud · click for text only' : 'Text only · click to read messages aloud';
   if (!on) { if ('speechSynthesis' in window) speechSynthesis.cancel(); try { stopListening(); } catch (e) { /* page still loading */ } setOrb(''); status('Voice off · messages in the chat'); }
-  if (share) { try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {} voiceBus?.postMessage({ voice: on }); }
+  if (share) {
+    try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {}
+    voiceBus?.postMessage({ voice: on });
+    fetch('/api/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on }) }).catch(() => {});
+  }
 }
 if (voiceBus) voiceBus.onmessage = e => { if (e.data && 'voice' in e.data) applyVoice(e.data.voice, false); };
 window.addEventListener('storage', e => { if (e.key === VOICE_KEY) applyVoice(e.newValue !== 'off', false); });
 try { applyVoice(localStorage.getItem(VOICE_KEY) !== 'off', false); } catch (e) { applyVoice(true, false); }
-$('voice').onclick = () => applyVoice(!voice, true);
+fetch('/api/voice').then(r => r.json()).then(v => applyVoice(v.on, false)).catch(() => {});   // the server's switch wins
+if ('speechSynthesis' in window) speechSynthesis.getVoices();   // Chrome loads its voice list lazily
+$('voice').onclick = () => {
+  const on = !voice;
+  applyVoice(on, true);
+  if (on && 'speechSynthesis' in window) {   // this click is a user gesture: unlock speech and confirm out loud
+    speechSynthesis.cancel(); if (speechSynthesis.paused) speechSynthesis.resume();
+    speechSynthesis.speak(Object.assign(new SpeechSynthesisUtterance('Voice on'), { lang: 'en-US' }));
+  }
+};
 // while this page is open it is the one that talks; the dashboard stays quiet so nothing is read twice
 setInterval(() => voiceBus?.postMessage({ copilot: Date.now() }), 2000);
 voiceBus?.postMessage({ copilot: Date.now() });

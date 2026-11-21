@@ -44,6 +44,7 @@ class Hub:
 hub = Hub()
 pipeline: Pipeline | None = None
 coach: Coach | None = None
+voice_on = True   # one Voice on/off switch for every open page (dashboard, co-pilot, any host name)
 
 
 def _on_state(state: dict) -> None:
@@ -85,6 +86,7 @@ async def _state_pump():
             st["llm"] = {"provider": coach.provider, "errors": coach.llm_errors,
                          "latency_ms": coach.last_latency_ms} if coach else None
             st["check"] = coach.checkin_status() if coach else {"active": False}
+            st["voice"] = voice_on
             await hub.broadcast({"type": "state", **st})
 
 
@@ -145,6 +147,23 @@ def set_tuning(body: TuningIn):
         return coach.set_tuning(**body.model_dump())
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+class VoiceIn(BaseModel):
+    on: bool
+
+
+@app.get("/api/voice")
+def get_voice():
+    return {"on": voice_on}
+
+
+@app.post("/api/voice")
+async def set_voice(body: VoiceIn):
+    global voice_on
+    voice_on = body.on
+    await hub.broadcast({"type": "voice", "on": voice_on})   # every page follows at once
+    return {"on": voice_on}
 
 
 class ChatIn(BaseModel):
