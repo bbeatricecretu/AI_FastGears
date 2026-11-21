@@ -59,6 +59,12 @@
   .rgb-evaluations { margin-top: 12px; }
   .presets { display: flex; gap: 6px; margin-bottom: 8px; }
   .presets button { flex: 1; }
+  /* the presets set every timing below: the sliders stay folded away for fine-tuning */
+  .chk.qs { display: flex; gap: 8px; align-items: center; margin: 12px 0 2px; font-size: 13px; cursor: pointer; }
+  .chk.qs input { accent-color: var(--c2, currentColor); }
+  details.adv { margin-top: 10px; }
+  details.adv summary { cursor: pointer; font-size: 12px; color: var(--muted); user-select: none; }
+  details.adv[open] summary { margin-bottom: 8px; }
   .tune { display: grid; grid-template-columns: 1fr 120px 48px; gap: 4px 8px; align-items: center; font-size: 13px; }
   .tune output { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
   .tune input[type=range] { padding: 0; }
@@ -156,7 +162,8 @@
         <button type="button" data-preset="normal">Normal</button>
         <button type="button" data-preset="talkative" title="More frequent messages and questions">Talkative</button>
       </div>
-      <div class="tune" id="tune"></div>
+      <label class="chk qs"><input type="checkbox" id="tune-questions"> Ask alertness questions after a danger alert</label>
+      <details class="adv"><summary>Advanced timing</summary><div class="tune" id="tune"></div></details>
       <small class="legend">Danger alerts are always spoken at once; these settings pace everything else.</small>
     </div>
   </section>
@@ -192,6 +199,8 @@ fetch('/api/voice').then(r => r.json()).then(v => applyVoice(v.on, false)).catch
 $('voice').onclick = () => applyVoice(!voice, true);
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 
+let saying = null;   // { u: utterance, p: urgency } while speaking
+let nextUp = null;   // a question that arrived during a more urgent message: asked right after it
 function speak(m) {
   // a check-in question opens the mic once it has been read out (at once when voice is off)
   if (Date.now() - copilotSeen < 5000) return;     // the co-pilot page is open and handles voice + answers
@@ -200,12 +209,18 @@ function speak(m) {
   const now = Date.now();
   if (m.severity === 'info' && !m.expects_answer && !(m.reason || '').startsWith('check-in') && now - lastSpoken < 4000) return;
   if (listening && mode === 'answer' && m.severity !== 'alert') return;   // the driver is talking: don't talk over them (alerts still do)
-  if (m.severity === 'alert') speechSynthesis.cancel();
+  // never queue (the voice would fall behind the screen): the newest message replaces the current one,
+  // unless what is being said is more urgent (danger alert > question > warning > info)
+  const p = m.severity === 'alert' ? 3 : m.expects_answer ? 2 : m.severity === 'warning' ? 1 : 0;
+  if (saying && (speechSynthesis.speaking || speechSynthesis.pending) && p < saying.p) { if (m.expects_answer) nextUp = m; return; }
+  speechSynthesis.cancel();
+  if (m.expects_answer) nextUp = null;
   stopListening();                                 // the mic must not hear the co-pilot's own voice
   const u = new SpeechSynthesisUtterance(m.message);
-  u.rate = m.severity === 'alert' ? 1.15 : 1.0;
-  // after a question the mic opens for the answer (also when cut off by an alert)
-  u.onend = u.onerror = () => { if (speechSynthesis.speaking) return; if (m.expects_answer) listenForAnswer(); };
+  u.rate = m.severity === 'alert' ? 1.15 : 1.05;
+  saying = { u, p };
+  // after a question the mic opens for the answer; a replaced message's end means nothing
+  u.onend = u.onerror = () => { if (!saying || saying.u !== u) return; saying = null; if (nextUp) { const q = nextUp; nextUp = null; speak(q); return; } if (m.expects_answer) listenForAnswer(); };
   window._utterances = [...(window._utterances || []).slice(-5), u];     // Chrome drops onend of unreferenced utterances
   speechSynthesis.speak(u); lastSpoken = now;
 }
@@ -447,10 +462,6 @@ function renderTuning(t) {
       r.oninput = () => { o.textContent = r.value + ' s'; clearTimeout(tuneTimer); tuneTimer = setTimeout(() => postTuning({ [k]: +r.value }), 250); };
       box.append(l, r, o);
     }
-    const c = document.createElement('label'); c.className = 'chk';
-    c.innerHTML = '<input type="checkbox" id="tune-questions"> Ask alertness questions after a danger alert';
-    box.append(c);
-    $('tune-questions').onchange = e => postTuning({ questions: e.target.checked });
   }
   for (const [k] of TUNE) {
     const v = t.values[k], r = $('tune-' + k);
@@ -465,6 +476,7 @@ async function postTuning(body) {
   if (r.ok) renderTuning(await r.json());
 }
 for (const b of document.querySelectorAll('[data-preset]')) b.onclick = () => postTuning({ preset: b.dataset.preset });
+$('tune-questions').onchange = e => postTuning({ questions: e.target.checked });
 fetch('/api/tuning').then(r => r.json()).then(renderTuning).catch(() => {});
 
 $('chat').onsubmit = async e => {

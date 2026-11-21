@@ -36,20 +36,41 @@ class FakeLLM:
         return '{"message":"Take a break soon.","severity":"warning","reason":"fatigue"}'
 
 
-def test_coach_instant_alert_then_llm():
-    got, ev = [], threading.Event()
-    def on(m):
-        got.append(m)
-        if m["source"] == "fake":
-            ev.set()
+def test_danger_alert_is_instant_and_not_said_again_by_the_llm():
+    got = []
     llm = FakeLLM()
-    c = Coach(llm, on, min_interval_s=8, summary_every_s=45)
+    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=45)
     c.observe(st(microsleep=True, level="danger"), now=100.0)
     assert got[0]["source"] == "instant" and got[0]["severity"] == "alert"
-    assert ev.wait(2)
-    c.observe(st(microsleep=True, level="danger"), now=101.0)   # same reason: no new LLM call, no repeat alert
-    time.sleep(0.1)
-    assert llm.calls == 1 and sum(m["source"] == "instant" for m in got) == 1
+    c.observe(st(microsleep=True, level="danger"), now=101.0)   # same episode: no repeat, no LLM echo
+    time.sleep(0.2)
+    assert llm.calls == 0 and len(got) == 1
+
+
+def test_warning_is_worded_by_the_llm_once():
+    got = []
+    llm = FakeLLM()
+    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=1e9)
+    c.observe(st(phone=True, level="caution"), now=100.0)
+    time.sleep(0.3)
+    assert [m["source"] for m in got] == ["fake"]                 # one message, in the LLM's words
+    assert got[0]["severity"] == "warning" and got[0]["reason"] == "phone in use"
+
+
+class SlowLLM(FakeLLM):
+    def complete(self, system, user, json_mode=False):
+        time.sleep(3.2)
+        return super().complete(system, user, json_mode)
+
+
+def test_slow_llm_warning_falls_back_to_rule_text_and_late_reply_is_dropped():
+    got = []
+    c = Coach(SlowLLM(), got.append, min_interval_s=8, summary_every_s=1e9)
+    c.observe(st(phone=True, level="caution"), now=100.0)
+    time.sleep(2.8)
+    assert [m["source"] for m in got] == ["instant"]              # rule text after WARN_LLM_WAIT_S
+    time.sleep(0.8)
+    assert len(got) == 1                                          # the late LLM wording is not said too
 
 
 def test_coach_without_llm_uses_rules():
@@ -362,18 +383,17 @@ def _off(level="danger"):
     return st(distracted=True, looking="left", level=level)
 
 
-def test_danger_flicker_gets_one_llm_message_per_episode():
+def test_danger_flicker_is_one_message_not_a_stream():
     llm = FakeLLM()
     got = []
     c = Coach(llm, got.append, min_interval_s=8, summary_every_s=90, message_gap_s=0)
     t = 100.0
-    for i in range(150):                                   # 30 s of danger flickering with caution
+    for i in range(90):                                    # 18 s of danger flickering with caution
         c.observe(_off("caution" if i % 10 >= 6 else "danger"), now=t)
         t += 0.2
         time.sleep(0.002)
     time.sleep(0.2)
-    assert llm.calls == 1                                  # not one per flicker
-    assert not any(m["severity"] == "warning" and m["source"] == "instant" for m in got)   # no step-down
+    assert llm.calls == 0 and len(got) == 1                # the alert once: no LLM echo, no step-down warning
 
 
 def test_ongoing_danger_gets_a_new_question_instead_of_repeated_alerts():

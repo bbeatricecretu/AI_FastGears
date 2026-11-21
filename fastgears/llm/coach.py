@@ -1,10 +1,12 @@
 """R2 — in-car reaction. Turns the CV state into alerts / voice guidance with an LLM.
 
 Design for a live demo:
-  * Danger events (microsleep, long eyes-off-road, phone) get an *instant* local alert
-    (zero latency, works offline), then the LLM's contextual message follows.
-  * The LLM is called on state changes, rate-limited (LLM_MIN_INTERVAL_S), plus a calm
-    periodic check-in summary (LLM_SUMMARY_EVERY_S) so the dashboard always has fresh text.
+  * One spoken message per event, never two versions of the same thing:
+    - danger ("alert"): the instant local text (zero latency, works offline); the alertness
+      question that follows is where the LLM comes in (it judges the answer + behaviour).
+    - warning: worded by the LLM for the situation; if it hasn't answered within
+      WARN_LLM_WAIT_S the rule text is said instead, and a late LLM reply is dropped.
+  * Without a hazard the LLM gives a calm periodic summary (LLM_SUMMARY_EVERY_S).
   * Calls run on a worker thread; the video pipeline never waits for the network.
   * Every provider failure falls back to rule-based text, so the demo never goes silent.
 Providers: Gemini (google-genai, default), Anthropic (optional), or none.
@@ -30,7 +32,8 @@ EPISODE_GAP_S = 10.0    # a reason must be gone this long before it counts as a 
 RATE_LIMIT_PAUSE_S = 30.0
 AWAIT_REPLY_S = 20.0    # after a question the co-pilot stays quiet this long, waiting for the reply
 ANSWER_MAX_S = 30.0     # a reply being spoken/transcribed holds the floor at most this long
-INTERRUPTS_REPLY = {"microsleep"}   # the only hazard that may talk over an open question
+INTERRUPTS_REPLY = {"microsleep"}
+WARN_LLM_WAIT_S = 2.5   # a warning waits this long for the LLM's wording, then the rule text is said   # the only hazard that may talk over an open question
 
 # Message pacing, adjustable live from the dashboard (Coach.set_tuning / POST /api/tuning).
 # Danger alerts ignore message_gap_s and warn_hold_s: they are always spoken at once.
@@ -411,6 +414,8 @@ class Coach:
                 self._last_local[ek] = now
                 if key == "signs of fatigue":    # tiredness: talking helps more than a warning
                     self._open_conversation(FATIGUE_OPENER, now, loc["severity"], key)
+                elif self.client and not is_alert:   # a warning can wait ~1 s for a better wording
+                    self._warn_async(loc, compact_state(state), now)
                 else:
                     self._emit({**loc, "source": "instant"})
                 alerted = is_alert
@@ -465,9 +470,9 @@ class Coach:
                 loc = {"message": "Are you comfortable? If needed, take a break when safe.",
                        "severity": "info", "reason": "facial movement"}
             due = True
-        # one LLM message per danger episode: the instant alert repeats are enough after that, and
-        # caution/danger flicker within the episode must not make the LLM say the same thing again
-        if key and not event and self._llm_episode.get(key) == self._episode_start.get(key):
+        # a hazard already has its one message (instant alert, or the LLM-worded warning): the LLM
+        # must not say the same thing again in its own words
+        if key and not event:
             due = False
         if due and now >= self._pause_until:
             self._last_llm = now
@@ -475,6 +480,43 @@ class Coach:
             if key:
                 self._llm_episode[key] = self._episode_start.get(key)
             self._submit(("react", compact_state(state), loc))
+
+    def _warn_async(self, loc: dict, compact: dict, asked: float) -> None:
+        """Say a warning in the LLM's words, or the rule text if the LLM is slow or fails. Exactly one
+        of the two is said, and nothing if the situation moved on meanwhile (a question was asked,
+        or the hazard escalated to a danger alert)."""
+        lock, state = threading.Lock(), {"done": False}
+        key = loc["reason"]
+
+        def finish(msg: dict) -> None:
+            with lock:
+                if state["done"]:
+                    return
+                state["done"] = True
+            if self.awaiting_reply(self._t) or (self.checkin and self.checkin.active):
+                return
+            if self._last_local.get(f"{key}|alert", -1e9) > asked:   # escalated: the alert said it
+                return
+            self._emit(msg)
+
+        timer = threading.Timer(WARN_LLM_WAIT_S, lambda: finish({**loc, "source": "instant"}))
+        timer.daemon = True
+        timer.start()
+
+        def run() -> None:
+            out = None
+            t0 = time.monotonic()
+            try:
+                out = parse_reply(self.client.complete(SYSTEM_PROMPT.format(language=self.language),
+                                                       "Driver state now:\n" + json.dumps(compact), json_mode=True))
+                self.last_latency_ms = int((time.monotonic() - t0) * 1000)
+            except Exception as e:
+                self.llm_errors += 1
+                log.warning("warning wording failed: %s", str(e)[:120])
+            if out:
+                timer.cancel()
+                finish({**out, "severity": loc["severity"], "reason": key, "source": self.provider})
+        threading.Thread(target=run, name="coach-warn", daemon=True).start()
 
     def _submit(self, job) -> None:
         try:
