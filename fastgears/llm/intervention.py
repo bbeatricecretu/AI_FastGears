@@ -205,8 +205,10 @@ class CheckIn:
     def waiting(self) -> bool:
         return self.phase == "waiting"
 
-    def can_start(self, now: float) -> bool:
-        return self.phase == "idle" and now - self._ended_at >= self.cooldown_s
+    def can_start(self, now: float, cooldown_s: float | None = None) -> bool:
+        """cooldown_s: a shorter cooldown for a danger that is still going on (see Coach.observe)."""
+        cd = self.cooldown_s if cooldown_s is None else min(self.cooldown_s, cooldown_s)
+        return self.phase == "idle" and now - self._ended_at >= cd
 
     def _pick_question(self) -> str:
         q = QUESTIONS[self._q_next % len(QUESTIONS)]
@@ -219,9 +221,9 @@ class CheckIn:
         return {"message": f"{lead} {question}".strip(), "severity": "warning", "reason": "check-in",
                 "source": "check", "expects_answer": True, "check_id": self.id, "round": self.round}
 
-    def start(self, hazard: str, now: float) -> dict | None:
+    def start(self, hazard: str, now: float, cooldown_s: float | None = None) -> dict | None:
         with self._lock:
-            if not self.can_start(now):
+            if not self.can_start(now, cooldown_s):
                 return None
             self.id += 1
             self.round, self.hazard, self.rounds = 1, hazard, []

@@ -284,6 +284,7 @@ class Coach:
         self.preset = "custom"
         self._last_said = -1e9          # last non-danger message (observe clock); message_gap_s counts from it
         self._episode_start: dict = {}  # reason -> when its current episode began (for warn_hold_s)
+        self._llm_episode: dict = {}    # reason -> episode start the LLM already spoke about
         self.language = language
         self.checkin = checkin          # closed-loop alertness check after danger alerts (optional)
         self._t = 0.0                   # time of the last observe(): the clock for answers/verdicts
@@ -393,16 +394,20 @@ class Coach:
         for k in [k for k in self._last_local if now - self._last_seen.get(k.split("|")[0], -1e9) > EPISODE_GAP_S]:
             del self._last_local[k]
         alerted = False
+        repeated = False    # this alert re-announces a danger that is still going on
         # while a question waits for the driver's reply (or they are answering), the co-pilot keeps
         # measuring but says nothing: only a microsleep, which makes answering impossible, interrupts
         busy = self.awaiting_reply(now) or (self.checkin is not None and self.checkin.active)
-        if loc and not (busy and key not in INTERRUPTS_REPLY):
+        # a danger dropping back to caution is no news: no warning for a hazard already alerted this episode
+        downgrade = bool(loc) and loc["severity"] == "warning" and f"{key}|alert" in self._last_local
+        if loc and not downgrade and not (busy and key not in INTERRUPTS_REPLY):
             ek = f"{key}|{loc['severity']}"
             is_alert = loc["severity"] == "alert"
             repeat = self.alert_repeat_s if is_alert else float("inf")
             ready = is_alert or (now - self._episode_start.get(key, now) >= self.warn_hold_s
                                  and not self._quiet(now))
             if ready and (ek not in self._last_local or now - self._last_local[ek] > repeat):
+                repeated = ek in self._last_local
                 self._last_local[ek] = now
                 if key == "signs of fatigue":    # tiredness: talking helps more than a warning
                     self._open_conversation(FATIGUE_OPENER, now, loc["severity"], key)
@@ -412,8 +417,11 @@ class Coach:
 
         # 2) closed loop: after a danger alert ask the driver a question, then judge the reaction
         if self.checkin:
-            if alerted and self.questions and self.checkin.can_start(now):
-                q = self.checkin.start(key, now)
+            # a danger still going on when its alert repeats gets a question instead of the same alert
+            # again: the long question cooldown then shrinks to the alert repeat time
+            cooldown = self.alert_repeat_s if repeated else None
+            if alerted and self.questions and self.checkin.can_start(now, cooldown):
+                q = self.checkin.start(key, now, cooldown)
                 if q:
                     self._emit(q)
             # the answer window doesn't run out while the driver is talking or the reply is being transcribed
@@ -457,9 +465,15 @@ class Coach:
                 loc = {"message": "Are you comfortable? If needed, take a break when safe.",
                        "severity": "info", "reason": "facial movement"}
             due = True
+        # one LLM message per danger episode: the instant alert repeats are enough after that, and
+        # caution/danger flicker within the episode must not make the LLM say the same thing again
+        if key and not event and self._llm_episode.get(key) == self._episode_start.get(key):
+            due = False
         if due and now >= self._pause_until:
             self._last_llm = now
             self._pending = False
+            if key:
+                self._llm_episode[key] = self._episode_start.get(key)
             self._submit(("react", compact_state(state), loc))
 
     def _submit(self, job) -> None:
@@ -595,6 +609,11 @@ class Coach:
                         continue            # rate-limited: stay quiet, instant alerts still work
             if self.awaiting_reply(self._t) or (self.checkin and self.checkin.active):
                 continue                    # a question was asked meanwhile: this comment would talk over it
+            if loc and out is not None:     # the LLM spoke about this hazard: it counts as its announcement,
+                for sev in ("warning", "alert"):   # so the instant repeat waits (existing keys only:
+                    ek = f"{loc['reason']}|{sev}"  # observe() iterates this dict on its own thread)
+                    if ek in self._last_local:
+                        self._last_local[ek] = self._t
             if out is None:
                 out = loc or {"message": "All good. Keep your eyes on the road.", "severity": "info", "reason": "ok"}
                 out = {**out, "source": "rules"}

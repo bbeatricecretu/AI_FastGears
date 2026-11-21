@@ -39,6 +39,9 @@ EAR_FULLY_CLOSED_RATIO = 0.3     # EAR of a fully shut eye ~0.3 x open EAR
 PERCLOS_CLOSURE = 0.8            # PERCLOS P80: eye >= 80 % closed
 PERCLOS_WINDOW_S = 300.0         # PERCLOS = share of closed time over the last 5 min
 PERCLOS_MIN_S = 60.0             # ...judged only once this much history exists (no "tired" at start-up)
+PERCLOS_RECENT_S = 60.0          # the 5-min trend only counts while the last minute backs it up:
+PERCLOS_RECENT_FACTOR = 2.0      # effective PERCLOS = min(5-min, 2 x last-minute), so a minute of open
+                                 # eyes clears an old episode instead of holding "tired" for 5 min
 BLINK_MAX_S = 0.5                # closures shorter than this count as blinks
 BLINK_WINDOW_S = 60.0
 LONG_CLOSURE_S = 0.5             # closure reported as a reason beyond this
@@ -105,7 +108,7 @@ _THRESHOLD_NAMES = (
     "CALIB_MIN_SAMPLES", "BASELINE_EAR_MIN", "BASELINE_EAR_MAX",
     "CALIB_BLINK_BS_MAX", "EAR_CLOSED_RATIO", "EAR_CLOSED_ABS",
     "BLINK_BS_CLOSED", "EAR_FULLY_CLOSED_RATIO", "PERCLOS_CLOSURE",
-    "PERCLOS_WINDOW_S", "PERCLOS_MIN_S", "BLINK_MAX_S", "BLINK_WINDOW_S", "LONG_CLOSURE_S",
+    "PERCLOS_WINDOW_S", "PERCLOS_MIN_S", "PERCLOS_RECENT_S", "PERCLOS_RECENT_FACTOR", "BLINK_MAX_S", "BLINK_WINDOW_S", "LONG_CLOSURE_S",
     "EYES_WARN_S", "MICROSLEEP_S", "EAR_MIN_CUTOFF", "EAR_BETA", "MAR_YAWN", "JAW_OPEN_YAWN",
     "YAWN_MIN_S", "YAWN_WINDOW_S", "YAWNS_TIRED", "YAW_SIDE_DEG", "YAW_AWAY_DEG",
     "PITCH_DOWN_DEG", "PITCH_UP_DEG", "IRIS_YAW_GAIN", "IRIS_PITCH_GAIN",
@@ -154,6 +157,9 @@ class AttentionMonitor:
         self._hand_since: float | None = None
         self._perclos_closed = 0.0                                   # closed seconds in _perclos
         self._perclos_total = 0.0                                    # all seconds in _perclos
+        self._recent: deque[tuple[float, float, bool]] = deque()     # same samples, last PERCLOS_RECENT_S
+        self._recent_closed = 0.0
+        self._recent_total = 0.0
         self._off_samples: deque[tuple[float, float]] = deque()     # (t, dt) of off-road frames
         self._off_total = 0.0
         self._last_off_t: float | None = None
@@ -319,6 +325,9 @@ class AttentionMonitor:
                 self._perclos.append((t, dt, shut))
                 self._perclos_total += dt
                 self._perclos_closed += dt if shut else 0.0
+                self._recent.append((t, dt, shut))
+                self._recent_total += dt
+                self._recent_closed += dt if shut else 0.0
 
             # mouth / yawns
             jaw = (face.blendshapes or {}).get("jawOpen", 0.0)
@@ -445,10 +454,18 @@ class AttentionMonitor:
         perclos = self._perclos_closed / self._perclos_total if self._perclos_total > 1e-6 else 0.0
         perclos = min(1.0, max(0.0, perclos))
         perclos_ready = self._perclos_total >= th["perclos_min_s"]
+        while self._recent and t - self._recent[0][0] > th["perclos_recent_s"]:
+            _, d, shut = self._recent.popleft()
+            self._recent_total -= d
+            self._recent_closed -= d if shut else 0.0
+        perclos_recent = (min(1.0, max(0.0, self._recent_closed / self._recent_total))
+                          if self._recent_total > 1e-6 else 0.0)
+        # the trend that drives "tired": the 5-min PERCLOS, as far as the last minute still supports it
+        perclos_eff = min(perclos, th["perclos_recent_factor"] * perclos_recent)
         microsleep = eye_closed_s >= th["microsleep_s"]
         eyes_closing = eye_closed_s >= th["eyes_warn_s"] and not microsleep
         yawns_5min = len(self._yawns)
-        tired_perclos = perclos_ready and perclos >= th["perclos_tired"]
+        tired_perclos = perclos_ready and perclos_eff >= th["perclos_tired"]
         tired_yawns = yawns_5min >= th["yawns_tired"]
         tired = tired_perclos or tired_yawns
 
@@ -476,7 +493,7 @@ class AttentionMonitor:
         self._acute = max(closure_score, self._acute * math.exp(-dt / th["acute_decay_s"]))
         perclos_score = 0.0
         if perclos_ready:
-            perclos_score = min(th["perclos_score_max"], th["level_caution"] * perclos / th["perclos_tired"])
+            perclos_score = min(th["perclos_score_max"], th["level_caution"] * perclos_eff / th["perclos_tired"])
         yawn_score = th["yawn_tired_score"] if tired_yawns else 0.0
         tilt_score = 0.0
         if tilt_s >= th["head_tilt_s"]:
@@ -505,7 +522,7 @@ class AttentionMonitor:
         elif eye_closed_s >= th["long_closure_s"]:
             reasons.append(f"eyes closed {eye_closed_s:.1f} s")
         if tired_perclos:
-            reasons.append(f"tired: eyes closed {perclos * 100:.0f}% of the last 5 min")
+            reasons.append(f"tired: eyes closed {perclos * 100:.0f}% of the last 5 min, {perclos_recent * 100:.0f}% of the last minute")
         if tilt_s >= th["head_tilt_s"]:
             what = "dropping" if looking == "nodding" else "tilted"
             reasons.append(f"head {what} {tilt_s:.1f} s (nodding off?)")
@@ -548,7 +565,9 @@ class AttentionMonitor:
             "ear_left": _r(ears_lr[0]) if ears_lr else None,
             "ear_right": _r(ears_lr[1]) if ears_lr else None,
             "blinks_per_min": round(blinks_per_min, 1),
-            "perclos": round(perclos, 3),
+            "perclos": round(perclos, 3),                 # 5-min trend (raw)
+            "perclos_recent": round(perclos_recent, 3),   # last minute
+            "perclos_effective": round(perclos_eff, 3),   # what drowsiness / "tired" use
             "microsleep": bool(microsleep),
             "eyes_closing": bool(eyes_closing),
             "tired": bool(tired),

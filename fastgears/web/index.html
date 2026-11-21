@@ -100,7 +100,7 @@
         <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
         <div class="m" id="m-phone"><small>Phone</small><span>–</span></div>
         <div class="m" id="m-ear"><small>EAR L / R</small><span>–</span></div>
-        <div class="m" id="m-perclos"><small>PERCLOS (5 min)</small><span>–</span></div>
+        <div class="m" id="m-perclos"><small>PERCLOS 5 min / 1 min</small><span>–</span></div>
         <div class="m" id="m-blinks"><small>Blinks/min</small><span>–</span></div>
         <div class="m" id="m-yawn"><small>Yawns 5 min</small><span>–</span></div>
         <div class="m" id="m-offroad"><small>Off-road now · last 30 s</small><span>–</span></div>
@@ -258,7 +258,7 @@ function onState(s) {
   set('m-phone', a.phone ? `IN USE ${Math.round(a.phone_s || 0)}s` : 'no', a.phone);
   set('m-ear', a.ear_left != null ? `${a.ear_left.toFixed(2)} / ${a.ear_right.toFixed(2)}`
       : a.ear != null ? a.ear.toFixed(2) : '–');
-  set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', a.tired);
+  set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '% · ' + Math.round((a.perclos_recent || 0) * 100) + '%' : '–', a.tired);
   set('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–');
   set('m-yawn', a.yawns_5min ?? '–', a.yawning);
   set('m-offroad', a.off_road_s != null ? `${a.off_road_s.toFixed(1)}s · ${(a.off_road_total_s || 0).toFixed(1)}/${a.distracted_after_s ?? 5}s` : '–', a.distracted);

@@ -354,3 +354,40 @@ def test_llm_comment_arriving_during_a_question_is_dropped():
     c._submit(("react", {}, {"message": "Phone away.", "severity": "warning", "reason": "phone in use"}))
     time.sleep(0.2)
     assert [m["message"] for m in got] == ["Where are you heading?"]
+
+
+# ── ongoing danger after a passed check-in: no message jam ─────────────────────
+
+def _off(level="danger"):
+    return st(distracted=True, looking="left", level=level)
+
+
+def test_danger_flicker_gets_one_llm_message_per_episode():
+    llm = FakeLLM()
+    got = []
+    c = Coach(llm, got.append, min_interval_s=8, summary_every_s=90, message_gap_s=0)
+    t = 100.0
+    for i in range(150):                                   # 30 s of danger flickering with caution
+        c.observe(_off("caution" if i % 10 >= 6 else "danger"), now=t)
+        t += 0.2
+        time.sleep(0.002)
+    time.sleep(0.2)
+    assert llm.calls == 1                                  # not one per flicker
+    assert not any(m["severity"] == "warning" and m["source"] == "instant" for m in got)   # no step-down
+
+
+def test_ongoing_danger_gets_a_new_question_instead_of_repeated_alerts():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9,
+              checkin=CheckIn(answer_timeout_s=20, cooldown_s=90))
+    c.observe(_off(), now=5.0)                             # alert + question
+    c.observe(road(), now=8.0)
+    c.chat("a car ahead", road())                          # passes
+    time.sleep(0.2)
+    t = 11.0
+    while t < 50.0:                                        # looks away again, inside the 90 s cooldown
+        c.observe(_off(), now=t)
+        t += 0.2
+    questions = [m for m in got if m.get("reason") == "check-in"]
+    assert len(questions) == 2                             # asked again once the alert repeated
+    assert sum(m.get("source") == "instant" for m in got) <= 3

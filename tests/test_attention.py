@@ -369,6 +369,26 @@ def test_perclos_uses_5_min_window_and_waits_for_history():
     assert out["perclos"] < 0.01 and out["tired"] is False
 
 
+def test_old_perclos_episode_clears_after_a_minute_of_open_eyes():
+    mon, out, t = calibrated()
+    for _ in range(14):                                          # ~84 s of 33 % closure: tired
+        out, t = run(mon, t, 1.9, lambda: fake_face(ear=0.05))
+        out, t = run(mon, t, 4.0, lambda: fake_face())
+    assert out["tired"] is True and out["drowsiness"] >= 40
+    out, t = run(mon, t, 62.0, lambda: fake_face())             # one minute wide awake
+    assert out["perclos"] > 0.15                                 # the 5-min trend still remembers...
+    assert out["perclos_recent"] < 0.01                          # ...but the last minute was clean
+    assert out["tired"] is False and out["drowsiness"] < 40      # so drowsiness drops, not stuck at 60
+
+
+def test_steadily_tired_driver_stays_tired():
+    mon, out, t = calibrated()
+    for _ in range(40):                                          # 4 min of ~33 % closure, still going
+        out, t = run(mon, t, 1.9, lambda: fake_face(ear=0.05))
+        out, t = run(mon, t, 4.0, lambda: fake_face())
+    assert out["tired"] is True and out["perclos_effective"] >= 0.15
+
+
 def test_hand_up_is_hand_off_wheel():
     mon, out, t = calibrated()
     out, t = run(mon, t, 2.0, lambda: fake_face(), )

@@ -287,7 +287,7 @@
         <div class="grid">
           <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
           <div class="m" id="m-closed"><small>Closed for</small><span>–</span></div>
-          <div class="m" id="m-perclos"><small>PERCLOS</small><span>–</span></div>
+          <div class="m" id="m-perclos"><small>PERCLOS · 5 min / 1 min</small><span>–</span></div>
           <div class="m" id="m-blinks"><small>Blinks / min</small><span>–</span></div>
           <div class="m" id="m-yawns"><small>Yawns · 5 min</small><span>–</span></div>
           <div class="m" id="m-tired"><small>Microsleep</small><span>–</span></div>
@@ -382,7 +382,7 @@ function onState(s) {
   const eye = (closed) => closed ? 'closed' : 'open';
   tile('m-eyes', a.face_present ? `L ${eye(a.eye_left_closed)} · R ${eye(a.eye_right_closed)}` : '–', a.eyes_closed ? 'warn' : '');
   tile('m-closed', a.eye_closed_s ? `${a.eye_closed_s.toFixed(1)} s` : '0 s', a.microsleep ? 'bad' : a.eye_closed_s >= 0.5 ? 'warn' : '');
-  tile('m-perclos', `${Math.round((a.perclos || 0) * 100)} %`, a.tired ? 'warn' : '');
+  tile('m-perclos', `${Math.round((a.perclos || 0) * 100)} % · ${Math.round((a.perclos_recent || 0) * 100)} %`, a.tired ? 'warn' : '');
   tile('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–', '');
   tile('m-yawns', `${a.yawns_5min ?? 0}${a.yawning ? ' · yawning' : ''}`, a.yawning || a.yawns_5min >= 2 ? 'warn' : '');
   tile('m-tired', a.microsleep ? 'YES' : a.tired ? 'tired' : 'no', a.microsleep ? 'bad' : a.tired ? 'warn' : '');
