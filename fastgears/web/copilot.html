@@ -154,6 +154,9 @@
                background: linear-gradient(180deg, color-mix(in srgb, #2f6bff 82%, #fff), #2f6bff); }
   .bubble.me.live { opacity: .72; }                     /* still being heard: words update as you speak */
   .bubble.me.live::after { content: "…"; }
+  /* how alert the reply sounded, added under the driver's bubble once the co-pilot has judged it */
+  .bubble.me .assess { display: block; margin: 4px 0 0; color: rgba(255,255,255,.8); font-size: .72rem; font-weight: 500; }
+  .bubble.me .assess.slow { color: #ffe0a8; } .bubble.me .assess.poor { color: #ffc2c8; }
   /* waiting for a reply: a frosted glass pill — "••• Searching…" */
   .bubble.ai.typing { display: inline-flex; align-items: center; gap: 14px; padding: .85rem 1.9rem; opacity: 1;
                       border-radius: 999px; font-size: 1.15rem; font-weight: 500; letter-spacing: -.01em; color: #fff;
@@ -309,6 +312,8 @@
           <div class="m" id="m-expr"><small>Expression</small><span>–</span></div>
           <div class="m" id="m-driver"><small>Driver</small><span>–</span></div>
           <div class="m" id="m-people"><small>Passengers</small><span>–</span></div>
+          <div class="m" id="m-reply"><small>Reply alertness</small><span>–</span></div>
+          <div class="m" id="m-replytime"><small>Reply time · avg</small><span>–</span></div>
           <div class="m chart"><small>Live<i style="background:var(--warn)"></i>drowsiness<i style="background:#7cc8ff"></i>distraction<i style="background:var(--bad)"></i>pulse</small><canvas id="chart" aria-label="Live graph of drowsiness, distraction and pulse"></canvas></div>
         </div>
       </div>
@@ -341,6 +346,10 @@
 const $ = id => document.getElementById(id);
 const orb = $('orb');
 let voice = true, lastSpoken = 0;
+let geminiStt = false;     // server can transcribe recorded audio (Gemini): from state.llm.stt
+let askedAt = null;        // performance.now() when the co-pilot's last question ended: reply time counts from it
+let pendingMeta = null;    // voice cues + reply time of a spoken reply, sent along with its text
+let lastMine = null;       // the driver's last bubble, tagged with how alert the reply sounded
 
 const LEVEL_TEXT = { ok: 'ATTENTIVE', caution: 'CAUTION', danger: 'DANGER' };
 const LABEL = { 'check-in': 'Alertness check', chat: 'Co-pilot', conversation: 'Co-pilot', 'check-in passed': 'Check passed' };
@@ -383,6 +392,10 @@ function onState(s) {
   tile('m-phone', a.phone ? `IN USE${h.phone_source ? ' · ' + h.phone_source : ''}` : 'no', a.phone ? 'bad' : '');
   tile('m-hands', a.hand_off_wheel ? 'off the wheel' : `${h.driver ?? 0} seen · ${h.free ?? 0} free`, a.hand_off_wheel ? 'warn' : '');
   tile('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–', '');
+  const en = s.engagement || {};
+  geminiStt = !!(s.llm && s.llm.stt);
+  tile('m-reply', en.replies ? `${en.last} · ${en.score}/100` : '–', en.last === 'poor' ? 'bad' : en.last === 'slow' ? 'warn' : '');
+  tile('m-replytime', en.last_reply_s != null ? `${en.last_reply_s} s · ${en.avg_reply_s} s` : '–', en.last_reply_s >= 8 ? 'bad' : en.last_reply_s >= 4 ? 'warn' : '');
   tile('m-check', ck.active ? (ck.phase === 'judging' ? 'checking…' : `Q ${ck.round}/${ck.max_rounds} · ${Math.ceil(ck.seconds_left ?? 0)} s`) : 'idle', ck.active ? 'warn' : '');
 
   const trust = p.trust || {};
@@ -463,7 +476,18 @@ function addBubble(m, instant = false) {
     if (label && m.severity !== 'info') { const s = document.createElement('small'); s.textContent = label; li.append(s); }
   }
   li.append(document.createTextNode(m.message));
+  if (mine) lastMine = li;
   trimThread(); scrollThread();
+}
+function tagReply(a) {                  // "1.4 s · clear · alert" under the driver's last bubble
+  if (!lastMine || !lastMine.isConnected || lastMine.querySelector('.assess')) return;
+  const t = document.createElement('small');
+  t.className = 'assess ' + a.alertness;
+  const v = a.voice || {};
+  t.textContent = [a.reply_time_s != null ? `${a.reply_time_s} s` : null, v.clarity, v.energy === 'low' ? 'low energy' : null,
+                   v.hesitant ? 'hesitant' : null, a.alertness].filter(Boolean).join(' · ');
+  t.title = (a.signals || []).join(' · ') || 'Reply sounded alert';
+  lastMine.append(t);
 }
 function liveTranscript(text) {         // the driver's words as they are recognised
   if (!liveBubble) { liveBubble = document.createElement('li'); $('thread').append(liveBubble); }
@@ -496,7 +520,7 @@ function speak(m) {
   u.onend = u.onerror = () => {
     if (speechSynthesis.speaking) return;
     setOrb('');
-    if (m.expects_answer) listenForAnswer();
+    if (m.expects_answer) { askedAt = performance.now(); listenForAnswer(); }   // reply time counts from here
   };
   window._utterances = [...(window._utterances || []).slice(-5), u];   // Chrome drops onend of unreferenced utterances
   if (speechSynthesis.paused) speechSynthesis.resume();               // Chrome can leave the queue paused: nothing would play
@@ -508,7 +532,9 @@ function onMessage(m) {
   addToFeed(m);
   const old = (m.t || 0) < Date.now() / 1000 - 5;   // history replayed on connect: show, don't speak
   if (m.source === 'user') { if (old) addBubble(m, true); return; }
+  if (m.assessment && !old) tagReply(m.assessment);
   show(m, old);
+  if (m.expects_answer && !old && (!voice || !('speechSynthesis' in window))) askedAt = performance.now();   // nothing spoken: the clock starts now
   if (!old) speak(m);
 }
 
@@ -528,12 +554,14 @@ connect();
 $('chat').onsubmit = async e => {
   e.preventDefault();
   const text = $('q').value.trim(); if (!text) return;
+  const meta = pendingMeta || {}; pendingMeta = null;   // spoken replies carry voice cues + reply time
   $('q').value = '';
   addToFeed({ message: text, source: 'user', t: Date.now() / 1000 });
   addBubble({ message: text, source: 'user' });
   showTyping();
   status('Thinking…'); setOrb('thinking');
-  await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ text, voice: meta.voice || null, reply_time_s: meta.reply_time_s ?? null }) });
 };
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 // ── message frequency panel (same /api/tuning as the dashboard) ──
@@ -625,25 +653,149 @@ const unlockSpeech = () => {
 };
 addEventListener('pointerdown', unlockSpeech, true); addEventListener('keydown', unlockSpeech, true);
 
-// speech input: the mic listens for one reply — when the 🎤 button is pressed or right after the co-pilot asks something
+// ── speech input: the mic listens for one reply — when the mic button is pressed or right after the co-pilot asks something ──
+// Main path: record the reply here (works in any browser), send the audio to Gemini (/api/transcribe), which
+// returns the words AND how they sounded (clear / mumbled / slurred, energy, hesitation). The words go into the
+// chat like a typed message, with the voice cues and the reply time, so the co-pilot can judge how alert the
+// driver is. Fallback without Gemini: the browser's own speech recognition (Chrome / Edge only).
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && (window.AudioContext || window.webkitAudioContext));
+const useRecorder = () => geminiStt && canRecord;
+const STT_PAUSE_MS = 60000;
+let sttFailAt = -1e9;      // last failed transcription (performance.now())
 let rec = null, listening = false, mode = null, nextMode = null;
+
+const VAD = { threshold: 0.015, silenceMs: 1300, maxMs: 15000, noSpeechMs: 14000 };   // the server holds a question open ~20 s
+// tell the server a reply is on its way: it stays silent and the question doesn't time out meanwhile
+let answeringSent = false;
+function answering(active) {
+  if (active === answeringSent) return;
+  answeringSent = active;
+  fetch('/api/answering', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }).catch(() => {});
+}
+const rc = { stream: null, ctx: null, src: null, node: null, chunks: [], startedAt: 0, speechAt: null, lastVoice: 0, manual: false, on: false };
+
+async function recStart(manual) {
+  if (rc.on || listening) return;
+  rc.on = true;                                        // claimed at once: a second click can't start a second recording
+  try {
+    rc.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    rc.on = false;
+    addBubble({ message: "I can't use the microphone. Allow it in the browser's address bar, or type your answer.", severity: 'info', reason: '' });
+    return;
+  }
+  rc.ctx = rc.ctx || new (window.AudioContext || window.webkitAudioContext)();
+  if (rc.ctx.state === 'suspended') await rc.ctx.resume();
+  rc.src = rc.ctx.createMediaStreamSource(rc.stream);
+  rc.node = rc.ctx.createScriptProcessor(4096, 1, 1);
+  rc.chunks = []; rc.speechAt = null; rc.manual = manual; rc.startedAt = rc.lastVoice = performance.now();
+  rc.node.onaudioprocess = e => {
+    const x = e.inputBuffer.getChannelData(0), now = performance.now();
+    rc.chunks.push(new Float32Array(x));
+    let sum = 0; for (let i = 0; i < x.length; i++) sum += x[i] * x[i];
+    if (Math.sqrt(sum / x.length) > VAD.threshold) {           // voice in this block
+      if (rc.speechAt == null) { rc.speechAt = now - (x.length / rc.ctx.sampleRate) * 1000; liveTranscript('Listening'); answering(true); }
+      rc.lastVoice = now;
+    }
+    if (rc.speechAt != null && now - rc.lastVoice > VAD.silenceMs) recStop(true);           // finished talking
+    else if (rc.speechAt == null && !rc.manual && now - rc.startedAt > VAD.noSpeechMs) recStop(false);   // no answer
+    else if (now - rc.startedAt > VAD.maxMs) recStop(true);
+  };
+  rc.src.connect(rc.node); rc.node.connect(rc.ctx.destination);   // a ScriptProcessor only runs while connected (outputs silence)
+  listening = true; mode = 'answer';
+  if (manual) answering(true);                       // pressing the mic is the start of a reply
+  $('mic').classList.add('listening'); setOrb('listening'); status('Listening…');
+}
+
+function recStop(send) {
+  if (!rc.on) return;
+  rc.on = false; listening = false; mode = null;
+  if (rc.node) { rc.node.onaudioprocess = null; rc.node.disconnect(); }
+  rc.src?.disconnect();
+  rc.stream?.getTracks().forEach(t => t.stop());        // release the mic: the browser's recording dot goes away
+  rc.stream = rc.src = rc.node = null;
+  $('mic').classList.remove('listening');
+  if (orb.classList.contains('listening')) setOrb('');
+  const heard = rc.speechAt != null;
+  const replyTime = heard && askedAt != null && rc.speechAt > askedAt && rc.speechAt - askedAt < 30000
+    ? +((rc.speechAt - askedAt) / 1000).toFixed(1) : null;
+  if (heard) askedAt = null;
+  const chunks = rc.chunks; rc.chunks = [];
+  if (!send || !heard) { dropLiveTranscript(); answering(false); return; }
+  transcribeAndSend(encodeWav(chunks, rc.ctx.sampleRate, rc.speechAt - rc.startedAt), replyTime);
+}
+
+// 16 kHz mono 16-bit WAV (a format Gemini reads), starting just before the first word
+function encodeWav(chunks, rate, speechStartMs) {
+  const len = chunks.reduce((n, c) => n + c.length, 0), all = new Float32Array(len);
+  let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+  const from = Math.max(0, Math.floor((speechStartMs - 300) / 1000 * rate));
+  const step = rate / 16000, n = Math.max(0, Math.floor((len - from) / step));
+  const v = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (p, s) => { for (let i = 0; i < s.length; i++) v.setUint8(p + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 16000, true);
+  v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {                        // average each step: a simple anti-aliased downsample
+    const a = from + Math.floor(i * step), b = Math.max(a + 1, from + Math.floor((i + 1) * step));
+    let s = 0; for (let j = a; j < b; j++) s += all[j];
+    v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, s / (b - a))) * 0x7fff, true);
+  }
+  return new Blob([v], { type: 'audio/wav' });
+}
+
+async function transcribeAndSend(wav, replyTime) {
+  liveTranscript('Transcribing'); setOrb('thinking'); status('Transcribing…');
+  try {
+    const r = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    sttFailAt = -1e9;                                  // working again: the mic reopens after questions
+    if (!d.transcript) { dropLiveTranscript(); setOrb(''); status("Didn't catch that"); answering(false); return; }
+    send(d.transcript, { voice: d.voice || {}, reply_time_s: replyTime });
+  } catch (e) {
+    dropLiveTranscript(); setOrb(''); answering(false);
+    // after a failure the mic stops opening by itself for a minute (the button still works), and the
+    // error is said once, not after every question
+    const now = performance.now(), quiet = now - sttFailAt < STT_PAUSE_MS;
+    sttFailAt = now;
+    status('Voice recognition unavailable · type your answer');
+    if (!quiet) addBubble({ message: /quota/i.test(e.message)
+      ? 'Voice recognition is out of quota right now. Please type your answer, or try the mic again in a minute.'
+      : "I couldn't hear that. Please type your answer, or press the mic to try again.", severity: 'info', reason: '' });
+  }
+}
+
+// browser speech recognition: fallback when the server has no Gemini
 function startListening(m, force) {
+  if (useRecorder()) {
+    if (force) { recStart(true); return; }                          // the driver pressed the mic: always try
+    if (performance.now() - sttFailAt < STT_PAUSE_MS) return;       // just failed: don't reopen the mic by itself
+    if (!('speechSynthesis' in window) || !speechSynthesis.speaking) recStart(false);
+    return;
+  }
   if (!rec || (!force && speechSynthesis.speaking)) return;
   if (listening) { if (mode !== m) { nextMode = m; rec.abort(); } return; }
   mode = m; rec.continuous = false; rec.interimResults = true;   // show the words live while you speak
   try { rec.start(); } catch (e) { /* already starting */ }
 }
-// mic button: cut the co-pilot off mid-sentence and listen to the driver right away; press again to stop
+// mic button: cut the co-pilot off mid-sentence and listen to the driver right away; press again to send
 function talkNow() {
+  if (rc.on) { recStop(true); return; }
   if (listening && mode === 'answer') { stopListening(); return; }
+  if (!useRecorder() && !rec) {
+    addBubble({ message: 'Voice input needs Gemini on the server (LLM_PROVIDER=gemini) or Chrome / Edge. Please type instead.', severity: 'info', reason: '' });
+    return;
+  }
   if ('speechSynthesis' in window) speechSynthesis.cancel();
   setOrb('');
   startListening('answer', true);
 }
-function stopListening() { nextMode = null; if (listening) rec.abort(); }
+function stopListening() { nextMode = null; if (rc.on) recStop(false); else if (listening && rec) rec.abort(); }
 function listenForAnswer() { startListening('answer'); }
-function send(text) { $('q').value = text; $('chat').requestSubmit(); }
+function send(text, meta) { answeringSent = false; pendingMeta = meta || null;   // the chat request closes the question server-side
+  $('q').value = text; $('chat').requestSubmit(); }
 if (SR) {
   rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
   rec.onstart = () => {
@@ -653,24 +805,26 @@ if (SR) {
   rec.onend = () => {
     listening = false; $('mic').classList.remove('listening');
     if (orb.classList.contains('listening')) setOrb('');
-    if (liveBubble && liveBubble.classList.contains('live')) dropLiveTranscript();   // heard nothing final
+    if (liveBubble && liveBubble.classList.contains('live')) { dropLiveTranscript(); answering(false); }   // heard nothing final
     const m = nextMode; nextMode = null;
     if (m) startListening(m);
   };
-  rec.onerror = e => { if (e.error !== 'aborted' && e.error !== 'no-speech') console.warn('speech recognition:', e.error); };
+  rec.onerror = e => {
+    if (e.error === 'aborted' || e.error === 'no-speech') return;
+    console.warn('speech recognition:', e.error);
+    addBubble({ message: `Speech recognition failed (${e.error}). Please type your answer.`, severity: 'info', reason: '' });
+  };
   rec.onresult = e => {
     let final = '', interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const r = e.results[i];
       if (r.isFinal) final += r[0].transcript; else interim += r[0].transcript;
     }
-    if (final.trim()) send(final.trim()); else if (interim.trim()) liveTranscript(interim.trim());
+    if (final.trim()) send(final.trim()); else if (interim.trim()) { liveTranscript(interim.trim()); answering(true); }
   };
-  $('mic').onclick = talkNow;
-} else {
-  $('mic').disabled = true;
-  $('mic').title = 'Speech input needs Chrome or Edge';
 }
+$('mic').onclick = talkNow;
+if (!SR && !canRecord) { $('mic').disabled = true; $('mic').title = 'This browser cannot record audio'; }
 </script>
 </body>
 </html>

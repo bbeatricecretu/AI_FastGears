@@ -19,13 +19,18 @@ import time
 from collections import deque
 from typing import Callable, Protocol
 
-from .intervention import JUDGE_PROMPT, CheckIn, merge_verdict, parse_judge, rule_verdict
+from .dialogue import (ANALYSIS_RULES, TRANSCRIBE_PROMPT, Engagement, merge_assessment, parse_assessment,
+                       parse_voice, reply_signals)
+from .intervention import JUDGE_PROMPT, CheckIn, evidence, merge_verdict, parse_judge, rule_verdict
 
 log = logging.getLogger("coach")
 
 ALERT_REPEAT_S = 20.0   # an ongoing danger episode is re-announced at most this often
 EPISODE_GAP_S = 10.0    # a reason must be gone this long before it counts as a new episode
 RATE_LIMIT_PAUSE_S = 30.0
+AWAIT_REPLY_S = 20.0    # after a question the co-pilot stays quiet this long, waiting for the reply
+ANSWER_MAX_S = 30.0     # a reply being spoken/transcribed holds the floor at most this long
+INTERRUPTS_REPLY = {"microsleep"}   # the only hazard that may talk over an open question
 
 # Message pacing, adjustable live from the dashboard (Coach.set_tuning / POST /api/tuning).
 # Danger alerts ignore message_gap_s and warn_hold_s: they are always spoken at once.
@@ -69,6 +74,9 @@ Safety first: if the state shows danger, tell them to focus on the road before a
 Treat discomfort_grimace as facial movement only. Never diagnose medical conditions."""
 
 CONVO_TURNS = 8          # conversation lines the LLM sees (driver + co-pilot)
+FOLLOW_UP_MSG = "Stay with me. Count down from ten for me, out loud."
+BREAK_MSG = "Your answers sound tired. Please plan a break at the next rest area."
+STOP_MSG = "You don't sound fit to drive. Please stop at the next safe place."
 FATIGUE_OPENER = "You look a bit tired. Talk to me for a moment: where are you heading?"
 OPENERS = ("How is the drive going so far?",
            "How are you feeling? Need a break soon?",
@@ -80,30 +88,76 @@ class LLMClient(Protocol):
     def complete(self, system: str, user: str, json_mode: bool = False) -> str: ...
 
 
+def _quota_or_missing(e: Exception) -> bool:
+    """Errors that another model may not have: daily/minute quota used up, model not available."""
+    s = str(e)
+    return any(k in s for k in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND"))
+
+
 class GeminiClient:
+    """Gemini with model fallback: quotas are per model, so when the main model's free quota is used
+    up (429) the next model in the list takes over for the rest of the session."""
     name = "gemini"
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, fallback_models: tuple[str, ...] | list[str] = ()):
         from google import genai
         from google.genai import types
         self._types = types
         # v1 rejects system_instruction ("Developer instruction is not enabled"): use v1beta
         self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
-        self.model = model
+        self.models = list(dict.fromkeys([model, *fallback_models]))
+        self._i = 0
+        self._lock = threading.Lock()
+
+    @property
+    def model(self) -> str:
+        return self.models[self._i]
+
+    def _thinking(self, model: str):
+        t = self._types
+        try:  # models think by default: costs latency we don't want in a car
+            return (t.ThinkingConfig(thinking_budget=0) if "2.5" in model
+                    else t.ThinkingConfig(thinking_level="minimal"))
+        except Exception:
+            return None
+
+    def _generate(self, contents, **kw) -> str:
+        t = self._types
+        i, last = self._i, None
+        while i < len(self.models):
+            model = self.models[i]
+            cfg = dict(kw)
+            think = self._thinking(model)
+            if think is not None:
+                cfg["thinking_config"] = think
+            try:
+                r = self._client.models.generate_content(model=model, contents=contents,
+                                                         config=t.GenerateContentConfig(**cfg))
+            except Exception as e:
+                if not _quota_or_missing(e):
+                    raise
+                last = e
+                log.warning("Gemini model %s unavailable (%s): trying the next one", model, str(e)[:60])
+                i += 1
+                continue
+            with self._lock:
+                if i > self._i:
+                    self._i = i
+                    log.warning("Gemini: switched to %s for the rest of the session", model)
+            return r.text or ""
+        raise last or RuntimeError("no Gemini model available")
 
     def complete(self, system: str, user: str, json_mode: bool = False) -> str:
-        t = self._types
         kw = dict(system_instruction=system, temperature=0.5, max_output_tokens=300)
         if json_mode:
             kw["response_mime_type"] = "application/json"
-        try:  # models think by default: costs latency we don't want in a car
-            kw["thinking_config"] = (t.ThinkingConfig(thinking_budget=0) if "2.5" in self.model
-                                     else t.ThinkingConfig(thinking_level="minimal"))
-        except Exception:
-            pass
-        r = self._client.models.generate_content(model=self.model, contents=user,
-                                                 config=t.GenerateContentConfig(**kw))
-        return r.text or ""
+        return self._generate(user, **kw)
+
+    def transcribe(self, audio: bytes, mime: str, prompt: str) -> str:
+        """Speech -> text + how the voice sounds, in one call (Gemini hears the audio itself)."""
+        part = self._types.Part.from_bytes(data=audio, mime_type=mime)
+        return self._generate([part, prompt], temperature=0.0, max_output_tokens=300,
+                              response_mime_type="application/json")
 
 
 class AnthropicClient:
@@ -124,7 +178,7 @@ def make_client(settings) -> LLMClient | None:
     p = settings.llm_provider
     try:
         if p == "gemini" and settings.gemini_api_key:
-            return GeminiClient(settings.gemini_api_key, settings.gemini_model)
+            return GeminiClient(settings.gemini_api_key, settings.gemini_model, settings.gemini_fallback_models)
         if p == "anthropic" and settings.anthropic_api_key:
             return AnthropicClient(settings.anthropic_api_key, settings.anthropic_model)
     except Exception as e:  # missing package, bad key format...
@@ -222,7 +276,7 @@ class Coach:
                  min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English",
                  checkin: CheckIn | None = None, convo_idle_s: float = 0.0,
                  message_gap_s: float = 0.0, warn_hold_s: float = 0.0,
-                 alert_repeat_s: float = ALERT_REPEAT_S):
+                 alert_repeat_s: float = ALERT_REPEAT_S, await_reply_s: float = AWAIT_REPLY_S):
         self.client, self.on_message = client, on_message
         self.min_interval_s, self.summary_every_s = min_interval_s, summary_every_s
         self.message_gap_s, self.warn_hold_s, self.alert_repeat_s = message_gap_s, warn_hold_s, alert_repeat_s
@@ -238,6 +292,7 @@ class Coach:
         self._last_talk: float | None = None
         self._opener_i = 0
         self.history: deque = deque(maxlen=50)
+        self.engagement = Engagement()   # how alert the driver's replies sound, over the last few
         self._jobs: queue.Queue = queue.Queue(maxsize=1)
         self._last_llm = 0.0
         self._last_local = {}
@@ -250,6 +305,9 @@ class Coach:
         self._last_discomfort_id = None
         self.llm_errors = 0
         self.last_latency_ms: int | None = None
+        self.await_reply_s = await_reply_s
+        self._await_until = -1e9        # a question is open until then (observe clock)
+        self._answering_since: float | None = None
         threading.Thread(target=self._worker, name="coach", daemon=True).start()
 
     @property
@@ -288,6 +346,25 @@ class Coach:
                             if all(now[k] == pv[k] for k in pv if now[k] is not None)), "custom")
         return self.tuning()
 
+    # -- waiting for the driver's reply ------------------------------------------------------
+    def answering(self, now: float) -> bool:
+        """The driver is speaking / their reply is being transcribed (reported by the browser)."""
+        return self._answering_since is not None and now - self._answering_since < ANSWER_MAX_S
+
+    def awaiting_reply(self, now: float) -> bool:
+        """A question is open: until the reply arrives (or the window closes) the co-pilot stays quiet."""
+        return now < self._await_until or self.answering(now)
+
+    def set_answering(self, active: bool) -> None:
+        """Browser: the driver started (True) or abandoned (False) a spoken reply."""
+        if active:
+            self._answering_since = self._t
+        else:
+            self._answering_since = None
+            # a question still open gets a short grace period, so the driver can try again
+            if self._await_until > self._t:
+                self._await_until = max(self._await_until, self._t + 3.0)
+
     def _quiet(self, now: float) -> bool:
         """True while the last non-danger message is younger than message_gap_s."""
         return now - self._last_said < self.message_gap_s
@@ -316,9 +393,10 @@ class Coach:
         for k in [k for k in self._last_local if now - self._last_seen.get(k.split("|")[0], -1e9) > EPISODE_GAP_S]:
             del self._last_local[k]
         alerted = False
-        # during a check-in the question owns the voice: only an alert about a NEW hazard interrupts
-        busy = self.checkin is not None and self.checkin.active
-        if loc and not (busy and (loc["severity"] != "alert" or key == self.checkin.hazard)):
+        # while a question waits for the driver's reply (or they are answering), the co-pilot keeps
+        # measuring but says nothing: only a microsleep, which makes answering impossible, interrupts
+        busy = self.awaiting_reply(now) or (self.checkin is not None and self.checkin.active)
+        if loc and not (busy and key not in INTERRUPTS_REPLY):
             ek = f"{key}|{loc['severity']}"
             is_alert = loc["severity"] == "alert"
             repeat = self.alert_repeat_s if is_alert else float("inf")
@@ -338,15 +416,18 @@ class Coach:
                 q = self.checkin.start(key, now)
                 if q:
                     self._emit(q)
-            job = self.checkin.observe(state, now)
+            # the answer window doesn't run out while the driver is talking or the reply is being transcribed
+            job = self.checkin.observe(state, now, hold=self.answering(now))
             if job:
                 self._judge_async(job)
-            if self.checkin.active:     # the dialogue owns the voice: no LLM summaries meanwhile
-                self._pending = False
-                self._last_key, self._last_level = key, level
-                if key:
-                    self._prev_seen[key] = now
-                return
+        if (self.checkin and self.checkin.active) or self.awaiting_reply(now):
+            # the dialogue owns the voice: no LLM summaries, openers or comments meanwhile. Nothing is
+            # queued either: after the reply the co-pilot speaks about the state as it is then.
+            self._pending = False
+            self._last_key, self._last_level = key, level
+            if key:
+                self._prev_seen[key] = now
+            return
 
         # 3) a quiet, calm drive: the co-pilot starts a short conversation now and then
         if self._last_talk is None:
@@ -394,35 +475,79 @@ class Coach:
         self._emit({"message": text, "severity": severity, "reason": reason, "source": "instant",
                     "expects_answer": True})
 
-    def chat(self, text: str, state: dict) -> dict:
+    @property
+    def can_transcribe(self) -> bool:
+        return hasattr(self.client, "transcribe")
+
+    def transcribe(self, audio: bytes, mime: str) -> dict:
+        """Driver's recorded reply -> {"transcript", "voice": {clarity, energy, hesitant}}."""
+        if not self.can_transcribe:
+            raise RuntimeError("speech-to-text needs LLM_PROVIDER=gemini")
+        t0 = time.monotonic()
+        try:
+            out = parse_voice(self.client.transcribe(audio, mime, TRANSCRIBE_PROMPT.format(language=self.language)))
+        except Exception:
+            self.llm_errors += 1
+            raise
+        self.last_latency_ms = int((time.monotonic() - t0) * 1000)
+        return out
+
+    def chat(self, text: str, state: dict, voice: dict | None = None,
+             reply_time_s: float | None = None) -> dict:
         """Synchronous Q&A for the dashboard's 'talk to the co-pilot' box. While a check-in waits
-        for an answer, whatever the driver says is that answer."""
-        msg = {"role": "user", "message": text[:500], "severity": "info", "source": "user", "t": time.time()}
+        for an answer, whatever the driver says is that answer. Every reply is also judged for
+        alertness (reply time, voice, content, camera) and the co-pilot acts on it."""
+        text = text[:500]
+        self._answering_since, self._await_until = None, -1e9    # the reply is here: the question is closed
+        msg = {"role": "user", "message": text, "severity": "info", "source": "user", "t": time.time()}
         self.history.append(msg)
+        rule = reply_signals(text, reply_time_s, voice, state)
         if self.checkin and self.checkin.waiting:
-            job = self.checkin.answer(text[:500], self._t)
+            job = self.checkin.answer(text, self._t)
             if job:
+                job["voice"], job["reply_time_s"] = voice or {}, reply_time_s
+                job["reply_signals"] = rule["signals"]
+                self.engagement.add(merge_assessment(rule, None), reply_time_s)
                 self._judge_async(job)
                 return {"message": "", "severity": "info", "reason": "check-in answer", "source": "check"}
         self._last_talk = self._t
         talk = "\n".join(f"{who}: {line}" for who, line in self._convo) or "(none)"
-        self._convo.append(("driver", text[:500]))
-        if not self.client:
-            reply = "I'm in offline mode (no LLM key). " + (local_message(state) or {"message": "All looks fine — drive safe."})["message"]
-        else:
+        self._convo.append(("driver", text))
+        llm = None
+        if self.client:
             try:
-                reply = self.client.complete(CHAT_PROMPT.format(language=self.language),
-                                             f"Live state: {json.dumps(compact_state(state))}\n\n"
-                                             f"Conversation so far:\n{talk}\n\nDriver says: {text}")
+                about = {"reply_time_s": reply_time_s, "voice": voice or "typed, not spoken"}
+                llm = parse_assessment(self.client.complete(
+                    CHAT_PROMPT.format(language=self.language) + ANALYSIS_RULES,
+                    f"Live state: {json.dumps(compact_state(state))}\n\n"
+                    f"Conversation so far:\n{talk}\n\nDriver says: {text}\n"
+                    f"How they said it: {json.dumps(about)}", json_mode=True))
             except Exception as e:
                 log.warning("chat failed: %s", e)
                 self.llm_errors += 1
-                reply = "Sorry, I can't reach the assistant right now."
+        assessment = self.engagement.add(merge_assessment(rule, llm), reply_time_s)
+        action = assessment["action"]
+        if llm and llm.get("action", action) == action:
+            reply = llm["message"]
+        elif action == "break":
+            reply = BREAK_MSG
+        elif action == "stop":
+            reply = STOP_MSG
+        elif llm:
+            reply = llm["message"]
+        elif action == "follow_up":
+            reply = FOLLOW_UP_MSG
+        elif self.client:
+            reply = "Sorry, I can't reach the assistant right now."
+        else:
+            reply = "I'm in offline mode (no LLM key). " + (local_message(state) or {"message": "All looks fine — drive safe."})["message"]
         reply = reply.strip()[:400]
         self._convo.append(("co-pilot", reply))
+        severity = {"break": "warning", "stop": "alert"}.get(action, "info")
         # expects_answer: the browser reopens the mic, so the driver can just keep talking
-        out = {"message": reply, "severity": "info", "reason": "chat", "source": self.provider,
-               "expects_answer": True}
+        out = {"message": reply, "severity": severity, "reason": {"break": "tired replies", "stop": "unfit replies"}.get(action, "chat"),
+               "source": self.provider if llm else "rules", "expects_answer": action in ("continue", "follow_up"),
+               "assessment": {**assessment, "reply_time_s": reply_time_s, "voice": voice or {}}}
         self._emit(out)
         return out
 
@@ -434,7 +559,7 @@ class Coach:
         if self.client and job.get("answer"):   # nothing to judge without an answer: camera decides
             try:
                 txt = self.client.complete(JUDGE_PROMPT.format(language=self.language, hazard=job["hazard"]),
-                                           "Check-in round:\n" + json.dumps(job), json_mode=True)
+                                           "Check-in round:\n" + json.dumps(evidence(job)), json_mode=True)
                 llm = parse_judge(txt)
             except Exception as e:
                 self.llm_errors += 1
@@ -468,6 +593,8 @@ class Coach:
                     if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                         self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_S
                         continue            # rate-limited: stay quiet, instant alerts still work
+            if self.awaiting_reply(self._t) or (self.checkin and self.checkin.active):
+                continue                    # a question was asked meanwhile: this comment would talk over it
             if out is None:
                 out = loc or {"message": "All good. Keep your eyes on the road.", "severity": "info", "reason": "ok"}
                 out = {**out, "source": "rules"}
@@ -478,6 +605,8 @@ class Coach:
     def _emit(self, msg: dict) -> None:
         if not (msg.get("severity") == "alert" and msg.get("source") == "instant"):
             self._last_said = self._t   # a danger alert doesn't make the next warning wait
+        if msg.get("expects_answer"):
+            self._await_until = self._t + self.await_reply_s   # quiet until the driver replies
         msg = {**msg, "t": time.time()}
         self.history.append(msg)
         try:

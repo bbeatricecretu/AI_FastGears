@@ -6,6 +6,13 @@
       "runtimeExecutable": ".venv\\Scripts\\python.exe",
       "runtimeArgs": ["-m", "fastgears"],
       "port": 8000
+    },
+    {
+      "name": "fastgears-test",
+      "runtimeExecutable": ".venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "fastgears"],
+      "env": { "PORT": "8001", "CAMERA": "no-camera.mp4", "ENABLE_OBJECTS": "0", "ENABLE_RPPG": "0", "PHONE_VISION_CHECK": "0", "LLM_SUMMARY_EVERY_S": "100000" },
+      "port": 8001
     }
   ]
 }

@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -84,7 +84,9 @@ async def _state_pump():
         if pipeline and hub.clients:
             st = pipeline.state()
             st["llm"] = {"provider": coach.provider, "errors": coach.llm_errors,
-                         "latency_ms": coach.last_latency_ms} if coach else None
+                         "latency_ms": coach.last_latency_ms, "stt": coach.can_transcribe} if coach else None
+            st["engagement"] = coach.engagement.status() if coach else {"replies": 0}
+            st["awaiting_reply"] = coach.awaiting_reply(coach._t) if coach else False
             st["check"] = coach.checkin_status() if coach else {"active": False}
             st["voice"] = voice_on
             await hub.broadcast({"type": "state", **st})
@@ -168,12 +170,47 @@ async def set_voice(body: VoiceIn):
 
 class ChatIn(BaseModel):
     text: str
+    voice: dict | None = None            # how the reply sounded (from /api/transcribe)
+    reply_time_s: float | None = None    # question end -> first word, measured in the browser
 
 
 @app.post("/api/chat")
 async def chat(body: ChatIn):
     st = pipeline.state() if pipeline else {}
-    return await asyncio.to_thread(coach.chat, body.text, st)
+    return await asyncio.to_thread(coach.chat, body.text, st, body.voice, body.reply_time_s)
+
+
+class AnsweringIn(BaseModel):
+    active: bool
+
+
+@app.post("/api/answering")
+def answering(body: AnsweringIn):
+    """Browser: the driver started speaking a reply (True) or gave up (False). While a reply is
+    on its way the co-pilot keeps measuring but stays silent, and the question doesn't time out."""
+    coach.set_answering(body.active)
+    return {"ok": True}
+
+
+MAX_AUDIO_BYTES = 2_000_000   # ~60 s of 16 kHz mono WAV
+
+
+@app.post("/api/transcribe")
+async def transcribe(request: Request):
+    """The driver's spoken reply (raw audio body, e.g. audio/wav) -> transcript + voice cues, via Gemini."""
+    if not coach or not coach.can_transcribe:
+        return JSONResponse({"error": "speech-to-text needs LLM_PROVIDER=gemini and GEMINI_API_KEY"}, status_code=503)
+    audio = await request.body()
+    if not audio or len(audio) > MAX_AUDIO_BYTES:
+        return JSONResponse({"error": "empty or too long recording"}, status_code=400)
+    mime = request.headers.get("content-type", "audio/wav").split(";")[0]
+    try:
+        return await asyncio.to_thread(coach.transcribe, audio, mime)
+    except Exception as e:
+        log.warning("transcribe failed: %s", str(e)[:200])
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            return JSONResponse({"error": "Gemini quota used up", "quota": True}, status_code=429)
+        return JSONResponse({"error": "transcription failed"}, status_code=502)
 
 
 @app.get("/video.mjpg")

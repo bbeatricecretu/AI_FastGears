@@ -299,3 +299,58 @@ def test_questions_can_be_switched_off():
     c.set_tuning(questions=False)
     c.observe(st(microsleep=True, level="danger"), now=100.0)
     assert [m["source"] for m in got] == ["instant"] and not c.checkin.active
+
+
+# ── waiting for the driver's reply: no message jam ──────────────────────────────
+
+def test_open_question_silences_everything_but_microsleep():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
+    c.observe(st(), now=0.0)
+    c.observe(st(), now=601.0)                                         # opener: a question
+    assert got[-1]["expects_answer"] and c.awaiting_reply(601.0)
+    n = len(got)
+    c.observe(st(phone=True, level="caution"), now=603.0)              # warning: waits
+    c.observe(st(distracted=True, looking="left", level="danger"), now=605.0)   # other danger: waits too
+    assert len(got) == n
+    c.observe(st(microsleep=True, level="danger"), now=606.0)          # can't answer asleep: interrupts
+    assert got[-1]["reason"] == "microsleep"
+
+
+def test_reply_closes_the_question_and_talk_resumes():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
+    c.observe(st(), now=0.0)
+    c.observe(st(), now=601.0)
+    c.observe(st(), now=602.0)
+    c.chat("all fine, heading home", st())                             # answer -> co-pilot reply (asks again)
+    assert got[-1]["reason"] == "chat"
+    c.observe(st(), now=630.0)                                         # unanswered follow-up expired
+    assert not c.awaiting_reply(630.0)
+    c.observe(st(phone=True, level="caution"), now=631.0)
+    assert got[-1]["reason"] == "phone in use"
+
+
+def test_driver_talking_keeps_the_floor_and_the_checkin_open():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9,
+              checkin=CheckIn(answer_timeout_s=12, cooldown_s=30))
+    c.observe(st(distracted=True, looking="left", level="danger"), now=100.0)
+    assert got[-1]["reason"] == "check-in"
+    c.observe(road(), now=105.0)
+    c.set_answering(True)                                              # browser: driver is speaking
+    for t in range(106, 125):                                          # past the 12 s answer window
+        c.observe(road(), now=float(t))
+    assert c.checkin.waiting and got[-1]["reason"] == "check-in"       # no timeout, nothing said
+    assert c.chat("a white van", road())["source"] == "check"          # the late answer still counts
+
+
+def test_llm_comment_arriving_during_a_question_is_dropped():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+    c._t = 10.0
+    c._emit({"message": "Where are you heading?", "severity": "info", "reason": "conversation",
+             "source": "instant", "expects_answer": True})
+    c._submit(("react", {}, {"message": "Phone away.", "severity": "warning", "reason": "phone in use"}))
+    time.sleep(0.2)
+    assert [m["message"] for m in got] == ["Where are you heading?"]

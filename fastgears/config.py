@@ -56,17 +56,20 @@ class Settings:
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # quotas are per model: when the main model's (free) quota runs out, these take over in order
+    gemini_fallback_models: tuple = tuple(m.strip() for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite-preview,gemini-3.5-flash-lite,gemini-3.5-flash").split(",") if m.strip())
     anthropic_api_key: str | None = os.getenv("ANTHROPIC_API_KEY")
     anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
     phone_vision_check: bool = _bool("PHONE_VISION_CHECK", True)
-    gemini_vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
+    gemini_vision_model: str = os.getenv("GEMINI_VISION_MODEL", "gemini-3.1-flash-lite")
     llm_min_interval_s: float = float(os.getenv("LLM_MIN_INTERVAL_S", "8"))
     llm_summary_every_s: float = float(os.getenv("LLM_SUMMARY_EVERY_S", "45"))
     language: str = os.getenv("ASSISTANT_LANGUAGE", "English")
     # closed-loop check-in after a danger alert: question -> answer + camera reaction -> verdict
     checkin: bool = _bool("CHECKIN", True)
-    checkin_answer_s: float = float(os.getenv("CHECKIN_ANSWER_S", "12"))
+    checkin_answer_s: float = float(os.getenv("CHECKIN_ANSWER_S", "20"))
     checkin_max_rounds: int = int(os.getenv("CHECKIN_MAX_ROUNDS", "3"))
     checkin_cooldown_s: float = float(os.getenv("CHECKIN_COOLDOWN_S", "30"))
     convo_idle_s: float = float(os.getenv("CONVO_IDLE_S", "600"))   # co-pilot starts a chat after this long (0 = off)
