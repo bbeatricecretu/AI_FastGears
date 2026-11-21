@@ -41,10 +41,19 @@ you comment on slower trends such as yawns or tiredness.
 A discomfort_grimace event describes facial movement only. Keep any check-in neutral.
 Reply ONLY with JSON: {{"message": "...", "severity": "info|warning|alert", "reason": "<3-6 words>"}}"""
 
-CHAT_PROMPT = """You are FastGears, an in-car co-pilot talking with the driver or a passenger, in {language}.
-You see the live driver-monitoring state below. Answer in at most 2 short sentences, safety first.
-If the driver seems drowsy or distracted, gently say so. Treat discomfort_grimace as a description of
-facial movement only. Never diagnose medical conditions. Plain text, no markdown."""
+CHAT_PROMPT = """You are FastGears, an in-car co-pilot having a spoken conversation with the driver, in {language}.
+Everything you say is read aloud while they drive: at most 25 words, natural and warm, plain text.
+You see the live driver-monitoring state and the conversation so far. Keep the thread of the conversation.
+Talking keeps a tired driver alert: if the state shows tiredness, end with one short, easy question
+(about the trip, music, plans), never one that needs looking at a screen.
+Safety first: if the state shows danger, tell them to focus on the road before anything else.
+Treat discomfort_grimace as facial movement only. Never diagnose medical conditions."""
+
+CONVO_TURNS = 8          # conversation lines the LLM sees (driver + co-pilot)
+FATIGUE_OPENER = "You look a bit tired. Talk to me for a moment: where are you heading?"
+OPENERS = ("How is the drive going so far?",
+           "How are you feeling? Need a break soon?",
+           "Long stretch of road. What are you listening to?")
 
 
 class LLMClient(Protocol):
@@ -192,12 +201,16 @@ class Coach:
 
     def __init__(self, client: LLMClient | None, on_message: Callable[[dict], None],
                  min_interval_s: float = 8.0, summary_every_s: float = 45.0, language: str = "English",
-                 checkin: CheckIn | None = None):
+                 checkin: CheckIn | None = None, convo_idle_s: float = 0.0):
         self.client, self.on_message = client, on_message
         self.min_interval_s, self.summary_every_s = min_interval_s, summary_every_s
         self.language = language
         self.checkin = checkin          # closed-loop alertness check after danger alerts (optional)
         self._t = 0.0                   # time of the last observe(): the clock for answers/verdicts
+        self.convo_idle_s = convo_idle_s  # co-pilot opens a conversation after this long without one (0 = never)
+        self._convo: deque = deque(maxlen=CONVO_TURNS)   # (who, text) lines the LLM sees
+        self._last_talk: float | None = None
+        self._opener_i = 0
         self.history: deque = deque(maxlen=50)
         self._jobs: queue.Queue = queue.Queue(maxsize=1)
         self._last_llm = 0.0
@@ -237,12 +250,17 @@ class Coach:
         for k in [k for k in self._last_local if now - self._last_seen.get(k.split("|")[0], -1e9) > EPISODE_GAP_S]:
             del self._last_local[k]
         alerted = False
-        if loc:
+        # during a check-in the question owns the voice: only an alert about a NEW hazard interrupts
+        busy = self.checkin is not None and self.checkin.active
+        if loc and not (busy and (loc["severity"] != "alert" or key == self.checkin.hazard)):
             ek = f"{key}|{loc['severity']}"
             repeat = ALERT_REPEAT_S if loc["severity"] == "alert" else float("inf")
             if ek not in self._last_local or now - self._last_local[ek] > repeat:
                 self._last_local[ek] = now
-                self._emit({**loc, "source": "instant"})
+                if key == "signs of fatigue":    # tiredness: talking helps more than a warning
+                    self._open_conversation(FATIGUE_OPENER, now, loc["severity"], key)
+                else:
+                    self._emit({**loc, "source": "instant"})
                 alerted = loc["severity"] == "alert"
 
         # 2) closed loop: after a danger alert ask the driver a question, then judge the reaction
@@ -261,7 +279,14 @@ class Coach:
                     self._prev_seen[key] = now
                 return
 
-        # 3) LLM on change, or periodic summary
+        # 3) a quiet, calm drive: the co-pilot starts a short conversation now and then
+        if self._last_talk is None:
+            self._last_talk = now
+        if self.convo_idle_s and level == "ok" and now - self._last_talk >= self.convo_idle_s:
+            self._open_conversation(OPENERS[self._opener_i % len(OPENERS)], now)
+            self._opener_i += 1
+
+        # 4) LLM on change, or periodic summary
         # ask the LLM on a NEW episode (reason not seen in the last EPISODE_GAP_S) or an escalation,
         # not on every flicker of the same situation
         rank = {"ok": 0, "caution": 1, "danger": 2}
@@ -290,6 +315,13 @@ class Coach:
         except queue.Full:          # one in flight is enough; drop stale requests
             pass
 
+    def _open_conversation(self, text: str, now: float, severity: str = "info",
+                           reason: str = "conversation") -> None:
+        self._last_talk = now
+        self._convo.append(("co-pilot", text))
+        self._emit({"message": text, "severity": severity, "reason": reason, "source": "instant",
+                    "expects_answer": True})
+
     def chat(self, text: str, state: dict) -> dict:
         """Synchronous Q&A for the dashboard's 'talk to the co-pilot' box. While a check-in waits
         for an answer, whatever the driver says is that answer."""
@@ -300,17 +332,25 @@ class Coach:
             if job:
                 self._judge_async(job)
                 return {"message": "", "severity": "info", "reason": "check-in answer", "source": "check"}
+        self._last_talk = self._t
+        talk = "\n".join(f"{who}: {line}" for who, line in self._convo) or "(none)"
+        self._convo.append(("driver", text[:500]))
         if not self.client:
             reply = "I'm in offline mode (no LLM key). " + (local_message(state) or {"message": "All looks fine — drive safe."})["message"]
         else:
             try:
                 reply = self.client.complete(CHAT_PROMPT.format(language=self.language),
-                                             f"Live state: {json.dumps(compact_state(state))}\n\nDriver/passenger says: {text}")
+                                             f"Live state: {json.dumps(compact_state(state))}\n\n"
+                                             f"Conversation so far:\n{talk}\n\nDriver says: {text}")
             except Exception as e:
                 log.warning("chat failed: %s", e)
                 self.llm_errors += 1
                 reply = "Sorry, I can't reach the assistant right now."
-        out = {"message": reply.strip()[:400], "severity": "info", "reason": "chat", "source": self.provider}
+        reply = reply.strip()[:400]
+        self._convo.append(("co-pilot", reply))
+        # expects_answer: the browser reopens the mic, so the driver can just keep talking
+        out = {"message": reply, "severity": "info", "reason": "chat", "source": self.provider,
+               "expects_answer": True}
         self._emit(out)
         return out
 
@@ -319,7 +359,7 @@ class Coach:
         """Verdict for one check-in round: camera rules, made stricter by the LLM when present."""
         rule = rule_verdict(job)
         llm = None
-        if self.client:
+        if self.client and job.get("answer"):   # nothing to judge without an answer: camera decides
             try:
                 txt = self.client.complete(JUDGE_PROMPT.format(language=self.language, hazard=job["hazard"]),
                                            "Check-in round:\n" + json.dumps(job), json_mode=True)

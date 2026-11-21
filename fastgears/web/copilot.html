@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastGears · Live co-pilot</title>
+<style>
+  /* registered so the level colour can ease instead of jumping */
+  @property --c1 { syntax: "<color>"; inherits: true; initial-value: #2f6bff; }
+  @property --c2 { syntax: "<color>"; inherits: true; initial-value: #7cc8ff; }
+  @property --c3 { syntax: "<color>"; inherits: true; initial-value: #6a4dff; }
+  :root {
+    --c1: #2f6bff; --c2: #7cc8ff; --c3: #6a4dff; --spin: 14s;      /* level ok: blue */
+    --text: #f4f6fb; --muted: #a3abba; --line: rgba(255,255,255,.12);
+    --warn: #ffb547; --bad: #ff4d5e; --good: #5ee0a0;
+    font: 100%/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  body { transition: --c1 .9s ease, --c2 .9s ease, --c3 .9s ease; }
+  body.caution { --c1: #ff9a1f; --c2: #ffd27a; --c3: #ff6a3d; --spin: 9s; }
+  body.danger  { --c1: #ff2d4a; --c2: #ff8a7a; --c3: #b0124a; --spin: 5s; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #000; color: var(--text); overflow: hidden; display: grid; grid-template-rows: auto 1fr; }
+  body::before {   /* light rising from the bottom, coloured by the level */
+    content: ""; position: fixed; inset: auto -20% -40% -20%; height: 70%; z-index: -1;
+    background: radial-gradient(ellipse at 50% 100%, var(--c1) 0%, color-mix(in srgb, var(--c1) 30%, transparent) 35%, transparent 70%);
+    opacity: .75;
+  }
+
+  header { display: flex; justify-content: space-between; align-items: center; padding: .75rem 1.4rem; }
+  .brand { font-weight: 500; letter-spacing: .01em; }
+  .brand { font-size: 1.05rem; color: var(--text); display: flex; align-items: center; gap: 10px; letter-spacing: -.015em; }
+  .brand b { font-weight: 700; } .brand span { font-weight: 400; color: #c7cedb; }
+  /* logo (licensed mark), tinted by the attention level; dims while the connection is down */
+  .logo { width: 28px; height: 28px; flex: none; display: block;
+          background: linear-gradient(135deg, var(--c2), var(--c1));
+          -webkit-mask: url("data:image/png;base64,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") center / contain no-repeat;
+                  mask: url("data:image/png;base64,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") center / contain no-repeat;
+          filter: drop-shadow(0 0 8px color-mix(in srgb, var(--c1) 55%, transparent)); transition: opacity .3s; }
+  body.offline .logo { opacity: .4; background: #8a909c; }
+  .chips { display: flex; gap: 8px; align-items: center; }
+  .chip { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; }
+  .ghost { background: rgba(255,255,255,.06); color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
+           padding: 6px 13px; font: inherit; font-size: 13px; cursor: pointer; }
+  .ghost.on { color: var(--text); border-color: color-mix(in srgb, var(--c2) 60%, transparent); }
+  .ghost, .pill button { transition: transform 100ms ease-out, border-color .2s, color .2s; touch-action: manipulation; }
+  .ghost:active, .pill button:active { transform: scale(.97); }   /* feedback on press, not release */
+  .badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 6px;
+           border-radius: 999px; background: var(--c1); color: #fff; font-size: 11px; font-weight: 600; }
+  .badge[hidden] { display: none; }
+  :focus-visible { outline: 2px solid var(--c2); outline-offset: 2px; }
+
+  /* two columns, one screen: camera + the three detection cards on the left, the voice chat on the right */
+  main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr);
+         gap: 20px; padding: 0 22px 18px; min-height: 0; overflow: hidden; }
+  .left { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 14px; min-height: 0; }
+  .params { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .params .card { padding: 10px 12px; }
+  .params .card h2 { margin-bottom: 6px; }
+  .params .card h2 b { font-size: 17px; }
+  .params .grid { gap: 6px; }
+  .params .m { padding: 5px 8px; border-radius: 10px; }
+  .params .m span { font-size: .9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .params .bar { margin-bottom: 8px; }
+  .params .m small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .col { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+
+  /* frosted glass card */
+  /* structural regions: heavier, darker material (Apple: weight encodes hierarchy); the chat stays lighter */
+  .card { background: linear-gradient(180deg, rgba(22,25,34,.72), rgba(12,14,20,.62));
+          border: 1px solid rgba(255,255,255,.08); border-top-color: rgba(255,255,255,.16); border-radius: 1.25rem; padding: .9rem 1rem;
+          backdrop-filter: blur(24px) saturate(150%); -webkit-backdrop-filter: blur(24px) saturate(150%);
+          box-shadow: 0 10px 34px rgba(0,0,0,.35); }
+  .card h2 { margin: 0 0 10px; font-size: 12px; font-weight: 500; color: var(--muted); letter-spacing: .08em; text-transform: uppercase;
+             display: flex; justify-content: space-between; align-items: center; }
+  .card h2 b { font-size: 1.25rem; letter-spacing: -.02em; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* left: camera + timeline */
+  .cam { padding: 0; overflow: hidden; position: relative; background: #05070d; min-height: 0; height: 100%; box-shadow: 0 18px 60px rgba(0,0,0,.55); }
+  .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .cam .tag { position: absolute; left: .75rem; top: .75rem; font-size: .7rem; font-weight: 600; letter-spacing: .06em; padding: .3rem .65rem; border-radius: 999px;
+              background: rgba(10,12,18,.5); border: 1px solid rgba(255,255,255,.18); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  .cam .tag::before { content: "● "; color: var(--bad); }
+
+  /* centre: orb + live suggestion */
+  .center { align-items: center; text-align: center; gap: 10px; padding-top: 26px; min-height: 0; }
+  .orb { position: relative; width: min(17vh, 150px); aspect-ratio: 1; border-radius: 50%; overflow: hidden; flex: none;
+    background: radial-gradient(circle at 50% 58%, #000 0 42%, color-mix(in srgb, var(--c3) 25%, #02040c) 72%, color-mix(in srgb, var(--c1) 55%, #000) 100%);
+    box-shadow: 0 0 50px 6px color-mix(in srgb, var(--c1) 50%, transparent), 0 0 140px 30px color-mix(in srgb, var(--c1) 20%, transparent),
+                inset 0 0 36px color-mix(in srgb, var(--c2) 45%, transparent); transition: box-shadow .8s; }
+  .orb i { position: absolute; inset: -6%; border-radius: 50%; mix-blend-mode: screen; filter: blur(4px);
+    background: conic-gradient(from 0deg, transparent 0 30%, color-mix(in srgb, var(--c1) 70%, transparent) 45%, var(--c2) 62%, #fff 66%, var(--c1) 74%, transparent 90%);
+    -webkit-mask: radial-gradient(circle, transparent 30%, #000 46%, #000 68%, transparent 80%);
+            mask: radial-gradient(circle, transparent 30%, #000 46%, #000 68%, transparent 80%);
+    animation: spin var(--spin) linear infinite; }
+  .orb i:nth-child(2) { transform: rotate(110deg) scaleY(.6); animation-duration: calc(var(--spin) * 1.7); animation-direction: reverse;
+    background: conic-gradient(from 90deg, transparent 0 35%, var(--c3) 55%, var(--c2) 70%, transparent 88%); }
+  .orb i:nth-child(3) { inset: 4%; filter: blur(1px); transform: rotate(-35deg) scaleX(.5); animation-duration: calc(var(--spin) * .75);
+    background: conic-gradient(from 200deg, transparent 0 55%, var(--c2) 68%, #fff 74%, var(--c1) 80%, transparent 92%); }
+  .orb i:nth-child(4) { inset: 12%; filter: blur(8px); opacity: .7; transform: rotate(60deg) scaleY(.4); animation-duration: calc(var(--spin) * 2.3);
+    background: conic-gradient(from 300deg, transparent 0 40%, var(--c1) 60%, var(--c3) 75%, transparent 90%); }
+  .orb::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid color-mix(in srgb, var(--c2) 55%, transparent);
+    background: radial-gradient(circle at 30% 24%, rgba(255,255,255,.28), transparent 26%); }
+  .orb.speaking  { animation: breathe .8s ease-in-out infinite; }
+  .orb.listening { animation: breathe 2.2s ease-in-out infinite; box-shadow: 0 0 70px 14px color-mix(in srgb, var(--c2) 55%, transparent), inset 0 0 40px var(--c2); }
+  .orb.thinking i { animation-duration: calc(var(--spin) / 4); }
+  @keyframes spin { to { rotate: 360deg; } }
+  @keyframes breathe { 50% { scale: 1.06; } }
+
+  .level { font-size: 13px; letter-spacing: .14em; font-weight: 600; padding: 6px 16px; border-radius: 999px;
+           border: 1px solid color-mix(in srgb, var(--c2) 50%, transparent); color: var(--c2); }
+  #status { font-size: 1rem; font-weight: 500; letter-spacing: -.005em; color: #c7cedb; min-height: 1.3em; }
+
+  /* conversation under the orb, Siri-style: co-pilot on the left in the same frosted material as the
+     input bar, the driver on the right in the accent colour. Newest at the bottom, next to the bar. */
+  .thread { list-style: none; margin: 0; padding: 14px 2px 4px; width: 100%; max-width: 600px; flex: 1; min-height: 0;
+            overflow-y: auto; display: flex; flex-direction: column; gap: 10px; scrollbar-width: none;
+            -webkit-mask: linear-gradient(transparent, #000 36px, #000 calc(100% - 10px), transparent);
+                    mask: linear-gradient(transparent, #000 36px, #000 calc(100% - 10px), transparent); }
+  .thread::-webkit-scrollbar { display: none; }
+  .thread > :first-child { margin-top: auto; }          /* few bubbles: sit at the bottom, still scrollable */
+  .bubble { max-width: 86%; padding: .7rem 1.05rem; border-radius: 22px; text-align: left;
+            font-size: 1rem; line-height: 1.4; letter-spacing: -.005em; font-weight: 500;
+            animation: materialize .38s cubic-bezier(.2, .9, .25, 1) both; }
+  .bubble.instant { animation: none; }
+  .bubble small { display: block; margin-bottom: 2px; font-size: .7rem; font-weight: 400; letter-spacing: .01em; color: var(--muted); }
+  .bubble.ai { align-self: flex-start; transform-origin: bottom left; border-bottom-left-radius: 8px;
+               border: 1px solid rgba(255,255,255,.22); border-top-color: rgba(255,255,255,.34);
+               background: linear-gradient(180deg, rgba(255,255,255,.17), rgba(255,255,255,.06));
+               backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); opacity: .62; transition: opacity .4s ease; }
+  .bubble.ai.latest { opacity: 1; font-size: 1.28rem; line-height: 1.3; letter-spacing: -.015em; }   /* what matters now reads first */
+  .bubble.ai.warning { border-color: color-mix(in srgb, var(--warn) 70%, transparent); box-shadow: 0 0 26px color-mix(in srgb, var(--warn) 22%, transparent); }
+  .bubble.ai.alert   { border-color: color-mix(in srgb, var(--bad) 75%, transparent);  box-shadow: 0 0 30px color-mix(in srgb, var(--bad) 30%, transparent); }
+  .bubble.me { align-self: flex-end; transform-origin: bottom right; border-bottom-right-radius: 8px; color: #fff;
+               background: linear-gradient(180deg, color-mix(in srgb, #2f6bff 82%, #fff), #2f6bff); }
+  .bubble.me.live { opacity: .72; }                     /* still being heard: words update as you speak */
+  .bubble.me.live::after { content: "…"; }
+  /* waiting for a reply: a frosted glass pill — "••• Searching…" */
+  .bubble.ai.typing { display: inline-flex; align-items: center; gap: 14px; padding: .85rem 1.9rem; opacity: 1;
+                      border-radius: 999px; font-size: 1.15rem; font-weight: 500; letter-spacing: -.01em; color: #fff;
+                      border: 1px solid rgba(255,255,255,.38); border-top-color: rgba(255,255,255,.5);
+                      background: linear-gradient(180deg, rgba(255,255,255,.08) 0%, rgba(255,255,255,.14) 55%, rgba(255,255,255,.26) 100%);
+                      box-shadow: inset 0 1px 0 rgba(255,255,255,.35), inset 0 -10px 22px rgba(255,255,255,.10), 0 8px 28px rgba(0,0,0,.25); }
+  .typing .dots { display: flex; gap: 5px; align-items: center; }
+  .typing .dots span { width: 7px; height: 7px; border-radius: 50%; background: #fff; opacity: .45; animation: dot 1.2s ease-in-out infinite; }
+  .typing .dots span:nth-child(2) { animation-delay: .15s; } .typing .dots span:nth-child(3) { animation-delay: .3s; }
+  .typing .label { color: rgba(255,255,255,.92); }
+  @keyframes materialize { from { opacity: 0; transform: translateY(10px) scale(.96); filter: blur(6px); } }
+  @keyframes dot { 40% { opacity: 1; transform: translateY(-2px); } }
+  #reasons { font-size: .8rem; font-weight: 500; letter-spacing: .01em; color: #b4bccb; min-height: 1.2em; }
+
+  .pill { width: 100%; max-width: 560px; height: 60px; display: flex; align-items: center; gap: 10px; padding: 0 10px 0 24px; margin-top: 6px;
+          border-radius: 999px; border: 1px solid rgba(255,255,255,.28);
+          background: linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,.08));
+          backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); box-shadow: inset 0 1px 0 rgba(255,255,255,.35); }
+  .pill input { flex: 1; min-width: 0; background: none; border: 0; color: var(--text); font: inherit; font-size: 17px; }
+  .pill input::placeholder { color: rgba(255,255,255,.72); }
+  .pill input:focus { outline: none; }
+  .pill button { width: 44px; height: 44px; border-radius: 50%; border: 0; background: none; cursor: pointer; display: grid; place-items: center; }
+  /* mic button: microphone icon; while listening it fills with the accent colour and a ring pulses out */
+  #mic { position: relative; color: #fff; }
+  #mic svg { width: 22px; height: 22px; display: block; }
+  #mic:hover { background: rgba(255,255,255,.08); }
+  #mic.listening { background: var(--c1); box-shadow: 0 0 18px color-mix(in srgb, var(--c1) 60%, transparent); }
+  #mic.listening::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--c2);
+                          animation: ring 1.2s ease-out infinite; }
+  #mic:disabled { opacity: .35; cursor: not-allowed; }
+  @keyframes ring { from { opacity: .9; transform: scale(.85); } to { opacity: 0; transform: scale(1.35); } }
+
+  /* right: detection categories */
+  .bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); overflow: hidden; margin-bottom: 12px; }
+  .bar span { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--good); transition: width .4s, background .4s; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .m { background: rgba(255,255,255,.04); border: 1px solid transparent; border-radius: .7rem; padding: .5rem .65rem; transition: border-color .3s, background .3s; }
+  .m small { display: block; font-size: .68rem; font-weight: 500; color: #b4bccb; letter-spacing: .02em; }
+  .m span { font-size: 1rem; font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .m.warn { border-color: color-mix(in srgb, var(--warn) 60%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+  .m.bad  { border-color: color-mix(in srgb, var(--bad) 70%, transparent);  background: color-mix(in srgb, var(--bad) 14%, transparent); }
+
+  /* header chips never push the page wider: they scroll sideways on narrow screens */
+  header { gap: 12px; min-width: 0; }
+  .brand { white-space: nowrap; flex: none; }
+  .chips { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip, .ghost { white-space: nowrap; flex: none; }
+
+  /* tablets and small windows: one scrolling column — camera, then the co-pilot chat, then the detections */
+  @media (max-width: 1099px), (max-height: 520px) {
+    html, body { height: auto; }
+    body { overflow-x: hidden; overflow-y: auto; display: block; min-height: 100dvh; }
+    main { display: flex; flex-direction: column; gap: 16px; overflow: visible; padding: 0 16px 20px; }
+    .left { display: contents; }
+    .cam { order: 1; height: auto; aspect-ratio: 16 / 9; }
+    .center { order: 2; min-height: auto; }
+    .params { order: 3; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+    .orb { width: min(22vw, 120px); }
+    .thread { flex: none; min-height: 140px; max-height: 42vh; max-width: none; }
+    .pill { max-width: none; position: sticky; bottom: 12px; z-index: 2; }   /* the input stays in reach while scrolling */
+  }
+  /* phones */
+  @media (max-width: 600px) {
+    header { flex-direction: column; align-items: stretch; padding: .6rem .9rem .5rem; gap: 8px; }
+    .chips { padding-bottom: 2px; }
+    main { padding: 0 10px 16px; gap: 12px; }
+    .card { border-radius: 1rem; }
+    .params { grid-template-columns: 1fr; }
+    .params .m span { font-size: .95rem; }
+    .orb { width: 92px; }
+    .center { gap: 8px; }
+    .bubble.ai.latest { font-size: 1.1rem; }
+    .bubble { max-width: 92%; }
+    .pill { height: 54px; padding-left: 18px; }
+    .pill input { font-size: 16px; }   /* 16px stops iOS zooming into the field */
+  }
+  /* landscape phones and other short screens: the camera must not fill the whole screen */
+  @media (max-height: 520px) { .cam { aspect-ratio: auto; height: 68vh; } }
+  /* big desktop screens: keep the two columns from stretching too far */
+  @media (min-width: 1800px) { main { max-width: 1760px; width: 100%; margin: 0 auto; } }
+  @media (prefers-reduced-motion: reduce) {
+    .orb i, .orb, #mic.listening::after { animation: none !important; }
+    .bubble { animation: fade .2s ease both; } .typing .dots span { animation: none; opacity: .9; }
+    @keyframes fade { from { opacity: 0; } }
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .card, .pill, .bubble.ai { background: #14161d; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  }
+  @media (prefers-contrast: more) {
+    :root { --muted: #c9cfda; --line: rgba(255,255,255,.45); }
+    .card, .pill { background: #0d0f14; }
+  }
+</style>
+</head>
+<body class="offline">
+<header>
+  <div class="brand"><span class="logo" role="img" aria-label="FastGears logo"></span><div><b>Fast</b><span>Gears</span></div></div>
+  <div class="chips">
+    <span class="chip" id="fps">–</span>
+    <button class="ghost on" id="voice" aria-pressed="true">Voice on</button>
+    <button class="ghost" id="recal" title="Look at the road for a few seconds">Recalibrate</button>
+  </div>
+</header>
+
+<main>
+  <section class="left" aria-label="Camera and detections">
+    <div class="card cam"><img src="/video.mjpg" alt="Live driver camera"><span class="tag">LIVE</span></div>
+    <div class="params">
+      <div class="card">
+        <h2>Drowsiness <b id="drow">0</b></h2>
+        <div class="bar"><span id="drow-bar"></span></div>
+        <div class="grid">
+          <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
+          <div class="m" id="m-closed"><small>Closed for</small><span>–</span></div>
+          <div class="m" id="m-perclos"><small>PERCLOS</small><span>–</span></div>
+          <div class="m" id="m-blinks"><small>Blinks / min</small><span>–</span></div>
+          <div class="m" id="m-yawns"><small>Yawns · 5 min</small><span>–</span></div>
+          <div class="m" id="m-tired"><small>Microsleep</small><span>–</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Distraction <b id="dist">0</b></h2>
+        <div class="bar"><span id="dist-bar"></span></div>
+        <div class="grid">
+          <div class="m" id="m-looking"><small>Looking</small><span>–</span></div>
+          <div class="m" id="m-offroad"><small>Off road · now / 60 s</small><span>–</span></div>
+          <div class="m" id="m-phone"><small>Phone</small><span>–</span></div>
+          <div class="m" id="m-hands"><small>Hands</small><span>–</span></div>
+          <div class="m" id="m-head"><small>Head yaw / pitch</small><span>–</span></div>
+          <div class="m" id="m-check"><small>Alertness check</small><span>–</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Driver &amp; vitals</h2>
+        <div class="grid">
+          <div class="m" id="m-pulse"><small>Pulse (camera)</small><span>–</span></div>
+          <div class="m" id="m-expr"><small>Expression</small><span>–</span></div>
+          <div class="m" id="m-driver"><small>Driver</small><span>–</span></div>
+          <div class="m" id="m-people"><small>Passengers</small><span>–</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="col center" aria-label="Co-pilot">
+    <div class="orb" id="orb" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <div class="level" id="level">CALIBRATING</div>
+    <div id="reasons"></div>
+    <div id="status">Hello, driver</div>
+    <ol class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation with the co-pilot">
+      <li class="bubble ai latest instant">How can I help you on the road?</li>
+    </ol>
+    <form class="pill" id="chat" autocomplete="off">
+      <input id="q" placeholder="Ask anything…" aria-label="Message the co-pilot">
+      <button type="button" id="mic" aria-label="Speak to the co-pilot" title="Speak to the co-pilot">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="2.5" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3.5"/>
+        </svg>
+      </button>
+    </form>
+  </section>
+
+</main>
+
+
+<script>
+// Live co-pilot dashboard (R4): every detection as it happens + the live text/voice suggestion.
+// The orb shows what the co-pilot is doing (listening / thinking / speaking), its colour the level.
+// Voice logic mirrors index.html: open only one of the two pages with voice on.
+const $ = id => document.getElementById(id);
+const orb = $('orb');
+let voice = true, lastSpoken = 0;
+
+const LEVEL_TEXT = { ok: 'ATTENTIVE', caution: 'CAUTION', danger: 'DANGER' };
+const LABEL = { 'check-in': 'Alertness check', chat: 'Co-pilot', conversation: 'Co-pilot', 'check-in passed': 'Check passed' };
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+function setOrb(mode) { orb.className = 'orb' + (mode ? ' ' + mode : ''); }
+function status(t) { $('status').textContent = t; }
+function tile(id, value, state) {           // state: '' | 'warn' | 'bad'
+  const el = $(id); el.querySelector('span').textContent = value; el.className = 'm' + (state ? ' ' + state : '');
+}
+function bar(id, v) {
+  const el = $(id); el.style.width = Math.min(100, v) + '%';
+  el.style.background = v >= 70 ? 'var(--bad)' : v >= 40 ? 'var(--warn)' : 'var(--good)';
+}
+
+// ── live detections ──
+function onState(s) {
+  const a = s.attention || {}, p = s.pulse || {}, c = s.camera || {}, d = s.driver || {}, h = s.hands || {};
+  const ds = s.driver_signals || {}, ck = s.check || {};
+  const lvl = a.calibrated === false ? null : (a.level || 'ok');
+  document.body.classList.toggle('caution', lvl === 'caution');
+  document.body.classList.toggle('danger', lvl === 'danger');
+  $('level').textContent = lvl ? LEVEL_TEXT[lvl] : (a.face_present === false ? 'LOOKING FOR THE DRIVER' : 'CALIBRATING · LOOK AT THE ROAD');
+  $('reasons').textContent = (a.reasons || []).join(' · ');
+  $('fps').textContent = c.connected ? `${c.fps ?? '–'} cam · ${c.proc_fps ?? '–'} proc fps` : 'no camera';
+
+  const drow = a.drowsiness || 0, dist = a.distraction || 0;
+  $('drow').textContent = Math.round(drow); bar('drow-bar', drow);
+  $('dist').textContent = Math.round(dist); bar('dist-bar', dist);
+
+  const eye = (closed) => closed ? 'closed' : 'open';
+  tile('m-eyes', a.face_present ? `L ${eye(a.eye_left_closed)} · R ${eye(a.eye_right_closed)}` : '–', a.eyes_closed ? 'warn' : '');
+  tile('m-closed', a.eye_closed_s ? `${a.eye_closed_s.toFixed(1)} s` : '0 s', a.microsleep ? 'bad' : a.eye_closed_s >= 0.5 ? 'warn' : '');
+  tile('m-perclos', `${Math.round((a.perclos || 0) * 100)} %`, a.tired ? 'warn' : '');
+  tile('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–', '');
+  tile('m-yawns', `${a.yawns_5min ?? 0}${a.yawning ? ' · yawning' : ''}`, a.yawning || a.yawns_5min >= 2 ? 'warn' : '');
+  tile('m-tired', a.microsleep ? 'YES' : a.tired ? 'tired' : 'no', a.microsleep ? 'bad' : a.tired ? 'warn' : '');
+
+  tile('m-looking', a.looking || '–', a.distracted ? 'bad' : a.looking && a.looking !== 'road' ? 'warn' : '');
+  tile('m-offroad', `${(a.off_road_s || 0).toFixed(1)} s · ${Math.round(a.off_road_total_s || 0)} s`, a.distracted ? 'bad' : a.off_road_s >= 1 ? 'warn' : '');
+  tile('m-phone', a.phone ? `IN USE${h.phone_source ? ' · ' + h.phone_source : ''}` : 'no', a.phone ? 'bad' : '');
+  tile('m-hands', a.hand_off_wheel ? 'off the wheel' : `${h.driver ?? 0} seen · ${h.free ?? 0} free`, a.hand_off_wheel ? 'warn' : '');
+  tile('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–', '');
+  tile('m-check', ck.active ? (ck.phase === 'judging' ? 'checking…' : `Q ${ck.round}/${ck.max_rounds} · ${Math.ceil(ck.seconds_left ?? 0)} s`) : 'idle', ck.active ? 'warn' : '');
+
+  tile('m-pulse', p.bpm ? `${Math.round(p.bpm)} bpm${p.pulse_state === 'held' ? ' · held' : ''}` : (p.pulse_state || '–'), '');
+  tile('m-expr', ds.expression || '–', '');
+  tile('m-driver', d.status || '–', d.locked ? '' : 'warn');
+  tile('m-people', d.passengers ?? 0, '');
+}
+
+// ── live suggestion: text + voice ──
+function addToFeed() {}                 // the messages panel was removed; the conversation lives in the thread
+
+// ── conversation thread ──
+let liveBubble = null, typingBubble = null, typingTimer = null;
+function scrollThread() { const t = $('thread'); t.scrollTop = t.scrollHeight; }
+function trimThread() { while ($('thread').children.length > 14) $('thread').firstElementChild.remove(); }
+function clearTyping() { clearTimeout(typingTimer); typingBubble?.remove(); typingBubble = null; }
+function showTyping() {                 // the co-pilot is working on a reply
+  clearTyping();
+  typingBubble = document.createElement('li');
+  typingBubble.className = 'bubble ai latest typing';
+  typingBubble.setAttribute('aria-label', 'Co-pilot is thinking');
+  typingBubble.innerHTML = '<span class="dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="label">Searching…</span>';
+  $('thread').append(typingBubble); scrollThread();
+  typingTimer = setTimeout(clearTyping, 12000);   // a check-in answer gets no direct reply
+}
+function addBubble(m, instant = false) {
+  const mine = m.source === 'user';
+  if (!mine) clearTyping();
+  let li = mine && liveBubble ? liveBubble : null;    // the live transcript becomes the final bubble
+  liveBubble = null;
+  if (!li) { li = document.createElement('li'); $('thread').append(li); }
+  li.className = `bubble ${mine ? 'me' : 'ai ' + (m.severity || 'info')}${instant ? ' instant' : ''}`;
+  li.textContent = '';
+  if (!mine) {
+    $('thread').querySelectorAll('.bubble.ai.latest').forEach(b => b.classList.remove('latest'));
+    li.classList.add('latest');
+    const label = LABEL[m.reason] || cap(m.reason || '');
+    if (label && m.severity !== 'info') { const s = document.createElement('small'); s.textContent = label; li.append(s); }
+  }
+  li.append(document.createTextNode(m.message));
+  trimThread(); scrollThread();
+}
+function liveTranscript(text) {         // the driver's words as they are recognised
+  if (!liveBubble) { liveBubble = document.createElement('li'); $('thread').append(liveBubble); }
+  liveBubble.className = 'bubble me live';
+  liveBubble.textContent = text;
+  scrollThread();
+}
+function dropLiveTranscript() { liveBubble?.remove(); liveBubble = null; }
+
+function show(m, instant) {
+  addBubble(m, instant);
+  const r = m.reason || '';
+  status(m.expects_answer ? (voice ? 'Listening for your answer…' : 'Type your answer below') : (LABEL[r] || cap(r) || 'Co-pilot'));
+}
+
+function speak(m) {
+  if (!voice) { setOrb(''); return; }             // voice off: text only — the message is in the chat, nothing is spoken or heard
+  if (!('speechSynthesis' in window)) { setOrb(''); if (m.expects_answer) listenForAnswer(); return; }
+  const now = Date.now();
+  if (m.severity === 'info' && !m.expects_answer && now - lastSpoken < 4000) return;
+  if (listening && mode === 'answer' && m.severity !== 'alert') return;   // the driver is talking: don't talk over them (alerts still do)
+  if (m.severity === 'alert') speechSynthesis.cancel();
+  stopListening();                                  // the mic must not hear the co-pilot's own voice
+  const u = new SpeechSynthesisUtterance(m.message);
+  u.rate = m.severity === 'alert' ? 1.15 : 1.0;
+  u.onstart = () => setOrb('speaking');
+  u.onend = u.onerror = () => {
+    if (speechSynthesis.speaking) return;
+    setOrb('');
+    if (m.expects_answer) listenForAnswer();
+  };
+  window._utterances = [...(window._utterances || []).slice(-5), u];   // Chrome drops onend of unreferenced utterances
+  speechSynthesis.speak(u); lastSpoken = now;
+}
+
+function onMessage(m) {
+  if (!m.message) return;
+  addToFeed(m);
+  const old = (m.t || 0) < Date.now() / 1000 - 5;   // history replayed on connect: show, don't speak
+  if (m.source === 'user') { if (old) addBubble(m, true); return; }
+  show(m, old);
+  if (!old) speak(m);
+}
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.onopen = () => { document.body.classList.remove('offline'); };
+  ws.onclose = () => { document.body.classList.add('offline'); setTimeout(connect, 1000); };
+  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.type === 'state') onState(m); else if (m.type === 'message') onMessage(m); };
+  setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
+}
+connect();
+
+$('chat').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('q').value.trim(); if (!text) return;
+  $('q').value = '';
+  addToFeed({ message: text, source: 'user', t: Date.now() / 1000 });
+  addBubble({ message: text, source: 'user' });
+  showTyping();
+  status('Thinking…'); setOrb('thinking');
+  await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+};
+$('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
+// ── voice switch: one setting shared with the dashboard, remembered across reloads ──
+const VOICE_KEY = 'fastgears.voice';
+const voiceBus = 'BroadcastChannel' in window ? new BroadcastChannel('fastgears-voice') : null;
+function applyVoice(on, share) {
+  voice = on;
+  $('voice').classList.toggle('on', on); $('voice').setAttribute('aria-pressed', on);
+  $('voice').textContent = on ? 'Voice on' : 'Voice off';
+  $('voice').title = on ? 'Messages are read aloud · click for text only' : 'Text only · click to read messages aloud';
+  if (!on) { if ('speechSynthesis' in window) speechSynthesis.cancel(); try { stopListening(); } catch (e) { /* page still loading */ } setOrb(''); status('Voice off · messages in the chat'); }
+  if (share) { try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {} voiceBus?.postMessage({ voice: on }); }
+}
+if (voiceBus) voiceBus.onmessage = e => { if (e.data && 'voice' in e.data) applyVoice(e.data.voice, false); };
+window.addEventListener('storage', e => { if (e.key === VOICE_KEY) applyVoice(e.newValue !== 'off', false); });
+try { applyVoice(localStorage.getItem(VOICE_KEY) !== 'off', false); } catch (e) { applyVoice(true, false); }
+$('voice').onclick = () => applyVoice(!voice, true);
+// while this page is open it is the one that talks; the dashboard stays quiet so nothing is read twice
+setInterval(() => voiceBus?.postMessage({ copilot: Date.now() }), 2000);
+voiceBus?.postMessage({ copilot: Date.now() });
+// browsers only allow speech after the first click/keypress on the page: unlock it on the first one
+const unlockSpeech = () => {
+  removeEventListener('pointerdown', unlockSpeech, true); removeEventListener('keydown', unlockSpeech, true);
+  if (!('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u);
+};
+addEventListener('pointerdown', unlockSpeech, true); addEventListener('keydown', unlockSpeech, true);
+
+// speech input: the mic listens for one reply — when the 🎤 button is pressed or right after the co-pilot asks something
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false, mode = null, nextMode = null;
+function startListening(m, force) {
+  if (!rec || (!force && speechSynthesis.speaking)) return;
+  if (listening) { if (mode !== m) { nextMode = m; rec.abort(); } return; }
+  mode = m; rec.continuous = false; rec.interimResults = true;   // show the words live while you speak
+  try { rec.start(); } catch (e) { /* already starting */ }
+}
+// mic button: cut the co-pilot off mid-sentence and listen to the driver right away; press again to stop
+function talkNow() {
+  if (listening && mode === 'answer') { stopListening(); return; }
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  setOrb('');
+  startListening('answer', true);
+}
+function stopListening() { nextMode = null; if (listening) rec.abort(); }
+function listenForAnswer() { startListening('answer'); }
+function send(text) { $('q').value = text; $('chat').requestSubmit(); }
+if (SR) {
+  rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
+  rec.onstart = () => {
+    listening = true;
+    if (mode === 'answer') { $('mic').classList.add('listening'); setOrb('listening'); status('Listening…'); }
+  };
+  rec.onend = () => {
+    listening = false; $('mic').classList.remove('listening');
+    if (orb.classList.contains('listening')) setOrb('');
+    if (liveBubble && liveBubble.classList.contains('live')) dropLiveTranscript();   // heard nothing final
+    const m = nextMode; nextMode = null;
+    if (m) startListening(m);
+  };
+  rec.onerror = e => { if (e.error !== 'aborted' && e.error !== 'no-speech') console.warn('speech recognition:', e.error); };
+  rec.onresult = e => {
+    let final = '', interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) final += r[0].transcript; else interim += r[0].transcript;
+    }
+    if (final.trim()) send(final.trim()); else if (interim.trim()) liveTranscript(interim.trim());
+  };
+  $('mic').onclick = talkNow;
+} else {
+  $('mic').disabled = true;
+  $('mic').title = 'Speech input needs Chrome or Edge';
+}
+</script>
+</body>
+</html>

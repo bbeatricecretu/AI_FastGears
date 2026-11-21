@@ -61,7 +61,8 @@ async def lifespan(app: FastAPI):
                   summary_every_s=settings.llm_summary_every_s,
                   language=settings.language,
                   checkin=CheckIn(settings.checkin_answer_s, settings.checkin_max_rounds,
-                                  settings.checkin_cooldown_s) if settings.checkin else None)
+                                  settings.checkin_cooldown_s) if settings.checkin else None,
+                  convo_idle_s=settings.convo_idle_s)
     pipeline = Pipeline(settings, on_state=_on_state).start()
     task = asyncio.create_task(_state_pump())
     log.info("dashboard: http://%s:%d  (LLM: %s)", settings.host, settings.port, coach.provider)
@@ -88,6 +89,12 @@ app = FastAPI(title="FastGears driver monitor", lifespan=lifespan)
 @app.get("/")
 def index():
     return FileResponse(WEB / "index.html")
+
+
+@app.get("/copilot")
+def copilot():
+    """Driver-facing screen: the co-pilot's message and voice, no technical data."""
+    return FileResponse(WEB / "copilot.html")
 
 
 @app.get("/api/health")

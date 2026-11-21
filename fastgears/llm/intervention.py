@@ -5,9 +5,12 @@ road ahead ("What is directly ahead of you?"). While it waits for the answer, th
 measuring the driver: how fast the eyes came back to the road, how much of the time they stayed
 there, whether the danger is still on. The answer and that reaction are then judged:
 
-  * ok              -> thank the driver and go back to the neutral state (with a cooldown)
-  * not ok          -> say why and ask another question (up to MAX_ROUNDS)
+  * camera ok       -> the driver is back: end quietly (a short thanks only if they answered)
+  * camera not ok   -> say why and ask another question (up to MAX_ROUNDS)
   * still not ok    -> final alert: stop at the next safe place
+
+The camera decides whether to ask again; the answer is optional. A driver who is clearly back on
+the road is not asked again just because the mic missed the answer.
 
 The LLM judges the answer (is it a real, coherent answer about the road?), but it can never
 pass a driver the camera says is still in danger: the camera rules are a hard floor.
@@ -58,11 +61,9 @@ def rule_verdict(job: dict) -> dict:
     answered = len(ans) >= MIN_ANSWER_CHARS
     r = job["reaction"]
     cv_ok = r["level_now"] != "danger" and r["on_road_share"] >= ON_ROAD_SHARE_OK and not r["microsleep"]
-    if answered and cv_ok:
-        return {"ok": True, "cv_ok": True, "message": PASS_MSG, "next_question": ""}
-    if not answered:
-        msg = "I didn't hear an answer."
-    elif r["level_now"] == "danger" or r["microsleep"]:
+    if cv_ok:   # no answer but eyes back on the road: pass without a word
+        return {"ok": True, "cv_ok": True, "message": PASS_MSG if answered else "", "next_question": ""}
+    if r["level_now"] == "danger" or r["microsleep"]:
         msg = "You still look unsafe. Eyes on the road."
     else:
         msg = "Your eyes keep leaving the road."
@@ -190,7 +191,9 @@ class CheckIn:
             src = verdict.get("source", "rules")
             if verdict["ok"]:
                 self._end(now)
-                return [{"message": verdict["message"] or PASS_MSG, "severity": "info",
+                if not verdict["message"]:                 # passed on the camera alone: stay quiet
+                    return []
+                return [{"message": verdict["message"], "severity": "info",
                          "reason": "check-in passed", "source": src}]
             if self.round >= self.max_rounds:
                 self._end(now)

@@ -69,6 +69,7 @@ class Settings:
     checkin_answer_s: float = float(os.getenv("CHECKIN_ANSWER_S", "12"))
     checkin_max_rounds: int = int(os.getenv("CHECKIN_MAX_ROUNDS", "3"))
     checkin_cooldown_s: float = float(os.getenv("CHECKIN_COOLDOWN_S", "30"))
+    convo_idle_s: float = float(os.getenv("CONVO_IDLE_S", "600"))   # co-pilot starts a chat after this long (0 = off)
 
 
 settings = Settings()

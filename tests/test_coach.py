@@ -116,13 +116,22 @@ def test_checkin_passes_with_answer_and_eyes_on_road():
     assert ck.start("phone in use", 136.0) is not None
 
 
-def test_checkin_no_answer_asks_again_then_stops():
+def test_checkin_no_answer_but_eyes_on_road_passes_quietly():
+    ck = CheckIn(answer_timeout_s=10, max_rounds=3, cooldown_s=0)
+    ck.start("microsleep", 0.0)
+    job = None
+    for i in range(1, 12):
+        job = job or ck.observe(road(), float(i))
+    assert job and job["answer"] is None                           # timed out, but awake
+    assert ck.resolve(job, merge_verdict(rule_verdict(job), None), 11.0) == [] and not ck.active
+
+
+def test_checkin_asks_again_only_while_camera_says_unsafe_then_stops():
     ck = CheckIn(answer_timeout_s=10, max_rounds=2, cooldown_s=0)
     first = ck.start("microsleep", 0.0)
     job = None
     for i in range(1, 12):
-        job = job or ck.observe(road(), float(i))
-    assert job and job["answer"] is None                           # timed out
+        job = job or ck.observe(st(face_present=True, looking="down", eyes_closed=False), float(i))
     out = ck.resolve(job, merge_verdict(rule_verdict(job), None), 11.0)
     assert out[0]["expects_answer"] and ck.round == 2
     assert out[0]["message"] != first["message"]                   # a new question
@@ -131,6 +140,18 @@ def test_checkin_no_answer_asks_again_then_stops():
     assert job["reaction"]["level_now"] == "danger"
     out = ck.resolve(job, merge_verdict(rule_verdict(job), None), 13.0)
     assert out[0]["reason"] == "check-in failed" and out[0]["severity"] == "alert" and not ck.active
+
+
+def test_no_other_voice_messages_during_a_checkin():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, checkin=CheckIn(answer_timeout_s=60, cooldown_s=30))
+    c.observe(st(distracted=True, looking="left", level="danger"), now=100.0)
+    n = len(got)                                                   # alert + question
+    c.observe(st(distracted=True, looking="left", level="danger"), now=125.0)   # same hazard, past repeat
+    c.observe(st(hand_off_wheel=True, level="caution"), now=126.0)             # a mere warning
+    assert len(got) == n
+    c.observe(st(microsleep=True, level="danger"), now=127.0)                  # a new danger interrupts
+    assert got[-1]["reason"] == "microsleep"
 
 
 def test_checkin_eyes_off_road_fails_even_with_answer():
@@ -191,3 +212,42 @@ def test_compact_state_names_one_primary_hazard():
     c = compact_state(st(level="danger", phone=True, perclos=0.2, yawns_5min=2))
     assert c["primary_hazard"] == "phone in use"
     assert compact_state(st(level="ok"))["primary_hazard"] is None
+
+
+# ── conversation ────────────────────────────────────────────────────────────────
+
+class EchoLLM:
+    name = "fake"
+    def __init__(self): self.users = []
+    def complete(self, system, user, json_mode=False):
+        self.users.append(user)
+        return "Sounds good."
+
+
+def test_conversation_remembers_previous_turns_and_keeps_the_mic_open():
+    llm = EchoLLM()
+    c = Coach(llm, lambda m: None, min_interval_s=1e9, summary_every_s=1e9)
+    first = c.chat("I'm driving to Cluj", st())
+    assert first["expects_answer"]                                  # browser reopens the mic
+    c.chat("about two hours left", st())
+    assert "driver: I'm driving to Cluj" in llm.users[1] and "co-pilot: Sounds good." in llm.users[1]
+
+
+def test_tiredness_opens_a_conversation_instead_of_a_plain_warning():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9)
+    c.observe(st(tired=True, level="caution"), now=10.0)
+    assert got[0]["expects_answer"] and got[0]["reason"] == "signs of fatigue"
+
+
+def test_calm_drive_gets_an_occasional_conversation_opener():
+    got = []
+    c = Coach(None, got.append, min_interval_s=1e9, summary_every_s=1e9, convo_idle_s=600)
+    c.observe(st(), now=0.0)
+    c.observe(st(), now=599.0)
+    assert not got
+    c.observe(st(), now=601.0)
+    assert got[-1]["reason"] == "conversation" and got[-1]["expects_answer"]
+    c.chat("all fine", st())                                       # talking resets the idle timer
+    c.observe(st(), now=900.0)
+    assert sum(m.get("reason") == "conversation" for m in got) == 1

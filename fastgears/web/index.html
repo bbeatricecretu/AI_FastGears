@@ -17,6 +17,7 @@
   header .spacer { flex: 1; }
   button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
   button:hover { border-color: var(--accent); }
+  .btn-link { color: var(--accent); text-decoration: none; border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; }
   button.on { border-color: var(--accent); color: var(--accent); }
   main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr); gap: 16px; padding: 16px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
@@ -69,6 +70,7 @@
   <span class="pill" id="fps">– fps</span>
   <span class="pill" id="llm">LLM –</span>
   <span class="spacer"></span>
+  <a href="/copilot" target="_blank" class="btn-link" title="Driver screen: co-pilot messages and voice">Driver screen ↗</a>
   <button id="voice" class="on" title="Read co-pilot messages aloud">🔊 Voice on</button>
   <button id="recal" title="Look at the road for 5 s">Recalibrate</button>
 </header>
@@ -165,18 +167,41 @@ const set = (id, v, alert = false) => { const el = $(id); el.querySelector('span
 let voice = true, lastSpoken = 0;
 const hist = [];   // {t, drow, dist, bpm}
 
-$('voice').onclick = () => { voice = !voice; $('voice').classList.toggle('on', voice); $('voice').textContent = voice ? '🔊 Voice on' : '🔈 Voice off'; if (!voice) speechSynthesis.cancel(); };
+// voice switch: one setting shared with the co-pilot page (/copilot), remembered across reloads
+const VOICE_KEY = 'fastgears.voice';
+const voiceBus = 'BroadcastChannel' in window ? new BroadcastChannel('fastgears-voice') : null;
+let copilotSeen = 0;                       // the co-pilot page does the talking while it is open
+function applyVoice(on, share) {
+  voice = on;
+  $('voice').classList.toggle('on', on); $('voice').textContent = on ? '🔊 Voice on' : '🔈 Voice off';
+  if (!on) { if ('speechSynthesis' in window) speechSynthesis.cancel(); try { stopListening(); } catch (e) { /* page still loading */ } }
+  if (share) { try { localStorage.setItem(VOICE_KEY, on ? 'on' : 'off'); } catch (e) {} voiceBus?.postMessage({ voice: on }); }
+}
+if (voiceBus) voiceBus.onmessage = e => {
+  if (!e.data) return;
+  if ('voice' in e.data) applyVoice(e.data.voice, false);
+  if (e.data.copilot) { copilotSeen = Date.now(); if ('speechSynthesis' in window) speechSynthesis.cancel(); }
+};
+window.addEventListener('storage', e => { if (e.key === VOICE_KEY) applyVoice(e.newValue !== 'off', false); });
+try { applyVoice(localStorage.getItem(VOICE_KEY) !== 'off', false); } catch (e) { applyVoice(true, false); }
+$('voice').onclick = () => applyVoice(!voice, true);
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 
 function speak(m) {
   // a check-in question opens the mic once it has been read out (at once when voice is off)
-  if (!voice || !('speechSynthesis' in window)) { if (m.expects_answer) listenForAnswer(); return; }
+  if (Date.now() - copilotSeen < 5000) return;     // the co-pilot page is open and handles voice + answers
+  if (!voice) return;                               // voice off: text only, nothing is spoken or heard
+  if (!('speechSynthesis' in window)) { if (m.expects_answer) listenForAnswer(); return; }
   const now = Date.now();
-  if (m.severity === 'info' && !(m.reason || '').startsWith('check-in') && now - lastSpoken < 4000) return;
+  if (m.severity === 'info' && !m.expects_answer && !(m.reason || '').startsWith('check-in') && now - lastSpoken < 4000) return;
+  if (listening && mode === 'answer' && m.severity !== 'alert') return;   // the driver is talking: don't talk over them (alerts still do)
   if (m.severity === 'alert') speechSynthesis.cancel();
+  stopListening();                                 // the mic must not hear the co-pilot's own voice
   const u = new SpeechSynthesisUtterance(m.message);
   u.rate = m.severity === 'alert' ? 1.15 : 1.0;
-  if (m.expects_answer) u.onend = () => listenForAnswer();
+  // after a question the mic opens for the answer (also when cut off by an alert)
+  u.onend = u.onerror = () => { if (speechSynthesis.speaking) return; if (m.expects_answer) listenForAnswer(); };
+  window._utterances = [...(window._utterances || []).slice(-5), u];     // Chrome drops onend of unreferenced utterances
   speechSynthesis.speak(u); lastSpoken = now;
 }
 
@@ -470,20 +495,43 @@ $('chat').onsubmit = async e => {
   await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
 };
 
+// Speech input: one utterance, when the 🎤 button is pressed or after the co-pilot asked something
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, listening = false;
-function listenForAnswer() {
-  $('q').placeholder = 'Answer the co-pilot…'; $('q').focus();
-  if (!rec || listening) return;
-  try { rec.start(); } catch (e) { /* already started */ }
+let rec = null, listening = false, mode = null, nextMode = null;
+function startListening(m, force) {
+  if (!rec || (!force && speechSynthesis.speaking)) return;
+  if (listening) { if (mode !== m) { nextMode = m; rec.abort(); } return; }
+  mode = m; rec.continuous = false;
+  try { rec.start(); } catch (e) { /* already starting */ }
 }
+// mic button: cut the co-pilot off mid-sentence and listen to the driver right away; press again to stop
+function talkNow() {
+  if (listening && mode === 'answer') { stopListening(); return; }
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  startListening('answer', true);
+}
+function stopListening() { nextMode = null; if (listening) rec.abort(); }
+function listenForAnswer() { $('q').placeholder = 'Answer the co-pilot…'; startListening('answer'); }
+function send(text) { $('q').value = text; $('chat').requestSubmit(); }
 if (SR) {
   rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
-  rec.onstart = () => { listening = true; $('mic').classList.add('listening'); };
-  rec.onend = () => { listening = false; $('mic').classList.remove('listening'); $('q').placeholder = 'Ask the co-pilot… (e.g. how am I doing?)'; };
-  rec.onresult = e => { $('q').value = e.results[0][0].transcript; $('chat').requestSubmit(); };
-  $('mic').onclick = () => listenForAnswer();
-} else { $('mic').disabled = true; $('mic').title = 'Speech input not supported in this browser'; }
+  rec.onstart = () => { listening = true; $('mic').classList.toggle('listening', mode === 'answer'); };
+  rec.onend = () => {
+    listening = false; $('mic').classList.remove('listening');
+    $('q').placeholder = 'Ask the co-pilot… (e.g. how am I doing?)';
+    const m = nextMode; nextMode = null;
+    if (m) startListening(m);
+  };
+  rec.onerror = e => { if (e.error !== 'aborted' && e.error !== 'no-speech') console.warn('speech recognition:', e.error); };
+  rec.onresult = e => {
+    const text = e.results[e.results.length - 1][0].transcript.trim();
+    if (text) send(text);
+  };
+  $('mic').onclick = talkNow;
+} else {
+  $('mic').disabled = true;
+  $('mic').title = 'Speech input not supported in this browser';
+}
 </script>
 </body>
 </html>
