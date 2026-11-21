@@ -83,6 +83,8 @@ DISTRACTED_TOTAL_S = 20.0        # ...reaching this total -> distracted (danger)
 OFF_ROAD_RECOVER_S = 2.0         # back on the road this long clears "distracted" (the total stays,
                                  # so the next glance re-triggers sooner)
 OFF_ROAD_REASON_S = 1.0
+OFF_ROAD_DECAY_S = 1.0           # back on the road: the off-road score fades with this time constant
+                                 # (gone in ~3 s); the 60 s total still makes the next glance count more
 MIRRORED = True                  # frames are horizontally flipped (selfie view)
 
 # --- scoring ----------------------------------------------------------------------
@@ -108,7 +110,7 @@ _THRESHOLD_NAMES = (
     "YAWN_MIN_S", "YAWN_WINDOW_S", "YAWNS_TIRED", "YAW_SIDE_DEG", "YAW_AWAY_DEG",
     "PITCH_DOWN_DEG", "PITCH_UP_DEG", "IRIS_YAW_GAIN", "IRIS_PITCH_GAIN",
     "FACE_MISSING_AWAY_S", "OFF_ROAD_WINDOW_S", "DISTRACTED_TOTAL_S", "OFF_ROAD_RECOVER_S",
-    "OFF_ROAD_REASON_S", "MIRRORED",
+    "OFF_ROAD_REASON_S", "OFF_ROAD_DECAY_S", "MIRRORED",
     "PERCLOS_TIRED", "EYE_HYSTERESIS", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_TIRED_SCORE",
     "PHONE_WARN_DISTRACTION", "PHONE_DANGER_S", "PHONE_GAP_S", "PHONE_DISTRACTION", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "HEAD_DROP_CLOSURE", "HEAD_BACK_DEG", "NOD_MEMORY_S", "DROP_PITCH_RISE_DEG", "DROP_LOOKBACK_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
@@ -481,8 +483,10 @@ class AttentionMonitor:
             tilt_score = min(100.0, th["level_danger"] * tilt_s / th["head_tilt_danger_s"])
         drowsiness = max(perclos_score, self._acute, yawn_score, tilt_score)
         distraction = min(100.0, th["level_danger"] * off_total / th["distracted_total_s"])
-        if not still_off:              # looking at the road again: the history alone can't hold danger
-            distraction = min(distraction, th["level_danger"] - 1.0)
+        if self._off_road_since is None and self._last_off_t is not None:
+            # looking at the road again: the off-road history fades out within seconds
+            distraction *= math.exp(-max(0.0, t - self._last_off_t) / th["off_road_decay_s"])
+        off_score = distraction
         if hand_up:
             if self._hand_since is None:
                 self._hand_since = t
@@ -516,7 +520,8 @@ class AttentionMonitor:
                 reasons.append(f"face not visible {off_road_s:.1f} s")
             else:
                 reasons.append(f"looking {looking} {off_road_s:.1f} s")
-        if off_total >= th["off_road_reason_s"] and (distracted or off_total >= 0.5 * th["distracted_total_s"]):
+        if (off_total >= th["off_road_reason_s"] and off_score >= th["level_caution"]
+                and (distracted or off_total >= 0.5 * th["distracted_total_s"])):
             reasons.append(f"eyes off road {off_total:.0f} s in the last {th['off_road_window_s']:.0f} s")
         if phone:
             reasons.append(f"phone in hand {phone_s:.0f} s" if phone_s >= 1.0 else "phone in hand")

@@ -137,6 +137,15 @@ def test_off_road_glances_add_up_over_the_window():
     assert any(r.startswith("eyes off road") for r in out["reasons"])
 
 
+def test_back_on_road_the_off_road_score_fades_within_seconds():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 14.0, lambda: fake_face(yaw=40.0))     # looked to the side for 14 s
+    assert out["level"] == "caution" and out["distraction"] >= 40
+    out, t = run(mon, t, 3.0, lambda: fake_face())              # back on the road for 3 s
+    assert out["level"] == "ok" and out["distraction"] < 5 and out["reasons"] == []
+    assert out["off_road_total_s"] >= 13.9                       # the 60 s window still remembers it
+
+
 def test_off_road_total_leaves_the_window():
     mon, out, t = calibrated()
     out, t = run(mon, t, 15.0, lambda: fake_face(yaw=40.0))

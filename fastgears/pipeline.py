@@ -49,11 +49,7 @@ class Pipeline:
         from .vision.attention import AttentionMonitor
         from .vision.discomfort import DiscomfortMonitor
         from .vision.driver import DriverLock
-        from .vision.cezara_attention import AttentionMonitor as FaceMetrics
         self.attention = AttentionMonitor(calib_s=self.s.calib_s)
-        # main_final's facial parameters (per-eye state, blink duration, nods, yawns, droop,
-        # glances) for the "Alerte sofer" panel; fed the same driver face as the attention monitor
-        self.face_metrics = FaceMetrics(calib_s=self.s.calib_s)
         self.driver = DriverLock(self.s.driver_seat)
         self.discomfort = DiscomfortMonitor(calib_s=self.s.calib_s,
                                             overlap_s=self.s.discomfort_overlap_s)
@@ -138,7 +134,6 @@ class Pipeline:
                 self._recalibrate.clear()
                 self.driver.reset()
                 self.attention.reset_calibration()
-                self.face_metrics.reset_calibration()
                 self.discomfort.reset()
                 if self.rppg:
                     self.rppg.reset()
@@ -213,7 +208,6 @@ class Pipeline:
             if not phone:
                 self._phone_xy = None
         att = self.attention.update(face, t, phone=phone, hand_up=both_off)
-        metrics = self.face_metrics.update(face, t, phone=phone)
         gestures = self.discomfort.update(face, t, frame.shape,
                                           missing_reason="face_model_unavailable" if self.face is None else "face_not_visible")
         pulse = self.rppg.status() if self.rppg else {}
@@ -229,9 +223,6 @@ class Pipeline:
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
             "driver": self.driver.state.as_dict(),
-            "driver_attention": _jsonable(metrics),
-            "driver_alerts": _driver_alerts(face, metrics, both_off, phone,
-                                            self.hands is not None, self.objects is not None),
             "hands": {"available": self.hands is not None, "seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
                       "vision_calls": self.vision.calls if self.vision else 0},
             "face_regions": regions,
@@ -340,25 +331,6 @@ class Pipeline:
             img = cv2.resize(img, (960, int(img.shape[0] * 960 / img.shape[1])))
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return buf.tobytes() if ok else None
-
-
-def _driver_alerts(face, metrics: dict, hands_off: bool, phone: bool,
-                   hands_available: bool, objects_available: bool) -> dict:
-    """The dashboard's three driver alerts (None = not measurable right now)."""
-    warning = metrics.get("active_warning")
-    messages = [warning["message"]] if warning else []
-    glance = {"sustained_off_road": "Privirea este menținută în afara drumului.",
-              "repeated_off_road": "Priviri repetate în afara drumului."}
-    for event in metrics.get("events", []):
-        if event.get("type") in glance and (not warning or event.get("id") != warning.get("event_id")):
-            messages.append(glance[event["type"]])
-    seen = face is not None
-    return {
-        "attention": {"active": True if messages else False if seen and metrics.get("calibrated") else None,
-                      "messages": messages},
-        "hands": {"active": hands_off if seen and hands_available else None},
-        "phone": {"active": phone if seen and objects_available else None},
-    }
 
 
 def _jsonable(x):
