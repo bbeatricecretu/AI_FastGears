@@ -92,6 +92,11 @@ Chrome or Edge (for voice), and a Gemini API key (free tier works).
 ### Windows (PowerShell)
 
 Pentru iPhone conectat prin USB pe Windows, vezi [ghidul de instalare și configurare Camo](README_CAMO.md).
+Pentru observațiile experimentale de culoare facială, vezi [ghidul modulului RGB](RGB/README.md).
+
+Panoul **Diagnosticele** afișează simultan pulsul estimat, semnele de somnolență, grimasa și schimbarea de culoare. Pornește cu `python -m fastgears --rgb` pentru a include culoarea și calibrează camera cu fața relaxată, în lumină stabilă.
+
+Tiparul de posibil preleșin cere reducerea activă a colorației obrajilor, o închidere a ochilor de cel puțin 0,5 s și un puls estimat sub 50 bpm cu semnal fiabil. Pragurile sunt euristici de demo. Detectorul de puls urmărește 45–180 bpm și folosește o fereastră de aproximativ 10 s, deci poate întârzia sau rata o scădere bruscă. Panoul oferă semnale orientative; validarea clinică a regulii rămâne deschisă.
 
 ```powershell
 git clone --branch mara-test-rgb https://github.com/bbeatricecretu/AI_FastGears.git

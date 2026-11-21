@@ -591,7 +591,8 @@ class RPPG:
         """Thread-safe; recomputes at most once per second (lazily), otherwise cached."""
         self._refresh()
         with self._lock:
-            return {**self._result, "face": self._face is not None, "diag": dict(self._diag)}
+            return {**self._result, "face": self._face is not None, "diag": dict(self._diag),
+                    "sampled_monotonic_s": self._est_sample_t if self._face is not None else None}
 
     def rois(self) -> list[tuple[int, int, int, int]]:
         with self._lock:

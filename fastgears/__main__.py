@@ -14,6 +14,9 @@ def main() -> None:
     ap.add_argument("--no-llm", action="store_true", help="rule-based messages only")
     ap.add_argument("--no-objects", action="store_true", help="skip YOLO phone detection (faster)")
     ap.add_argument("--no-rppg", action="store_true", help="skip camera pulse")
+    ap.add_argument("--rgb", action="store_true", help="enable experimental facial colour measurements")
+    ap.add_argument("--rgb-reference", help="optional neutral patch x0,y0,x1,y1 (default: estimate light from forehead)")
+    ap.add_argument("--rgb-overlay", action="store_true", help="show the RGB analysis masks and reference")
     a = ap.parse_args()
     # CLI overrides env, before config is imported
     if a.camera is not None:
@@ -30,6 +33,12 @@ def main() -> None:
         os.environ["ENABLE_OBJECTS"] = "0"
     if a.no_rppg:
         os.environ["ENABLE_RPPG"] = "0"
+    if a.rgb or a.rgb_reference is not None or a.rgb_overlay:
+        os.environ["ENABLE_RGB"] = "1"
+    if a.rgb_reference is not None:
+        os.environ["RGB_REFERENCE"] = a.rgb_reference
+    if a.rgb_overlay:
+        os.environ["RGB_OVERLAY"] = "1"
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     import uvicorn

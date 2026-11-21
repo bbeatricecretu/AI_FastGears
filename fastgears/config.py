@@ -45,6 +45,11 @@ class Settings:
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
     discomfort_overlap_s: float = float(os.getenv("DISCOMFORT_OVERLAP_S", "0.3"))
+    enable_rgb: bool = _bool("ENABLE_RGB", False)
+    rgb_reference: str = os.getenv("RGB_REFERENCE", "")
+    rgb_overlay: bool = _bool("RGB_OVERLAY", False)
+    rgb_calibration_s: str = os.getenv("RGB_CALIBRATION_S", "5")
+    rgb_persistence_s: str = os.getenv("RGB_PERSISTENCE_S", "1")
 
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none

@@ -15,6 +15,7 @@ import numpy as np
 
 from .camera import Camera
 from .config import Settings
+from .vision.driver_signals import assess_driver
 from .vision.face import FACE_REGION_CONTOURS, PULSE_REGIONS, face_region_contours
 
 log = logging.getLogger("pipeline")
@@ -29,7 +30,7 @@ class Pipeline:
         self.on_state = on_state
         self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror,
                              backend=settings.camera_backend)
-        self.face = self.rppg = self.objects = None
+        self.face = self.rppg = self.objects = self.rgb = None
         self.errors: dict[str, str] = {}
         self._load_detectors()
         self._jpeg: bytes | None = None
@@ -69,6 +70,16 @@ class Pipeline:
             except Exception as e:
                 self.errors["objects"] = str(e)
                 log.exception("object detector unavailable")
+        if self.s.enable_rgb:
+            try:
+                from RGB import ColorMonitor, Thresholds, parse_reference
+                self.rgb = ColorMonitor(parse_reference(self.s.rgb_reference),
+                                        Thresholds(calibration_s=float(self.s.rgb_calibration_s),
+                                                   persistence_s=float(self.s.rgb_persistence_s)),
+                                        overlay=self.s.rgb_overlay)
+            except Exception as e:
+                self.errors["rgb"] = str(e)
+                log.exception("RGB analysis unavailable")
 
     def start(self) -> "Pipeline":
         self.camera.start()
@@ -99,6 +110,8 @@ class Pipeline:
                 self._recalibrate.clear()
                 self.attention.reset_calibration()
                 self.discomfort.reset()
+                if self.rgb:
+                    self.rgb.reset()
             seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
             if frame is None or t is None or seq2 == seq:
                 self._publish_no_camera()
@@ -117,6 +130,7 @@ class Pipeline:
     def _step(self, frame: np.ndarray, t: float, t_ms: int) -> None:
         face = self.face.process(frame, t_ms) if self.face else None
         regions = face_region_contours(face, frame.shape)
+        rgb_state = self._rgb_state(frame, face, regions, t)
         if self.rppg:
             self.rppg.update(frame, face.eyes if face else None, t,
                              landmarks=face.landmarks_px if face else None)
@@ -132,6 +146,8 @@ class Pipeline:
             "status": "running",
             "attention": att,
             "discomfort": gestures,
+            "rgb": rgb_state,
+            "driver_signals": assess_driver(t, att, gestures, rgb_state, pulse),
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
@@ -141,7 +157,10 @@ class Pipeline:
             "detectors": {"face": self.face is not None, "rppg": self.rppg is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
-        if self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S:
+        preview_due = self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S
+        masks_current = (not self.rgb or not self.s.rgb_overlay or not rgb_state.get("regions")
+                         or rgb_state.get("sampled_monotonic_s") == t)
+        if preview_due and masks_current:
             self._jpeg = self._draw(frame, face, dets, att, pulse, regions)
             self._last_preview_t = t
         with self._lock:
@@ -151,17 +170,32 @@ class Pipeline:
 
     def _publish_no_camera(self) -> None:
         t = time.monotonic()
+        attention = self.attention.update(None, t)
         gestures = self.discomfort.update(None, t, missing_reason="no_camera_frame")
         if self.rppg:
             self.rppg.update(None, None, t)
         pulse = _jsonable(self.rppg.status()) if self.rppg else {}
+        rgb_state = self._rgb_state(None, None, {}, t)
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
+                           "attention": attention,
                            "discomfort": gestures,
+                           "rgb": rgb_state,
+                           "driver_signals": {"finding": "camera_unavailable"},
                            "pulse": pulse,
                            "face_box": None,
                            "face_regions": dict.fromkeys(FACE_REGION_CONTOURS),
                            "camera": {"connected": self.camera.connected}}
+
+    def _rgb_state(self, frame, face, regions, t):
+        if self.rgb:
+            try:
+                return self.rgb.update(frame, face, regions, t)
+            except Exception as e:
+                self.errors["rgb"] = str(e)
+                self.rgb = None
+                log.exception("RGB analysis stopped")
+        return {"enabled": True, "lighting": "analysis_unavailable"} if self.s.enable_rgb else {}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
     def _draw(self, frame, face, dets, att, pulse, regions) -> bytes | None:
@@ -189,6 +223,8 @@ class Pipeline:
                 contour = np.rint(points).astype(np.int32)
                 region_color = region_colors.get(name, (170, 90, 255))
                 cv2.polylines(img, [contour], True, region_color, 1, cv2.LINE_AA)
+        if self.rgb and self.s.rgb_overlay:
+            self.rgb.draw_masks(img)
         lines = [f"{level.upper()}  looking: {att.get('looking', '-')}",
                  f"EAR {att.get('ear') or 0:.2f}  PERCLOS {100 * (att.get('perclos') or 0):.0f}%  "
                  f"blinks/min {att.get('blinks_per_min') or 0:.0f}"]
