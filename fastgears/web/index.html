@@ -83,7 +83,7 @@
         <div class="m" id="m-looking"><small>Looking</small><span>–</span></div>
         <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
         <div class="m" id="m-phone"><small>Phone</small><span>–</span></div>
-        <div class="m" id="m-ear"><small>EAR</small><span>–</span></div>
+        <div class="m" id="m-ear"><small>EAR L / R</small><span>–</span></div>
         <div class="m" id="m-perclos"><small>PERCLOS (recent)</small><span>–</span></div>
         <div class="m" id="m-blinks"><small>Blinks/min</small><span>–</span></div>
         <div class="m" id="m-yawn"><small>Yawns 5 min</small><span>–</span></div>
@@ -151,9 +151,14 @@ function onState(s) {
     b.style.width = v + '%'; b.style.background = v >= 70 ? 'var(--danger)' : v >= 40 ? 'var(--caution)' : 'var(--ok)';
   }
   set('m-looking', a.looking || '–', a.distracted);
-  set('m-eyes', a.eyes_closed ? `closed ${(a.eye_closed_s || 0).toFixed(1)}s` : 'open', a.microsleep);
+  const eye = c => c == null ? '–' : c ? 'closed' : 'open';
+  set('m-eyes', a.eye_left_closed == null ? '–'
+      : `L ${eye(a.eye_left_closed)} · R ${eye(a.eye_right_closed)}`
+        + (a.eyes_closed ? ` ${(a.eye_closed_s || 0).toFixed(1)}s` : ''),
+      a.microsleep);
   set('m-phone', a.phone ? 'IN USE' : 'no', a.phone);
-  set('m-ear', a.ear != null ? a.ear.toFixed(2) : '–');
+  set('m-ear', a.ear_left != null ? `${a.ear_left.toFixed(2)} / ${a.ear_right.toFixed(2)}`
+      : a.ear != null ? a.ear.toFixed(2) : '–');
   set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', (a.perclos || 0) > 0.15);
   set('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–');
   set('m-yawn', a.yawns_5min ?? '–', a.yawning);

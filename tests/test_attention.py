@@ -434,3 +434,54 @@ def test_driver_crop_reaches_arm_length_to_the_side():
     face = fake_face(bbox=(600, 200, 700, 320))                         # 100 px wide face
     x0, y0, x1, y1 = ObjectDetector.driver_crop(face, (720, 1280, 3))
     assert x0 <= 300 and x1 >= 1000 and y1 == 720
+
+
+def _wink_face(left, right):
+    """Driver's-view per-eye EARs on a mirrored frame (ear_right = landmarks 33.. = driver's left)."""
+    f = fake_face()
+    f.ear_right, f.ear_left = left, right
+    return f
+
+
+def test_per_eye_labels_open_after_calibration():
+    mon, out, t = calibrated()
+    assert out["eye_left_closed"] is False and out["eye_right_closed"] is False
+    assert mon.base_ear_lr == pytest.approx((0.30, 0.30))
+    assert out["ear_left"] == pytest.approx(0.30)
+
+
+def test_wink_closes_one_eye_only_without_alerting():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 2.0, lambda: _wink_face(0.08, 0.30))   # left shut, right open
+    assert out["eye_left_closed"] is True and out["eye_right_closed"] is False
+    # mean EAR 0.19 stays above 0.6 x 0.30: the both-eye decision is unchanged
+    assert out["eyes_closed"] is False and out["microsleep"] is False
+    out, t = run(mon, t, 0.5, lambda: _wink_face(0.30, 0.08))
+    assert out["eye_left_closed"] is False and out["eye_right_closed"] is True
+
+
+def test_both_eyes_closed_labels_and_microsleep():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 2.0, lambda: fake_face(ear=0.05))
+    assert out["eye_left_closed"] is True and out["eye_right_closed"] is True
+    assert out["eyes_closed"] is True and out["microsleep"] is True
+
+
+def test_per_eye_label_hysteresis_and_unmirrored():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 0.3, lambda: _wink_face(0.10, 0.30))
+    assert out["eye_left_closed"] is True
+    # 0.19 is above the 0.18 threshold but inside the hysteresis band: still closed
+    out, t = run(mon, t, 0.3, lambda: _wink_face(0.19, 0.30))
+    assert out["eye_left_closed"] is True
+    out, t = run(mon, t, 0.3, lambda: _wink_face(0.25, 0.30))
+    assert out["eye_left_closed"] is False
+    raw, _, t2 = calibrated(mirrored=False)
+    out, _ = run(raw, t2, 0.3, lambda: _wink_face(0.10, 0.30))   # ear_right shut, raw frame
+    assert out["eye_right_closed"] is True and out["eye_left_closed"] is False
+
+
+def test_per_eye_labels_none_without_face():
+    mon, out, t = calibrated()
+    out = mon.update(None, t)
+    assert out["eye_left_closed"] is None and out["ear_left"] is None

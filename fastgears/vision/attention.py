@@ -46,6 +46,8 @@ LONG_CLOSURE_S = 0.5             # closure reported as a reason beyond this
 MICROSLEEP_S = 1.5
 EAR_MIN_CUTOFF = 1.5             # One-Euro params for the reported EAR
 EAR_BETA = 1.0
+EYE_HYSTERESIS = 0.02            # per-eye open/closed label: an eye already shut must reopen
+                                 # this far above the threshold (stops the label flickering)
 
 # --- mouth ----------------------------------------------------------------------
 MAR_YAWN = 0.6                   # inner-lip MAR for a yawn
@@ -99,7 +101,7 @@ _THRESHOLD_NAMES = (
     "YAWN_MIN_S", "YAWN_WINDOW_S", "YAW_SIDE_DEG", "YAW_AWAY_DEG",
     "PITCH_DOWN_DEG", "PITCH_UP_DEG", "IRIS_YAW_GAIN", "IRIS_PITCH_GAIN",
     "FACE_MISSING_AWAY_S", "DISTRACTED_S", "OFF_ROAD_REASON_S", "MIRRORED",
-    "PERCLOS_TIRED", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "PERCLOS_TAU_S", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "HEAD_DROP_CLOSURE", "HEAD_BACK_DEG", "NOD_MEMORY_S", "DROP_PITCH_RISE_DEG", "DROP_LOOKBACK_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
+    "PERCLOS_TIRED", "EYE_HYSTERESIS", "PERCLOS_SCORE_MAX", "ACUTE_DECAY_S", "YAWN_SCORE_EACH", "PHONE_DISTRACTION", "PERCLOS_TAU_S", "HEAD_TILT_DEG", "HEAD_TILT_S", "HEAD_TILT_DANGER_S", "HEAD_DROP_CLOSURE", "HEAD_BACK_DEG", "NOD_MEMORY_S", "DROP_PITCH_RISE_DEG", "DROP_LOOKBACK_S", "YAWN_POSE_MAX_DEG", "HAND_UP_S", "HAND_UP_DISTRACTION", "LEVEL_CAUTION",
     "LEVEL_DANGER",
 )
 DEFAULT_THRESHOLDS = {n.lower(): globals()[n] for n in _THRESHOLD_NAMES}
@@ -126,6 +128,7 @@ class AttentionMonitor:
         self._t0: float | None = None
         self._last_t: float | None = None
         self._closed_since: float | None = None
+        self._eye_closed = [False, False]   # per-eye label state (driver's left, right)
         self._blinks: deque[float] = deque()
         self._perclos: deque[tuple[float, float, bool]] = deque()  # t, dt, closed80
         self._mouth_open_since: float | None = None
@@ -149,9 +152,10 @@ class AttentionMonitor:
         """Forget the driver baseline; the next calib_s seconds re-learn it."""
         self.calibrated = False
         self._calib_start: float | None = None
-        self._calib = {"ear": [], "pitch": [], "yaw": [], "roll": [],
+        self._calib = {"ear": [], "ear_l": [], "ear_r": [], "pitch": [], "yaw": [], "roll": [],
                        "ix": [], "iy": []}
         self.base_ear: float | None = None
+        self.base_ear_lr: tuple[float, float] | None = None   # per eye, driver's left/right
         self.base_pose = (0.0, 0.0, 0.0)
         self.base_iris = (0.0, 0.0)
 
@@ -162,12 +166,22 @@ class AttentionMonitor:
         v = [bs[k] for k in ("eyeBlinkLeft", "eyeBlinkRight") if k in bs]
         return sum(v) / len(v) if v else None
 
+    def _driver_ears(self, face) -> tuple[float, float]:
+        """(left, right) EAR from the driver's own view. face.ear_right is landmarks 33..133,
+        the eye on image-left: the driver's right on a raw frame, their left when mirrored."""
+        if self.th["mirrored"]:
+            return float(face.ear_right), float(face.ear_left)
+        return float(face.ear_left), float(face.ear_right)
+
     def _calibrate(self, face, t: float, ear: float, blink: float | None) -> None:
         if self._calib_start is None:
             self._calib_start = t
         c = self._calib
         if blink is None or blink < self.th["calib_blink_bs_max"]:
             c["ear"].append(ear)
+            el, er = self._driver_ears(face)
+            c["ear_l"].append(el)
+            c["ear_r"].append(er)
         for k, v in (("pitch", face.pitch_deg), ("yaw", face.yaw_deg),
                      ("roll", face.roll_deg)):
             if v is not None:
@@ -180,6 +194,9 @@ class AttentionMonitor:
             if c["ear"]:
                 self.base_ear = min(self.th["baseline_ear_max"],
                                     max(self.th["baseline_ear_min"], median(c["ear"])))
+                clamp = lambda x: min(self.th["baseline_ear_max"],  # noqa: E731
+                                      max(self.th["baseline_ear_min"], x))
+                self.base_ear_lr = (clamp(median(c["ear_l"])), clamp(median(c["ear_r"])))
             med = lambda xs: median(xs) if xs else 0.0  # noqa: E731
             self.base_pose = (med(c["pitch"]), med(c["yaw"]), med(c["roll"]))
             self.base_iris = (med(c["ix"]), med(c["iy"]))
@@ -239,6 +256,8 @@ class AttentionMonitor:
 
         eyes_closed = False
         eye_closed_s = 0.0
+        eyes_lr: list[bool] | None = None
+        ears_lr: tuple[float, float] | None = None
         yawning = False
         ear_s = None
         rel_p = rel_y = rel_r = None
@@ -266,6 +285,17 @@ class AttentionMonitor:
                 if dur <= th["blink_max_s"]:
                     self._blinks.append(t)
                 self._closed_since = None
+            # per-eye open/closed label (display only: the decisions above use both eyes)
+            ears_lr = self._driver_ears(face)
+            bases = self.base_ear_lr or (self.base_ear, self.base_ear)
+            for i, e in enumerate(ears_lr):
+                thr_i = (th["ear_closed_ratio"] * bases[i] if bases[i] else th["ear_closed_abs"])
+                if self._eye_closed[i]:
+                    thr_i += th["eye_hysteresis"]
+                self._eye_closed[i] = e < thr_i
+            eyes_lr = list(self._eye_closed)
+            if eyes_closed and not any(eyes_lr):
+                eyes_lr = [True, True]   # closed by the blink blendshapes: both lids down
             closure = self._closure(ear, blink)
             a = 1.0 - math.exp(-dt / th["perclos_tau_s"])
             self._perclos_ewma += a * ((1.0 if closure >= th["perclos_closure"] else 0.0) - self._perclos_ewma)
@@ -335,6 +365,7 @@ class AttentionMonitor:
         else:
             # face lost: eye/mouth episodes cannot continue
             self._closed_since = None
+            self._eye_closed = [False, False]
             self._mouth_open_since = None
             if self._face_missing_since is None:
                 self._face_missing_since = t
@@ -443,6 +474,10 @@ class AttentionMonitor:
             "ear": _r(ear_s if face is not None else self._ear_s),
             "eyes_closed": bool(eyes_closed),
             "eye_closed_s": round(eye_closed_s, 2),
+            "eye_left_closed": None if eyes_lr is None else bool(eyes_lr[0]),
+            "eye_right_closed": None if eyes_lr is None else bool(eyes_lr[1]),
+            "ear_left": _r(ears_lr[0]) if ears_lr else None,
+            "ear_right": _r(ears_lr[1]) if ears_lr else None,
             "blinks_per_min": round(blinks_per_min, 1),
             "perclos": round(perclos, 3),
             "microsleep": bool(microsleep),
