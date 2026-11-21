@@ -2,12 +2,10 @@
 
 Eyes and mouth come from main's AttentionMonitor (calibrated per-eye closure, PERCLOS,
 yawns); the discomfort monitor does not measure them a second time."""
-from math import ceil
-
-from .attention import LEVEL_CAUTION, LONG_CLOSURE_S, PERCLOS_TIRED, YAWN_SCORE_EACH
+from .attention import LONG_CLOSURE_S, PERCLOS_TIRED, YAWNS_TIRED
 
 # yawns in the last 5 min that alone bring main's drowsiness score to caution
-YAWNS_DROWSY = ceil(LEVEL_CAUTION / YAWN_SCORE_EACH)
+YAWNS_DROWSY = YAWNS_TIRED
 
 
 def _fresh(timestamp, now, max_age):

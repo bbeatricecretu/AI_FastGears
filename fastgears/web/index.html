@@ -93,10 +93,10 @@
         <div class="m" id="m-eyes"><small>Eyes</small><span>–</span></div>
         <div class="m" id="m-phone"><small>Phone</small><span>–</span></div>
         <div class="m" id="m-ear"><small>EAR L / R</small><span>–</span></div>
-        <div class="m" id="m-perclos"><small>PERCLOS (recent)</small><span>–</span></div>
+        <div class="m" id="m-perclos"><small>PERCLOS (5 min)</small><span>–</span></div>
         <div class="m" id="m-blinks"><small>Blinks/min</small><span>–</span></div>
         <div class="m" id="m-yawn"><small>Yawns 5 min</small><span>–</span></div>
-        <div class="m" id="m-offroad"><small>Off-road</small><span>–</span></div>
+        <div class="m" id="m-offroad"><small>Off-road now · last 60 s</small><span>–</span></div>
         <div class="m" id="m-head"><small>Yaw / pitch</small><span>–</span></div>
         <div class="m" id="m-pulse"><small>Pulse (camera)</small><span>–</span></div>
         <div class="m" id="m-trust"><small>Pulse trust</small><span>–</span></div>
@@ -207,13 +207,13 @@ function onState(s) {
       : `L ${eye(a.eye_left_closed)} · R ${eye(a.eye_right_closed)}`
         + (a.eyes_closed ? ` ${(a.eye_closed_s || 0).toFixed(1)}s` : ''),
       a.microsleep);
-  set('m-phone', a.phone ? 'IN USE' : 'no', a.phone);
+  set('m-phone', a.phone ? `IN USE ${Math.round(a.phone_s || 0)}s` : 'no', a.phone);
   set('m-ear', a.ear_left != null ? `${a.ear_left.toFixed(2)} / ${a.ear_right.toFixed(2)}`
       : a.ear != null ? a.ear.toFixed(2) : '–');
-  set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', (a.perclos || 0) > 0.15);
+  set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', a.tired);
   set('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–');
   set('m-yawn', a.yawns_5min ?? '–', a.yawning);
-  set('m-offroad', a.off_road_s != null ? a.off_road_s.toFixed(1) + 's' : '–', a.distracted);
+  set('m-offroad', a.off_road_s != null ? `${a.off_road_s.toFixed(1)}s · ${Math.round(a.off_road_total_s || 0)}/20s` : '–', a.distracted);
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
   const pulseStatus = pulseProgress(p);

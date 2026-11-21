@@ -63,10 +63,13 @@ def test_eyes_closed_microsleep_danger():
     assert out["eyes_closed"] is False and out["level"] == "ok"
     out, t2 = run(mon, t, 1.0, lambda: fake_face(ear=0.08))
     assert out["eyes_closed"] is True
-    assert out["microsleep"] is False
-    out, t3 = run(mon, t2, 1.0, lambda: fake_face(ear=0.08))
-    assert out["eye_closed_s"] >= 1.5
-    assert out["microsleep"] is True
+    assert out["microsleep"] is False and out["level"] == "ok"
+    out, t2 = run(mon, t2, 1.5, lambda: fake_face(ear=0.08))      # 2.5 s: warning, not danger yet
+    assert out["eyes_closing"] is True and out["microsleep"] is False
+    assert out["level"] == "caution"
+    out, t3 = run(mon, t2, 2.6, lambda: fake_face(ear=0.08))      # 5.1 s: microsleep
+    assert out["eye_closed_s"] >= 5.0
+    assert out["microsleep"] is True and out["eyes_closing"] is False
     assert out["level"] == "danger"
     assert any(r.startswith("microsleep: eyes closed") for r in out["reasons"])
     assert out["perclos"] > 0
@@ -100,24 +103,45 @@ def test_blink_counting():
 ])
 def test_head_yaw_left_right_distracted(yaw, mirrored, label):
     mon, out, t = calibrated(mirrored=mirrored)
-    out, t1 = run(mon, t, 1.5, lambda: fake_face(yaw=yaw))
+    out, t1 = run(mon, t, 3.0, lambda: fake_face(yaw=yaw))
     assert out["looking"] == label
-    assert out["distracted"] is False
-    out, _ = run(mon, t1, 1.5, lambda: fake_face(yaw=yaw))
+    assert out["distracted"] is False and out["level"] == "ok"   # a short glance alone: no alarm
+    out, _ = run(mon, t1, 17.5, lambda: fake_face(yaw=yaw))
     assert out["looking"] == label
-    assert out["off_road_s"] >= 2.0
+    assert out["off_road_total_s"] >= 20.0
     assert out["distracted"] is True
     assert out["level"] == "danger"
     assert any(r.startswith(f"looking {label}") for r in out["reasons"])
 
 
 def test_head_back_to_road_resets():
-    mon, out, t = calibrated()
+    mon, out, t = calibrated(distracted_total_s=2.0)
     out, t = run(mon, t, 3.0, lambda: fake_face(yaw=40.0))
     assert out["distracted"]
-    out, _ = run(mon, t, 0.2, lambda: fake_face())
+    out, t = run(mon, t, 0.2, lambda: fake_face())
     assert out["looking"] == "road" and out["off_road_s"] == 0
-    assert out["distracted"] is False
+    out, _ = run(mon, t, 2.5, lambda: fake_face())
+    assert out["distracted"] is False and out["level"] != "danger"
+    assert out["off_road_total_s"] >= 2.9                        # the window still remembers it
+
+
+def test_off_road_glances_add_up_over_the_window():
+    mon, out, t = calibrated()
+    for _ in range(7):                                           # 7 x 3 s glances, 2 s back on the road
+        out, t = run(mon, t, 3.0, lambda: fake_face(pitch=30.0))
+        if out["distracted"]:
+            break
+        out, t = run(mon, t, 2.0, lambda: fake_face())
+    assert out["distracted"] is True and out["level"] == "danger"
+    assert out["off_road_s"] <= 3.0                              # no single glance was long
+    assert any(r.startswith("eyes off road") for r in out["reasons"])
+
+
+def test_off_road_total_leaves_the_window():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 15.0, lambda: fake_face(yaw=40.0))
+    out, t = run(mon, t, 61.0, lambda: fake_face())
+    assert out["off_road_total_s"] == 0 and out["level"] == "ok"
 
 
 def test_iris_gaze_moves_label():
@@ -127,7 +151,7 @@ def test_iris_gaze_moves_label():
 
 
 def test_pitch_down():
-    mon, out, t = calibrated()
+    mon, out, t = calibrated(distracted_total_s=2.0)
     out, _ = run(mon, t, 2.5, lambda: fake_face(pitch=30.0))
     assert out["looking"] == "down"
     assert out["distracted"] is True
@@ -141,7 +165,23 @@ def test_phone_reason():
     out = mon.update(fake_face(), t, phone=True)
     assert out["phone"] is True
     assert "phone in hand" in out["reasons"]
+    assert out["level"] == "caution"                            # seen: warning at once
+    out, t = run(mon, t, 9.0, lambda: fake_face(), phone=True)
+    assert out["level"] == "caution" and out["phone_s"] < 10
+    out, t = run(mon, t, 1.5, lambda: fake_face(), phone=True)
+    assert out["phone_s"] >= 10.0
     assert out["distraction"] >= 70 and out["level"] == "danger"
+
+
+def test_phone_episode_survives_a_short_dropout():
+    mon, out, t = calibrated()
+    out, t = run(mon, t, 6.0, lambda: fake_face(), phone=True)
+    out, t = run(mon, t, 1.0, lambda: fake_face())               # missed for 1 s
+    out, t = run(mon, t, 4.5, lambda: fake_face(), phone=True)
+    assert out["phone_s"] >= 10.0 and out["level"] == "danger"
+    out, t = run(mon, t, 3.0, lambda: fake_face())               # gone > 2 s: episode over
+    out = mon.update(fake_face(), t, phone=True)
+    assert out["phone_s"] == 0 and out["level"] == "caution"
 
 
 def test_yawn():
@@ -150,13 +190,13 @@ def test_yawn():
     assert out["yawning"] is False
     out, t = run(mon, t, 1.5, lambda: fake_face(mar=0.8))
     assert out["yawning"] is True and out["yawns_5min"] == 1
-    assert out["level"] in ("caution", "danger")
+    assert out["level"] == "ok" and out["tired"] is False       # one yawn is not fatigue
     out, _ = run(mon, t, 0.5, lambda: fake_face(blendshapes={"jawOpen": 0.1}))
     assert out["yawning"] is False and out["yawns_5min"] == 1
 
 
 def test_face_missing_goes_away_after_1s():
-    mon, out, t = calibrated()
+    mon, out, t = calibrated(distracted_total_s=2.0)
     out = mon.update(None, t + 0.5)
     assert out["face_present"] is False
     assert out["looking"] == "road" and out["off_road_s"] == 0
@@ -170,7 +210,9 @@ def test_face_missing_goes_away_after_1s():
     assert out["distracted"] is True
     assert any(r.startswith("face not visible") for r in out["reasons"])
     out = mon.update(fake_face(), t + 2.7)
-    assert out["looking"] == "road" and out["distracted"] is False
+    assert out["looking"] == "road"
+    out, _ = run(mon, t + 2.8, 2.5, lambda: fake_face())         # 2 s back on the road clears it
+    assert out["distracted"] is False
 
 
 def test_output_json_serialisable():
@@ -288,13 +330,32 @@ def test_tilted_head_mouth_is_not_a_yawn():
     assert out["yawns_5min"] == 0
 
 
-def test_yawn_score_fades():
+def test_more_than_six_yawns_in_5_min_is_tired():
     mon, out, t = calibrated()
-    out, t = run(mon, t, 1.6, lambda: fake_face(mar=0.8))
-    out, t = run(mon, t, 1.0, lambda: fake_face())
-    fresh = out["drowsiness"]
-    out, t = run(mon, t, 150.0, lambda: fake_face())
-    assert out["yawns_5min"] == 1 and out["drowsiness"] < fresh
+    for i in range(7):
+        out, t = run(mon, t, 2.0, lambda: fake_face(mar=0.8))
+        out, t = run(mon, t, 10.0, lambda: fake_face())
+        if i < 5:
+            assert out["tired"] is False and out["level"] == "ok"
+    assert out["yawns_5min"] == 7 and out["tired"] is True and out["level"] == "caution"
+    assert any(r.startswith("tired: 7 yawns") for r in out["reasons"])
+    out, t = run(mon, t, 300.0, lambda: fake_face())             # they leave the 5-min window
+    assert out["tired"] is False and out["level"] == "ok"
+
+
+def test_perclos_uses_5_min_window_and_waits_for_history():
+    mon, out, t = calibrated()
+    for _ in range(5):                                           # 2 s shut, 4 s open: ~33 %
+        out, t = run(mon, t, 1.9, lambda: fake_face(ear=0.05))
+        out, t = run(mon, t, 4.0, lambda: fake_face())
+    assert out["perclos"] > 0.15 and out["tired"] is False       # < 60 s of history: not judged yet
+    for _ in range(6):
+        out, t = run(mon, t, 1.9, lambda: fake_face(ear=0.05))
+        out, t = run(mon, t, 4.0, lambda: fake_face())
+    assert out["tired"] is True and out["level"] == "caution"
+    assert any(r.startswith("tired: eyes closed") for r in out["reasons"])
+    out, t = run(mon, t, 301.0, lambda: fake_face())
+    assert out["perclos"] < 0.01 and out["tired"] is False
 
 
 def test_hand_up_is_hand_off_wheel():
@@ -354,7 +415,7 @@ def test_head_drop_with_droopy_eyes_is_drowsiness(pitch):
 
 
 def test_looking_down_with_blinks_stays_distraction():
-    mon, out, t = calibrated()
+    mon, out, t = calibrated(distracted_total_s=2.0)
     for _ in range(3):
         out, t = run(mon, t, 0.9, lambda: fake_face(pitch=30.0))
         out, t = run(mon, t, 0.2, lambda: fake_face(pitch=30.0, ear=0.08))   # blink
@@ -383,7 +444,7 @@ def test_chin_drop_losing_face_is_nodding_not_away():
 
 
 def test_looking_down_alert_then_face_lost_is_away():
-    mon, out, t = calibrated()
+    mon, out, t = calibrated(distracted_total_s=2.0)
     out, t = run(mon, t, 0.5, lambda: fake_face(pitch=30.0))             # eyes open
     out, t = run(mon, t, 3.0, lambda: None)
     assert out["looking"] == "away" and out["distracted"] is True
@@ -462,7 +523,7 @@ def test_wink_closes_one_eye_only_without_alerting():
 
 def test_both_eyes_closed_labels_and_microsleep():
     mon, out, t = calibrated()
-    out, t = run(mon, t, 2.0, lambda: fake_face(ear=0.05))
+    out, t = run(mon, t, 5.2, lambda: fake_face(ear=0.05))
     assert out["eye_left_closed"] is True and out["eye_right_closed"] is True
     assert out["eyes_closed"] is True and out["microsleep"] is True
 
