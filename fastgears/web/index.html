@@ -261,8 +261,7 @@ function onState(s) {
   set('m-head', a.yaw != null ? `${Math.round(a.yaw)}° / ${Math.round(a.pitch)}°` : '–');
   const trust = (p.trust || {});
   const pulseStatus = pulseProgress(p);
-  set('m-pulse', p.bpm ? p.bpm + ' bpm' + (p.pulse_state === 'held' ? ` · held (${p.rejected})` : '')
-                       : pulseStatus);
+  set('m-pulse', p.bpm ? `${p.bpm} bpm` : pulseStatus);
   $('m-pulse').title = p.reason ? pulseStatus : '';
   set('m-trust', trust.label ? `${trust.label} ${trust.score}` : '–', trust.label === 'unreliable');
   const dr = s.driver || {};
@@ -334,11 +333,7 @@ function pulseProgress(p) {
     insufficient_regions: 'Semnal slab în regiunile feței',
     regions_disagree: 'Regiunile feței indică pulsuri diferite',
     face_not_visible: 'Fața nu este detectată', estimation_failed: 'Estimare indisponibilă',
-    settling: 'Mișcare a capului · ține capul nemișcat ~10 s',
   };
-  // a moving head is the usual cause of a weak signal: say what to do
-  if (p.motion != null && p.motion > 0.08 && p.reason !== 'collecting') return 'Capul se mișcă · ține capul nemișcat ~10 s';
-  if (p.reason === 'collecting' && p.window_s) return `Se măsoară ${p.window_s}/6 s · ține capul nemișcat`;
   return statuses[p.reason] || 'Se așteaptă o estimare';
 }
 

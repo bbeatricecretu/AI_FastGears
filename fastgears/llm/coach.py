@@ -157,7 +157,7 @@ def compact_state(state: dict) -> dict:
     out = {k: a.get(k) for k in keep if k in a}
     loc = local_message(state)
     out["primary_hazard"] = loc["reason"] if loc else None   # one topic per message
-    if p.get("bpm") and p.get("pulse_state") in ("tracking", "held"):
+    if p.get("bpm") and (p.get("trust") or {}).get("label") == "reliable":   # main_final pulse
         out["pulse_bpm"] = p["bpm"]
     event = (state.get("discomfort") or {}).get("event")
     if event:

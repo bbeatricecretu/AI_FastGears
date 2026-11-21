@@ -40,7 +40,6 @@ class Settings:
 
     # detectors
     enable_rppg: bool = _bool("ENABLE_RPPG", True)
-    rppg_compare: bool = _bool("RPPG_COMPARE", False)   # debug: also run main's box ROIs, as pulse_boxes
     enable_objects: bool = _bool("ENABLE_OBJECTS", True)
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
