@@ -27,6 +27,7 @@ def _camera(v: str):
 @dataclass
 class Settings:
     camera: int | str = field(default_factory=lambda: _camera(os.getenv("CAMERA", "0")))
+    camera_backend: str = os.getenv("CAMERA_BACKEND", "auto").strip().lower()
     width: int = int(os.getenv("CAMERA_WIDTH", "1280"))
     height: int = int(os.getenv("CAMERA_HEIGHT", "720"))
     mirror: bool = _bool("MIRROR", True)
@@ -44,6 +45,12 @@ class Settings:
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     driver_seat: str = os.getenv("DRIVER_SEAT", "left").lower()   # auto | left | right (as on screen)
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
+    discomfort_overlap_s: float = float(os.getenv("DISCOMFORT_OVERLAP_S", "0.3"))
+    enable_rgb: bool = _bool("ENABLE_RGB", False)
+    rgb_reference: str = os.getenv("RGB_REFERENCE", "")
+    rgb_overlay: bool = _bool("RGB_OVERLAY", False)
+    rgb_calibration_s: str = os.getenv("RGB_CALIBRATION_S", "5")
+    rgb_persistence_s: str = os.getenv("RGB_PERSISTENCE_S", "1")
 
     # LLM
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()   # gemini | anthropic | none

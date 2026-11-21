@@ -13,9 +13,14 @@ log = logging.getLogger("camera")
 
 
 class Camera:
-    def __init__(self, source: int | str = 0, width: int = 1280, height: int = 720, mirror: bool = True):
+    def __init__(self, source: int | str = 0, width: int = 1280, height: int = 720,
+                 mirror: bool = True, backend: str = "auto"):
         self.source, self.width, self.height, self.mirror = source, width, height, mirror
+        if backend not in ("auto", "dshow", "msmf"):
+            raise ValueError(f"Invalid camera backend: {backend}")
+        self.backend = backend
         self._frame: np.ndarray | None = None
+        self._frame_t: float | None = None
         self._seq = 0
         self._cond = threading.Condition()
         self._stop = threading.Event()
@@ -31,7 +36,10 @@ class Camera:
         self._stop.set()
 
     def _open(self) -> cv2.VideoCapture:
-        if isinstance(self.source, int) and platform.system() == "Windows":
+        if self.backend != "auto" and isinstance(self.source, int):
+            api = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}[self.backend]
+            cap = cv2.VideoCapture(self.source, api)
+        elif isinstance(self.source, int) and platform.system() == "Windows":
             cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)   # opens much faster than MSMF
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.source)
@@ -54,12 +62,13 @@ class Camera:
                 time.sleep(2)
                 continue
             self.connected = True
-            log.info("camera %r open %dx%d", self.source,
+            log.info("camera %r open via %s at %dx%d", self.source, cap.getBackendName(),
                      int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
             file_dt = 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 30) if is_file else 0
             n, t0 = 0, time.monotonic()
             while not self._stop.is_set():
                 ok, frame = cap.read()
+                captured_at = time.monotonic()
                 if not ok:
                     if is_file:                       # loop a replay file
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -69,6 +78,7 @@ class Camera:
                     frame = cv2.flip(frame, 1)
                 with self._cond:
                     self._frame, self._seq = frame, self._seq + 1
+                    self._frame_t = captured_at
                     self._cond.notify_all()
                 n += 1
                 if time.monotonic() - t0 >= 2:
@@ -82,6 +92,11 @@ class Camera:
 
     def read(self, last_seq: int = -1, timeout: float = 1.0) -> tuple[int, np.ndarray | None]:
         """Block until a frame newer than last_seq arrives; returns (seq, frame)."""
+        seq, frame, _ = self.read_timed(last_seq, timeout)
+        return seq, frame
+
+    def read_timed(self, last_seq: int = -1, timeout: float = 1.0) -> tuple[int, np.ndarray | None, float | None]:
+        """Return the latest frame with its monotonic arrival time at the capture thread."""
         with self._cond:
             self._cond.wait_for(lambda: self._seq != last_seq or self._stop.is_set(), timeout=timeout)
-            return self._seq, self._frame
+            return self._seq, self._frame, self._frame_t

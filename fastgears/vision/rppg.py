@@ -1,16 +1,15 @@
 """Remote photoplethysmography (rPPG): heart rate from one webcam.
 
 Ported from afferent-junction2026 jetson/vision/rppg.py (validated there against a
-finger pulse sensor: mean absolute difference 1.8 BPM). The algorithmic core is kept
-verbatim: POS (Wang et al. 2017, "Algorithmic Principles of Remote PPG") over the last
+finger pulse sensor: mean absolute difference 1.8 BPM). The estimator uses
+POS (Wang et al. 2017, "Algorithmic Principles of Remote PPG") over the last
 10 s of forehead + cheek skin colour, dominant frequency in 45-180 BPM, plus the
 per-region trust score. Dropped from the original: YOLO-pose face locator, second
-camera / own capture, multi-camera fusion, GStreamer/JPEG feed path.
+camera / own capture, multi-camera fusion, GStreamer/JPEG feed path. This
+version combines spectra from individually tracked and qualified regions.
 
-Each heartbeat changes skin colour very slightly (mostly green). The caller supplies the
-face position from MediaPipe Face Landmarker as (cx, cy, d): midpoint between the eyes in
-frame pixels and the inter-eye distance in pixels; this module averages the skin pixels
-of three ROIs relative to that point at SAMPLE_HZ.
+Each heartbeat changes skin colour very slightly (mostly green). The live
+caller supplies MediaPipe landmarks and the eye centre and scale for motion.
 
 Honest requirements (from the source README):
   * the face must be still, 0.5-1 m from the camera, lit by steady white light;
@@ -30,9 +29,14 @@ import subprocess
 import threading
 import time
 from collections import deque
+from itertools import combinations
+from statistics import median
 
 import cv2
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+from .face import PULSE_REGIONS, landmark_region
 
 logger = logging.getLogger("rppg")
 
@@ -40,20 +44,27 @@ SAMPLE_HZ = 20.0
 WINDOW_S = 10.0
 MIN_WINDOW_S = 6.0
 BAND = (0.75, 3.0)          # 45-180 BPM
-FACE_LOST_S = 2.0           # drop the face after this long without a detection
-FACE_EMA = 0.3              # source smoothed at each 0.5 s detection with this weight
-FACE_EMA_PERIOD_S = 0.5
 ESTIMATE_EVERY_S = 1.0
-# Output filter (FastGears, on top of the validated estimate): head movement shifts the ROIs
+MIN_SAMPLE_FRACTION = 0.6
+PROVISIONAL_SAMPLE_FRACTION = 0.4
+MAX_GAP_S = 0.35
+MIN_REGION_COVERAGE = 0.85
+MIN_REGION_SNR_DB = 0.0
+REGION_AGREEMENT_BPM = 6.0
+SECONDARY_MIN_SNR_DB = -3.5
+SECONDARY_MIN_POWER = 0.42
+MAX_TRACK_AGE_S = 5.0
+REGION_RASTER_SIDE = 40
+# Output filter (from main, on top of the regional estimate): head movement shifts the ROIs
 # over the skin and produces a fake peak, so a moving window must not change the reading.
 MOTION_GATE = 0.08          # window motion (eye-midpoint spread / eye distance) above this: reject
 SNR_GATE_DB = 0.0           # below 0 dB the pulse is weaker than the noise: reject
-TRACK_BPM = 12              # prefer a spectral peak within +-12 BPM of the shown pulse...
-TRACK_MIN_RATIO = 0.5       # ...if it has at least half the power of the global peak
 SLEW_BPM_PER_S = 3.0        # the shown pulse changes at most this fast (a real heart rate is smooth)
 HOLD_MAX_S = 12.0           # keep the last good value this long while rejected, then "measuring"
-STEP_GATE = 0.04            # eye-midpoint jump between two samples (x eye distance): a movement;
-                            # the window restarts after it so the pulse returns after MIN_WINDOW_S still
+STEP_GATE = 0.25            # eye-midpoint displacement within STEP_SPAN_S (x eye distance): a posture
+STEP_SPAN_S = 0.5           # jump; the window restarts after it so the pulse returns after MIN_WINDOW_S.
+                            # Measured over 0.5 s, not per sample: landmark ROIs follow the skin and
+                            # _remove_motion cancels smooth sway, only a jump corrupts the window.
 
 # forehead + two cheeks, relative to (cx, cy) in units of eye distance d
 BOXES = [(-0.55, -1.10, 0.55, -0.45),   # forehead, above the eyes
@@ -127,19 +138,21 @@ def lock_camera(device):
     logger.info("%s: locked %s", device, ", ".join(ok) or "nothing")
 
 
-# ── algorithmic core (verbatim from the validated source) ─────────────
+# ── signal processing ───────────────────────────────────────────────
 def pos_spectrum(ts, rgb, sample_hz=SAMPLE_HZ):
     """POS on unevenly sampled RGB means -> (band freqs, band power, f0 Hz, SNR dB)."""
     grid = np.arange(ts[0], ts[-1], 1.0 / sample_hz)            # uniform resampling
     c = np.stack([np.interp(grid, ts, rgb[:, k]) for k in range(3)], axis=1)
     n, L = len(c), int(1.6 * sample_hz)
     h = np.zeros(n)
-    P = np.array([[0, 1, -1], [-2, 1, 1]])
-    for i in range(n - L + 1):                                   # per 1.6 s window
-        cn = c[i:i + L] / (c[i:i + L].mean(axis=0) + 1e-9)       # temporal normalisation
-        s = P @ cn.T                                             # plane orthogonal to skin tone
-        hh = s[0] + (s[0].std() / (s[1].std() + 1e-9)) * s[1]
-        h[i:i + L] += hh - hh.mean()
+    windows = sliding_window_view(c, L, axis=0)                   # each 1.6 s window
+    red, green, blue = (windows / (windows.mean(axis=2, keepdims=True) + 1e-9)).transpose(1, 0, 2)
+    s0, s1 = green - blue, -2 * red + green + blue              # plane orthogonal to skin tone
+    scale = s0.std(axis=1) / (s1.std(axis=1) + 1e-9)
+    pulses = s0 + scale[:, None] * s1
+    pulses -= pulses.mean(axis=1, keepdims=True)
+    for offset in range(L):
+        h[offset:offset + len(pulses)] += pulses[:, offset]
     k = int(sample_hz)                                           # detrend: 1 s moving average
     h = h - np.convolve(h, np.ones(k) / k, mode="same")
     h = (h - h.mean()) * np.hanning(n)
@@ -149,9 +162,100 @@ def pos_spectrum(ts, rgb, sample_hz=SAMPLE_HZ):
     band = (freqs >= BAND[0]) & (freqs <= BAND[1])
     fb, sb = freqs[band], spec[band]
     f0 = fb[int(np.argmax(sb))]
-    sig = (np.abs(fb - f0) <= 0.1) | (np.abs(fb - 2 * f0) <= 0.1)
-    snr = 10 * np.log10(sb[sig].sum() / (sb[~sig].sum() + 1e-12))
-    return fb, sb, float(f0), float(snr)
+    return fb, sb, float(f0), _spectral_snr(fb, sb, f0)
+
+
+def _spectral_snr(freqs, power, peak):
+    signal = (np.abs(freqs - peak) <= 0.1) | (np.abs(freqs - 2 * peak) <= 0.1)
+    return float(10 * np.log10((power[signal].sum() + 1e-12) / (power[~signal].sum() + 1e-12)))
+
+
+def _remove_motion(rgb, geometry):
+    """Remove colour variation explained by tracked translation and face scale."""
+    regressors = (geometry - geometry.mean(axis=0)) / max(geometry[:, 2].mean(), 1.0)
+    if np.max(regressors.std(axis=0)) < 0.004:
+        return rgb
+    # Ridge limits subtraction when a geometry predictor is nearly constant.
+    regularization = len(rgb) * 0.004**2
+    matrix = regressors.T @ regressors + regularization * np.eye(regressors.shape[1])
+    coefficients = np.linalg.solve(matrix, regressors.T @ (rgb - rgb.mean(axis=0)))
+    return rgb - regressors @ coefficients
+
+
+def _regional_peaks(freqs, power, peak, snr):
+    if snr >= MIN_REGION_SNR_DB:
+        yield peak, snr, False
+    # A shared secondary local maximum can survive a stronger, unrelated
+    # artifact in each region. Compare power with that region's own maximum.
+    local = np.flatnonzero((power[1:-1] > power[:-2]) & (power[1:-1] >= power[2:])) + 1
+    local = local[np.argsort(power[local])[-2:]]
+    for i in local:
+        if abs(freqs[i] - peak) * 60 <= REGION_AGREEMENT_BPM or power[i] < SECONDARY_MIN_POWER * power.max():
+            continue
+        secondary_snr = _spectral_snr(freqs, power, freqs[i])
+        if secondary_snr >= SECONDARY_MIN_SNR_DB:
+            yield freqs[i], secondary_snr, True
+
+
+def _tracked_peak(freqs, power, history):
+    strongest = int(np.argmax(power))
+    if not history:
+        return freqs[strongest]
+    local = np.flatnonzero((power[1:-1] > power[:-2]) & (power[1:-1] >= power[2:])) + 1
+    nearby = local[np.abs(freqs[local] * 60 - np.median(history[-3:])) <= 7]
+    if len(nearby):
+        peak = nearby[np.argmax(power[nearby])]
+        if power[peak] >= 0.60 * power[strongest]:
+            return freqs[peak]
+    return freqs[strongest]
+
+
+def _display_provisional_bpm(recent):
+    if len(recent) == 2 and abs(recent[-1] - recent[0]) > REGION_AGREEMENT_BPM:
+        return recent[0]
+    return round(median(recent))
+
+
+def _region_pixels(frame, polygon):
+    """Sample an in-frame polygon on a fixed, subpixel-aligned grid."""
+    height, width = frame.shape[:2]
+    if not np.isfinite(polygon).all():
+        return None
+    lo, hi = polygon.min(axis=0), polygon.max(axis=0)
+    x0, y0 = np.floor(lo).astype(int)
+    x1, y1 = np.ceil(hi).astype(int) + 1
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        return None
+    if np.min(hi - lo) < 5 or cv2.contourArea(cv2.convexHull(polygon.astype(np.float32))) < 35:
+        return None
+    side = REGION_RASTER_SIDE
+    step_x, step_y = (hi - lo) / (side - 1)
+    transform = np.array([[step_x, 0, lo[0]], [0, step_y, lo[1]]], dtype=np.float32)
+    crop = cv2.warpAffine(frame, transform, (side, side), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+    mask = np.zeros((side, side), np.uint8)
+    points = np.rint((polygon - lo) / (step_x, step_y)).astype(np.int32)
+    cv2.fillConvexPoly(mask, cv2.convexHull(points), 1)
+    pixels = crop[mask != 0]
+    return (pixels, (x0, y0, x1, y1)) if len(pixels) else None
+
+
+def _region_color(pixels):
+    """Trim local shadows and highlights without a fixed skin colour range."""
+    y = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb)[:, 0, 0]
+    lo, hi = np.percentile(y, (15, 90))
+    clipped = pixels.max(axis=1) >= 250
+    # Bright, nearly neutral pixels are commonly specular reflections.
+    glare = (y >= 215) & (np.ptp(pixels, axis=1) <= 20)
+    valid = (y >= lo) & (y <= hi) & ~clipped & ~glare
+    usable = valid.sum() >= max(35, 0.45 * len(pixels)) and 35 <= np.median(y) <= 225
+    rgb = pixels[valid, ::-1].mean(axis=0) if usable else (np.nan,) * 3
+    return rgb, int(valid.sum()), float(y.mean()), float(clipped.mean())
+
+
+def _pulse_result(**values):
+    return {"bpm": None, "snr": None, "window_s": 0.0, "fps": None,
+            "max_gap_s": None, "regions_bpm": [], "region_quality": {},
+            "motion": None, "trust": None, "reason": None, "method": None, **values}
 
 
 def trust_score(snr, region_bpms, bpm, history, motion, luma, clipped):
@@ -207,19 +311,20 @@ class RPPG:
         self._lock = threading.Lock()          # guards samples / face / rois / diag / result
         self._est_lock = threading.Lock()      # one recompute at a time
         self._samples: deque = deque(maxlen=int(self.sample_hz * 20))
-        self._face = None            # (cx, cy, d) smoothed
-        self._face_seen = None       # t of last detection
-        self._face_t = None          # t of last smoothing step
+        self._face = None            # (cx, cy, d) for the current frame
+        self._last_frame_t = None
         self._next_t = None          # next sample time (caller's clock)
         self._rois: list[tuple[int, int, int, int]] = []
         self._diag: dict = {}
         self._history: deque = deque(maxlen=8)
-        self._accepted: deque = deque(maxlen=3)   # last accepted window estimates
+        self._provisional_bpms: deque = deque(maxlen=3)
+        self._last_consensus_t = None
+        self._accepted: deque = deque(maxlen=3)   # last accepted consensus estimates
         self._shown: float | None = None          # filtered pulse shown to the user
         self._shown_t = self._last_ok = 0.0
-        self._result = {"bpm": None, "snr": None, "window_s": 0.0, "fps": None, "regions_bpm": [],
-                        "motion": None, "trust": None}
+        self._result = _pulse_result(reason="face_not_visible")
         self._est_at = None          # wall-clock (monotonic) of last recompute
+        self._est_sample_t = None
         self._gen = 0                # sample-buffer generation (bumped on gain change)
         # face-gain control (Linux + v4l2-ctl + device only)
         self._v4l2 = bool(device) and v4l2_available()
@@ -240,74 +345,83 @@ class RPPG:
             logger.warning("rPPG camera lock failed: %s", e)
 
     # ── per frame ─────────────────────────────────────────────────────
-    def update(self, frame_bgr: np.ndarray, face: tuple[float, float, float] | None, t: float) -> None:
-        # face tracking runs every frame (cheap); sampling is throttled to sample_hz
+    def update(self, frame_bgr: np.ndarray | None, face: tuple[float, float, float] | None,
+               t: float, *, landmarks: np.ndarray | None = None) -> None:
         with self._lock:
-            if face is not None and face[2] >= 1:
-                face = tuple(float(v) for v in face)
-                if self._face is not None and self._face_t is not None:
-                    # smooth so ROI jitter doesn't modulate the signal: the source applied
-                    # 0.3 EMA per 0.5 s detection; same time constant at any frame rate
-                    a = 1.0 - (1.0 - FACE_EMA) ** (max(t - self._face_t, 0.0) / FACE_EMA_PERIOD_S)
-                    face = tuple(p + a * (f - p) for p, f in zip(self._face, face))
-                self._face, self._face_seen, self._face_t = face, t, t
-            elif self._face is not None and (self._face_seen is None or t - self._face_seen > FACE_LOST_S):
-                self._face = None
-                self._face_t = None
+            if self._last_frame_t is not None and t <= self._last_frame_t:
+                return
+            self._last_frame_t = t
+            if face is None or frame_bgr is None or not np.isfinite(face).all() or face[2] < 1:
+                if self._face is not None:
+                    self._gen += 1
+                    self._face = None
+                    self._rois = []
+                    self._result = _pulse_result(reason="face_not_visible")
+                    self._est_at = None
+                if self._samples and t - self._samples[-1][0] > MAX_GAP_S:
+                    self._reset_window("face_not_visible")
+                return
+            self._face = face
             if self._next_t is not None and t < self._next_t:
                 return
+            if self._samples and t - self._samples[-1][0] > MAX_GAP_S:
+                self._reset_window("sampling_gap")
+            if self._result["reason"] == "face_not_visible":
+                self._result = _pulse_result(reason="collecting")
             period = 1.0 / self.sample_hz
             self._next_t = t + period if self._next_t is None else max(self._next_t + period, t)
-            if self._face is None or frame_bgr is None:
-                self._rois = []
-                return
-            cx, cy, d = self._face
-        sample = self._sample(frame_bgr, cx, cy, d, t)
-        if sample is not None and self._v4l2:
-            self._maybe_gain(sample[1], sample[2], t)
+            generation = self._gen
+        exposure = self._sample(frame_bgr, face, t, landmarks, generation)
+        if exposure is not None and self._v4l2:
+            self._maybe_gain(*exposure, t)
 
-    def _sample(self, frame, cx, cy, d, t):
-        H, W = frame.shape[:2]
-        rois, rects = [], []
-        for x0, y0, x1, y1 in BOXES:
-            a, b = int(max(0, cx + x0 * d)), int(min(W, cx + x1 * d))
-            c, e = int(max(0, cy + y0 * d)), int(min(H, cy + y1 * d))
-            if b > a and e > c:
-                rois.append(frame[c:e, a:b]); rects.append((a, c, b, e))
-        if not rois:
-            with self._lock:
-                self._rois = []
-            return None
-        pix = np.concatenate([r.reshape(-1, 3) for r in rois], axis=0)
-        ycc = cv2.cvtColor(pix.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb).reshape(-1, 3)
-        # Skin filter that works under any light colour (a fixed YCrCb skin box rejected
-        # ~100 % of the face under purple stage light): drop the darkest 15 % (hair, brows,
-        # shadows) and brightest 5 % (specular highlights, clipped pixels) by luma.
-        y = ycc[:, 0].astype(np.float32)
-        lo, hi = np.percentile(y, [15, 95])
-        skin = (y >= lo) & (y <= hi) & (pix.max(axis=1) < 250)
-        n_skin = int(skin.sum())
-        luma = float(ycc[:, 0].mean())
-        clipped = float((pix.max(axis=1) >= 250).mean())
-        allpix = pix[skin] if n_skin > 50 else pix
-        b, g, r = allpix.mean(axis=0)
-        # the same filter per region: forehead / cheek / cheek are three independent
-        # measurements of one pulse, which is what the trust score checks
-        regions = []
-        for roi in rois:
-            rp = roi.reshape(-1, 3)
-            ry = cv2.cvtColor(rp.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb).reshape(-1, 3)[:, 0]
-            m = (ry >= lo) & (ry <= hi) & (rp.max(axis=1) < 250)
-            rb, rg, rr = (rp[m] if m.sum() > 30 else rp).mean(axis=0)
-            regions += [rr, rg, rb]
-        regions += [np.nan] * (9 - len(regions))
+    def _reset_window(self, reason):
+        """Reset sampling state with the buffer lock held."""
+        self._gen += 1
+        self._samples.clear()
+        self._history.clear()
+        self._provisional_bpms.clear()
+        self._last_consensus_t = None
+        # the shown pulse survives a window reset: _filter holds it for HOLD_MAX_S
+        self._next_t = self._est_at = self._est_sample_t = None
+        self._result = _pulse_result(reason=reason)
+
+    def _sample(self, frame, face, t, landmarks, generation):
+        cx, cy, d = face
+        if landmarks is None:
+            # Keep compatibility with callers that only have eye geometry.
+            polygons = [np.asarray(((cx + a*d, cy + b*d), (cx + c*d, cy + b*d),
+                                    (cx + c*d, cy + e*d), (cx + a*d, cy + e*d)))
+                        for a, b, c, e in BOXES]
+        else:
+            polygons = [landmark_region(landmarks, name) for name in PULSE_REGIONS]
+        regions, rects, counts, exposure = [], [], [], []
+        for polygon in polygons:
+            measurement = _region_pixels(frame, polygon) if polygon is not None else None
+            if measurement is None:
+                regions.extend((np.nan,) * 3)
+                counts.append(0)
+                continue
+            pixels, rect = measurement
+            rgb, selected, luma, clipped = _region_color(pixels)
+            regions.extend(rgb)
+            counts.append(selected)
+            exposure.append((len(pixels), luma, clipped))
+            if np.isfinite(rgb).all():
+                rects.append(rect)
+        n_pixels = sum(n for n, _, _ in exposure)
+        luma = sum(n * y for n, y, _ in exposure) / n_pixels if n_pixels else 0.0
+        clipped = sum(n * c for n, _, c in exposure) / n_pixels if n_pixels else 0.0
+        height, width = frame.shape[:2]
         with self._lock:
+            if generation != self._gen:
+                return None
             self._rois = rects
-            self._samples.append((t, r, g, b, cx, cy, d, *regions))
-            self._diag = {"skin_px": n_skin, "roi_px": int(len(skin)), "brightness": round(luma),
-                          "clipped": round(clipped, 3), "eye_dist_px": round(d), "frame": f"{W}x{H}",
-                          "gain": self._gain}
-        return t, luma, clipped
+            self._samples.append((t, cx, cy, d, *regions))
+            self._diag = {"skin_px": sum(counts), "roi_px": n_pixels, "brightness": round(luma),
+                          "clipped": round(clipped, 3), "eye_dist_px": round(d), "frame": f"{width}x{height}",
+                          "gain": self._gain, "region_skin_px": dict(zip(PULSE_REGIONS, counts))}
+        return (luma, clipped) if n_pixels else None
 
     # ── face exposure via v4l2 gain (Linux, optional) ──────────────────
     def _maybe_gain(self, luma, clipped, t):
@@ -338,56 +452,116 @@ class RPPG:
                 logger.info("rPPG: face luma %.0f clipped %.1f%% -> gain %d", luma, clipped * 100, new)
                 self._gain = new
                 with self._lock:
-                    self._samples.clear()
-                    self._history.clear()
+                    self._reset_window("collecting")
         except Exception as e:
             logger.debug("rPPG gain control: %s", e)
         finally:
             self._gain_busy = False
 
     # ── estimate ──────────────────────────────────────────────────────
-    def _estimate(self, pts, diag):
+    def _estimate(self, pts, diag, history=()):
         if len(pts) < 2:
-            return {"bpm": None, "snr": None, "window_s": 0.0}
+            return _pulse_result(reason="collecting")
         t_end = pts[-1][0]
-        pts = [p for p in pts if p[0] >= t_end - WINDOW_S]
-        arr = np.array(pts, dtype=float)
-        step = np.hypot(np.diff(arr[:, 4]), np.diff(arr[:, 5])) / np.maximum(arr[1:, 6], 1.0)
+        arr = np.array([p for p in pts if p[0] >= t_end - WINDOW_S], dtype=float)
+        # a sudden head jump: keep only what came after the last movement (main's step gate)
+        back = np.searchsorted(arr[:, 0], arr[:, 0] - STEP_SPAN_S)
+        step = np.hypot(arr[:, 1] - arr[back, 1], arr[:, 2] - arr[back, 2]) / np.maximum(arr[:, 3], 1.0)
         moved = np.nonzero(step > STEP_GATE)[0]
         settling = len(moved) > 0
-        if settling:                              # keep only what came after the last movement
-            arr = arr[moved[-1] + 1:]
+        if settling:
+            arr = arr[moved[-1]:]
         span = float(arr[-1, 0] - arr[0, 0]) if len(arr) > 1 else 0.0
+        base = _pulse_result(window_s=round(span, 1))
         if span < MIN_WINDOW_S:
-            return {"bpm": None, "snr": None, "window_s": round(span, 1), "settling": settling}
+            return {**base, "reason": "settling" if settling else "collecting"}
         pts = arr
         ts = arr[:, 0]
-        fb, sb, f0, snr = pos_spectrum(ts, arr[:, 1:4], self.sample_hz)
-        bpm = round(f0 * 60)
-        shown = self._shown
-        if shown is not None:                     # peak tracking: stay on the heart's peak
-            near = np.abs(fb * 60 - shown) <= TRACK_BPM
-            if near.any():
-                i = int(np.argmax(np.where(near, sb, -1.0)))
-                if sb[i] >= TRACK_MIN_RATIO * sb.max():
-                    bpm = round(fb[i] * 60)
-        region_bpms = []
-        for k in range(3):
-            rgb = arr[:, 7 + 3 * k:10 + 3 * k]
-            if np.isnan(rgb).any():
-                region_bpms.append(None)
+        hz = (len(pts) - 1) / span
+        max_gap = float(np.diff(ts).max())
+        base.update(fps=round(hz, 1), max_gap_s=round(max_gap, 3))
+        if hz < max(self.sample_hz * PROVISIONAL_SAMPLE_FRACTION, 2.5 * BAND[1]) or max_gap > MAX_GAP_S:
+            return {**base, "reason": "insufficient_samples"}
+        low_sample_rate = hz < self.sample_hz * MIN_SAMPLE_FRACTION
+
+        # Keep the same FFT grid per region. Only bridge short gaps within a
+        # region with good coverage of the current capture window.
+        region_bpms, region_quality, candidates, signals = [], {}, [], []
+        for k, name in enumerate(PULSE_REGIONS):
+            rgb = arr[:, 4 + 3 * k:7 + 3 * k]
+            valid = np.isfinite(rgb).all(axis=1)
+            coverage = float(valid.mean())
+            quality = {"coverage": round(coverage, 2), "snr": None, "used": False}
+            region_quality[name] = quality
+            region_bpms.append(None)
+            valid_ts = ts[valid]
+            if (coverage < MIN_REGION_COVERAGE or len(valid_ts) < 2
+                    or np.diff(valid_ts).max() > MAX_GAP_S
+                    or valid_ts[0] - ts[0] > MAX_GAP_S / 2
+                    or ts[-1] - valid_ts[-1] > MAX_GAP_S / 2):
                 continue
-            region_bpms.append(round(pos_spectrum(ts, rgb, self.sample_hz)[2] * 60))
-        cxs, cys, ds = arr[:, 4], arr[:, 5], arr[:, 6]
+            filled = rgb if valid.all() else np.column_stack([np.interp(ts, valid_ts, c[valid]) for c in rgb.T])
+            filled = _remove_motion(filled, arr[:, 1:4])
+            freqs, power, peak, snr = pos_spectrum(ts, filled, self.sample_hz)
+            energy = power.sum()
+            if energy <= 1e-12 or not np.isfinite(snr):
+                continue
+            region_bpms[k] = round(peak * 60)
+            quality["snr"] = round(snr, 1)
+            signals.append(filled)
+            for frequency, strength, secondary in _regional_peaks(freqs, power, peak, snr):
+                weight = coverage * (1 + np.clip(strength, 0, 8))
+                candidates.append((name, frequency, weight, secondary, power / energy))
+
+        base.update(regions_bpm=region_bpms, region_quality=region_quality)
+        groups = [group for n in (2, 3) for group in combinations(candidates, n)
+                  if len({item[0] for item in group}) == n
+                  and np.ptp([item[1] for item in group]) * 60 <= REGION_AGREEMENT_BPM]
+        method = "regional_consensus"
+        if groups and not low_sample_rate:
+            group = max(groups, key=lambda items: (len(items), sum(not item[3] for item in items),
+                                                   sum(item[2] for item in items)))
+            names, peaks, weights, secondary, spectra = zip(*group)
+            for name, selected_peak in zip(names, peaks):
+                region_quality[name]["used"] = True
+                region_quality[name]["selected_bpm"] = round(selected_peak * 60)
+            power = np.average(spectra, axis=0, weights=weights)
+            centre = np.average(peaks, weights=weights)
+            nearby = np.flatnonzero(np.abs(freqs - centre) * 60 <= REGION_AGREEMENT_BPM)
+            peak = freqs[nearby[np.argmax(power[nearby])]]
+            snr = _spectral_snr(freqs, power, peak)
+        else:
+            if low_sample_rate:
+                base["reason"] = "low_sample_rate"
+            else:
+                enough_regions = len({item[0] for item in candidates}) >= 2
+                base["reason"] = "regions_disagree" if enough_regions else "insufficient_regions"
+            if not signals:
+                return base
+            # Retain an indicative reading from the pooled RGB, as in the
+            # previous estimator, while keeping it out of trusted consumers.
+            freqs, power, _, _ = pos_spectrum(ts, np.mean(signals, axis=0), self.sample_hz)
+            peak = _tracked_peak(freqs, power, history)
+            snr = _spectral_snr(freqs, power, peak)
+            if power.sum() <= 1e-12 or not np.isfinite(snr):
+                return base
+            method = "provisional"
+        bpm = round(peak * 60)
+        cxs, cys, ds = arr[:, 1], arr[:, 2], arr[:, 3]
         motion = float(np.sqrt(cxs.var() + cys.var()) / max(ds.mean(), 1.0))
-        with self._lock:
-            self._history.append(bpm)
-            history = list(self._history)
-        trust = trust_score(snr, region_bpms, bpm, history, motion,
+        trust_bpms = [quality.get("selected_bpm", previous)
+                      for quality, previous in zip(region_quality.values(), region_bpms)]
+        trust = trust_score(snr, trust_bpms, bpm, [*history, bpm], motion,
                             diag.get("brightness", 128), diag.get("clipped", 0.0))
-        return {"bpm": bpm, "snr": round(snr, 1), "window_s": round(span, 1),
-                "fps": round(len(pts) / span, 1), "regions_bpm": region_bpms,
-                "motion": round(motion, 3), "trust": trust}
+        if method == "provisional":
+            trust.update(score=min(trust["score"], 39), label="unreliable")
+            trust["reasons"].append("low sample rate" if low_sample_rate else "no qualified regional consensus")
+        elif any(secondary):
+            trust["reasons"].append("shared secondary spectral peak")
+            if trust["label"] == "reliable":
+                trust.update(score=min(trust["score"], 69), label="uncertain")
+        return {**base, "bpm": bpm, "snr": round(snr, 1), "motion": round(motion, 3),
+                "trust": trust, "method": method}
 
     def _refresh(self):
         now = time.monotonic()
@@ -396,38 +570,60 @@ class RPPG:
         if not self._est_lock.acquire(blocking=False):
             return                         # another thread is recomputing; serve the cache
         try:
-            self._est_at = now
             with self._lock:
-                pts = list(self._samples)
-                face = self._face is not None
+                if self._face is None or not self._samples:
+                    return
+                if self._samples[-1][0] == self._est_sample_t:
+                    return
+                self._est_at = now
+                generation, pts = self._gen, list(self._samples)
+                if self._last_consensus_t is None or pts[-1][0] - self._last_consensus_t > MAX_TRACK_AGE_S:
+                    self._history.clear()
+                history = list(self._history)
                 diag = dict(self._diag)
-            res = None
-            if face:
-                try:
-                    res = self._estimate(pts, diag)
-                except Exception as e:
-                    logger.warning("rPPG estimate failed: %s", e)
-            base = {"bpm": None, "snr": None, "window_s": 0.0, "fps": None, "regions_bpm": [],
-                    "motion": None, "trust": None}
-            out = {**base, **(res or {})}
-            out.update(self._filter(out, now))
+            try:
+                result = self._estimate(pts, diag, history)
+            except Exception as e:
+                logger.warning("rPPG estimate failed: %s", e)
+                result = _pulse_result(reason="estimation_failed")
             with self._lock:
-                self._result = out
+                if generation != self._gen:
+                    return
+                if self._result["reason"] == "sampling_gap" and result["reason"] == "collecting":
+                    result["reason"] = "sampling_gap"
+                if result["method"] == "regional_consensus":
+                    self._history.append(result["bpm"])
+                    self._last_consensus_t = pts[-1][0]
+                    self._provisional_bpms.clear()
+                    self._provisional_bpms.append(result["bpm"])
+                elif result["method"] == "provisional":
+                    result["raw_bpm"] = result["bpm"]
+                    self._provisional_bpms.append(result["raw_bpm"])
+                    result["bpm"] = _display_provisional_bpm(self._provisional_bpms)
+                else:
+                    self._provisional_bpms.clear()
+                result.update(self._filter(result, pts[-1][0]))
+                self._est_sample_t = pts[-1][0]
+                self._result = result
         finally:
             self._est_lock.release()
 
     def _filter(self, res: dict, now: float) -> dict:
-        """Gate by motion/SNR, median of the last accepted windows, slew-limit, hold."""
-        raw, snr, motion = res.get("bpm"), res.get("snr"), res.get("motion")
+        """Main's output filter: gate by consensus/motion/SNR, median of the last accepted
+        windows, slew-limit, hold the last good value. `now` is the sample clock."""
+        bpm, snr, motion = res.get("bpm"), res.get("snr"), res.get("motion")
+        raw = res.get("raw_bpm", bpm)
         why = None
-        if raw is None:
-            why = "settling after movement" if res.get("settling") else "no estimate"
+        if bpm is None:
+            why = "settling after movement" if res.get("reason") == "settling" else "no estimate"
+        elif res.get("method") != "regional_consensus":
+            why = "no regional consensus"
         elif motion is not None and motion > MOTION_GATE:
             why = "head moving"
         elif snr is None or snr < SNR_GATE_DB:
             why = "weak signal"
         if why is None:
-            self._accepted.append(raw)
+            self._accepted.append(bpm)
             target = float(np.median(self._accepted))
             if self._shown is None:
                 self._shown = target
@@ -441,16 +637,18 @@ class RPPG:
         else:
             self._shown = None
             self._accepted.clear()
-            state = "measuring"
-        return {"bpm": round(self._shown) if self._shown is not None else None, "bpm_raw": raw,
-                "pulse_state": state, "rejected": why}
+            # nothing trusted yet: pass the indicative (unreliable) reading through as-is
+            state = "provisional" if bpm is not None else "measuring"
+            return {"bpm": bpm, "bpm_raw": raw, "pulse_state": state, "rejected": why}
+        return {"bpm": round(self._shown), "bpm_raw": raw, "pulse_state": state, "rejected": why}
 
     # ── outputs ───────────────────────────────────────────────────────
     def status(self) -> dict:
         """Thread-safe; recomputes at most once per second (lazily), otherwise cached."""
         self._refresh()
         with self._lock:
-            return {**self._result, "face": self._face is not None, "diag": dict(self._diag)}
+            return {**self._result, "face": self._face is not None, "diag": dict(self._diag),
+                    "sampled_monotonic_s": self._est_sample_t if self._face is not None else None}
 
     def rois(self) -> list[tuple[int, int, int, int]]:
         with self._lock:

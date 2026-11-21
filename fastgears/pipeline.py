@@ -15,35 +15,44 @@ import numpy as np
 
 from .camera import Camera
 from .config import Settings
+from .vision.driver_signals import assess_driver
+from .vision.face import FACE_REGION_CONTOURS, PULSE_REGIONS, face_region_contours
 
 log = logging.getLogger("pipeline")
 
 COLORS = {"ok": (80, 200, 80), "caution": (0, 190, 255), "danger": (60, 60, 255)}
+PREVIEW_INTERVAL_S = 1 / 12
 
 
 class Pipeline:
     def __init__(self, settings: Settings, on_state: Callable[[dict], None] | None = None):
         self.s = settings
         self.on_state = on_state
-        self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror)
-        self.face = self.rppg = self.objects = self.hands = self.vision = None
+        self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror,
+                             backend=settings.camera_backend)
+        self.face = self.rppg = self.objects = self.hands = self.vision = self.rgb = None
         self._hands: list = []
         self._phone_xy: tuple[float, float] | None = None   # where the driver's phone was last seen
         self._frame_i = 0
         self.errors: dict[str, str] = {}
         self._load_detectors()
         self._jpeg: bytes | None = None
+        self._last_preview_t: float | None = None
         self._state: dict = {"attention": {}, "pulse": {}, "objects": [], "status": "starting"}
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
         self.proc_fps = 0.0
         self._stop = threading.Event()
+        self._recalibrate = threading.Event()
 
     def _load_detectors(self) -> None:
         from .vision.attention import AttentionMonitor
+        from .vision.discomfort import DiscomfortMonitor
         from .vision.driver import DriverLock
         self.attention = AttentionMonitor(calib_s=self.s.calib_s)
         self.driver = DriverLock(self.s.driver_seat)
+        self.discomfort = DiscomfortMonitor(calib_s=self.s.calib_s,
+                                            overlap_s=self.s.discomfort_overlap_s)
         try:
             from .vision.face import FaceTracker
             self.face = FaceTracker(models_dir=self.s.models_dir, num_faces=3)
@@ -82,6 +91,16 @@ class Pipeline:
                 except Exception as e:
                     self.errors["phone_vision"] = str(e)
                     log.exception("vision phone check unavailable")
+        if self.s.enable_rgb:
+            try:
+                from RGB import ColorMonitor, Thresholds, parse_reference
+                self.rgb = ColorMonitor(parse_reference(self.s.rgb_reference),
+                                        Thresholds(calibration_s=float(self.s.rgb_calibration_s),
+                                                   persistence_s=float(self.s.rgb_persistence_s)),
+                                        overlay=self.s.rgb_overlay)
+            except Exception as e:
+                self.errors["rgb"] = str(e)
+                log.exception("RGB analysis unavailable")
 
     def start(self) -> "Pipeline":
         self.camera.start()
@@ -93,9 +112,8 @@ class Pipeline:
         self.camera.stop()
 
     def recalibrate(self) -> None:
-        """Forget the driver lock and baseline: the face in the driver seat now is re-learned."""
-        self.driver.reset()
-        self.attention.reset_calibration()
+        """Forget the driver lock and baselines (applied on the pipeline thread, next frame)."""
+        self._recalibrate.set()
 
     # ── outputs ───────────────────────────────────────────────────────
     def state(self) -> dict:
@@ -110,12 +128,18 @@ class Pipeline:
         seq, n, t_fps = -1, 0, time.monotonic()
         last_ms = 0
         while not self._stop.is_set():
-            seq2, frame = self.camera.read(seq, timeout=1.0)
-            if frame is None or seq2 == seq:
+            if self._recalibrate.is_set():
+                self._recalibrate.clear()
+                self.driver.reset()
+                self.attention.reset_calibration()
+                self.discomfort.reset()
+                if self.rgb:
+                    self.rgb.reset()
+            seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
+            if frame is None or t is None or seq2 == seq:
                 self._publish_no_camera()
                 continue
             seq = seq2
-            t = time.monotonic()
             t_ms = max(int(t * 1000), last_ms + 1)          # MediaPipe VIDEO mode needs strictly increasing
             last_ms = t_ms
             try:
@@ -135,8 +159,11 @@ class Pipeline:
             except Exception:
                 log.exception("driver crop face pass failed")
         face = self.driver.update(faces, frame.shape, t)      # the driver only; others ignored
+        regions = face_region_contours(face, frame.shape)
+        rgb_state = self._rgb_state(frame, face, regions, t)
         if self.rppg:
-            self.rppg.update(frame, face.eyes if face else None, t)
+            self.rppg.update(frame, face.eyes if face else None, t,
+                             landmarks=face.landmarks_px if face else None)
         from .vision.hands import free_hands, hand_crop, on_open_palm
         self._frame_i += 1
         if self.hands and self._frame_i % 3 == 0:          # hands every 3rd frame (CPU)
@@ -177,37 +204,77 @@ class Pipeline:
             if not phone:
                 self._phone_xy = None
         att = self.attention.update(face, t, phone=phone, hand_up=both_off)
+        gestures = self.discomfort.update(face, t, frame.shape,
+                                          missing_reason="face_model_unavailable" if self.face is None else "face_not_visible")
         pulse = self.rppg.status() if self.rppg else {}
         state = {
             "t": time.time(),
             "uptime_s": round(t - self._t0, 1),
             "status": "running",
             "attention": att,
+            "discomfort": gestures,
+            "rgb": rgb_state,
+            "driver_signals": assess_driver(t, att, gestures, rgb_state, pulse),
             "pulse": _jsonable(pulse),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
             "driver": self.driver.state.as_dict(),
             "hands": {"seen": len(self._hands), "driver": len(mine_hands), "free": len(up), "phone_source": phone_src if phone else None,
                       "vision_calls": self.vision.calls if self.vision else 0},
+            "face_regions": regions,
             "camera": {"connected": self.camera.connected, "fps": round(self.camera.fps, 1),
                        "proc_fps": round(self.proc_fps, 1), "size": [frame.shape[1], frame.shape[0]]},
             "detectors": {"face": self.face is not None, "rppg": self.rppg is not None,
                           "hands": self.hands is not None, "phone_vision": self.vision is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
-        self._jpeg = self._draw(frame, face, dets, att, pulse, mine_hands, up)
+        preview_due = self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S
+        masks_current = (not self.rgb or not self.s.rgb_overlay or not rgb_state.get("regions")
+                         or rgb_state.get("sampled_monotonic_s") == t)
+        if preview_due and masks_current:
+            self._jpeg = self._draw(frame, face, dets, att, pulse, regions, mine_hands, up)
+            self._last_preview_t = t
         with self._lock:
             self._state = state
         if self.on_state:
             self.on_state(state)
 
     def _publish_no_camera(self) -> None:
+        t = time.monotonic()
+        gestures = self.discomfort.update(None, t, missing_reason="no_camera_frame")
+        if self.rppg:
+            self.rppg.update(None, None, t)
+        pulse = _jsonable(self.rppg.status()) if self.rppg else {}
+        rgb_state = self._rgb_state(None, None, {}, t)
+        prev = self._state.get("attention") or {}
+        # no frame: the AttentionMonitor is not fed (its timers stay as main calibrated them),
+        # but the dashboard must not keep showing a stale face / microsleep
+        attention = {"face_present": False, "calibrated": prev.get("calibrated", False), "level": "ok",
+                     "eyes_closed": False, "microsleep": False, "yawning": False, "phone": False,
+                     "looking": "-", "reasons": []}
         with self._lock:
             self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
+                           "attention": attention,
+                           "discomfort": gestures,
+                           "rgb": rgb_state,
+                           "driver_signals": {"finding": "camera_unavailable"},
+                           "pulse": pulse,
+                           "face_box": None,
+                           "face_regions": dict.fromkeys(FACE_REGION_CONTOURS),
                            "camera": {"connected": self.camera.connected}}
 
+    def _rgb_state(self, frame, face, regions, t):
+        if self.rgb:
+            try:
+                return self.rgb.update(frame, face, regions, t)
+            except Exception as e:
+                self.errors["rgb"] = str(e)
+                self.rgb = None
+                log.exception("RGB analysis stopped")
+        return {"enabled": True, "lighting": "analysis_unavailable"} if self.s.enable_rgb else {}
+
     # ── overlay (what the jury sees live) ─────────────────────────────
-    def _draw(self, frame, face, dets, att, pulse, hands=(), hands_free=()) -> bytes | None:
+    def _draw(self, frame, face, dets, att, pulse, regions=None, hands=(), hands_free=()) -> bytes | None:
         img = frame.copy()
         for b in self.driver.state.passenger_boxes:
             x0, y0, x1, y1 = map(int, b)
@@ -239,9 +306,15 @@ class Pipeline:
             for i in (33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380, 468, 473):
                 if i < len(lm):
                     cv2.circle(img, (int(lm[i][0]), int(lm[i][1])), 2, (255, 255, 0), -1)
-        if self.rppg:
-            for a, b, c2, d2 in self.rppg.rois():
-                cv2.rectangle(img, (a, b), (c2, d2), (0, 255, 0), 1)
+        region_colors = {name: (85, 225, 90) for name in PULSE_REGIONS}
+        region_colors["nose"] = (255, 210, 80)
+        for name, points in (regions or {}).items():
+            if points is not None:
+                contour = np.rint(points).astype(np.int32)
+                region_color = region_colors.get(name, (170, 90, 255))
+                cv2.polylines(img, [contour], True, region_color, 1, cv2.LINE_AA)
+        if self.rgb and self.s.rgb_overlay:
+            self.rgb.draw_masks(img)
         lines = [f"{level.upper()}  looking: {att.get('looking', '-')}",
                  f"EAR {att.get('ear') or 0:.2f}  PERCLOS {100 * (att.get('perclos') or 0):.0f}%  "
                  f"blinks/min {att.get('blinks_per_min') or 0:.0f}"]

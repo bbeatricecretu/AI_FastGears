@@ -127,10 +127,16 @@ Chrome or Edge (for voice), and a Gemini API key (free tier works).
 
 ### Windows (PowerShell)
 
+Pentru iPhone conectat prin USB pe Windows, vezi [ghidul de instalare și configurare Camo](README_CAMO.md).
+Pentru observațiile experimentale de culoare facială, vezi [ghidul modulului RGB](RGB/README.md).
+
+Panoul **Diagnosticele** afișează simultan pulsul estimat, semnele de somnolență, grimasa și schimbarea de culoare. Pornește cu `python -m fastgears --rgb` pentru a include culoarea și calibrează camera cu fața relaxată, în lumină stabilă.
+
+Tiparul de posibil preleșin cere reducerea activă a colorației obrajilor, o închidere a ochilor de cel puțin 0,5 s și un puls estimat sub 50 bpm cu semnal fiabil. Pragurile sunt euristici de demo. Detectorul de puls urmărește 45–180 bpm și folosește o fereastră de aproximativ 10 s, deci poate întârzia sau rata o scădere bruscă. Panoul oferă semnale orientative; validarea clinică a regulii rămâne deschisă.
+
 ```powershell
-git clone https://github.com/bbeatricecretu/AI_FastGears.git
+git clone --branch mara-test-rgb https://github.com/bbeatricecretu/AI_FastGears.git
 cd AI_FastGears
-git checkout vlad
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
@@ -141,8 +147,7 @@ notepad .env        # paste GEMINI_API_KEY=...
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/bbeatricecretu/AI_FastGears.git && cd AI_FastGears
-git checkout vlad
+git clone --branch mara-test-rgb https://github.com/bbeatricecretu/AI_FastGears.git && cd AI_FastGears
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu
@@ -173,6 +178,7 @@ Useful flags:
 
 ```powershell
 .venv\Scripts\python -m fastgears --camera 1          # second webcam
+.venv\Scripts\python -m fastgears --camera 1 --camera-backend msmf  # Camo on this test laptop
 .venv\Scripts\python -m fastgears --no-objects        # skip YOLO (faster on weak laptops)
 .venv\Scripts\python -m fastgears --no-rppg           # skip camera pulse
 .venv\Scripts\python -m fastgears --no-llm            # rule-based messages only
@@ -181,6 +187,38 @@ Useful flags:
 
 API: `GET /api/state` (latest detections as JSON) · `GET /api/messages` · `POST /api/chat {"text": "..."}` ·
 `POST /api/recalibrate` · `GET /api/health` · `WS /ws` · `GET /video.mjpg`.
+
+## Puls și regiuni faciale în testul Camo
+
+Pentru Camo pe laptopul de test, pornește `fastgears` cu `--camera 1 --camera-backend msmf` și lasă estimarea pulsului activată. Pe flux, verde marchează fruntea și ambii obraji, albastru marchează nasul, iar roz marchează contururile exterior și interior ale gurii. `face_regions` din `/api/state` oferă punctele în coordonatele cadrului original. Zona buzelor se obține scăzând conturul interior din cel exterior. O regiune ieșită din cadru apare cu valoarea `null`.
+
+Estimatorul folosește timpul monoton la care OpenCV a livrat cadrul, inclusiv latența camerei virtuale. Fereastra are 6–10 s. La configurația implicită de 20 Hz, sub 8 probe/s sau la un gol de peste 350 ms nu se afișează BPM. Consensul regional necesită cel puțin 12 probe/s și două regiuni cu cel puțin 85% probe valide și vârfuri POS la cel mult 6 BPM distanță. Eliminăm variația de culoare explicată de mișcarea și schimbarea scalei feței și acceptăm vârfuri secundare comune dacă au suficientă putere în fiecare regiune. Un consens bazat pe un vârf secundar are încredere cel mult `uncertain`. Între 8 și 12 probe/s sau dacă lipsește consensul, POS pe culorile agregate furnizează BPM când există semnal utilizabil. Această citire are încredere `unreliable`. Pragurile sunt tehnice și experimentale.
+
+În regim cu încredere scăzută, afișajul folosește mediana a până la trei estimări consecutive și păstrează ultima estimare brută în `pulse.raw_bpm`. Pentru a verifica acuratețea, compară estimatorii pe aceeași secvență de cadre cu o serie BPM de referință înregistrată simultan. Raportează eroarea absolută medie pentru citirile disponibile și proporția de ferestre în care fiecare estimator a publicat BPM. `pulse.reason`, `pulse.fps`, `pulse.max_gap_s` și `pulse.region_quality` explică rezultatul fiecărei ferestre. Testele din `tests/test_rppg.py` includ semnale sintetice cu probe rare, regiuni divergente și o frunte supraexpusă.
+
+## Verificarea gesturilor faciale
+
+```powershell
+.venv\Scripts\python -m fastgears --no-objects --no-rppg --no-llm
+```
+
+Deschide [dashboard-ul local](http://127.0.0.1:8000) și urmărește panoul **Gesturi faciale**. Stai la birou cu fața la cameră, ochii deschiși și expresia relaxată. Panoul afișează progresul până la acumularea a 5 s de cadre eligibile. Apasă **Recalibrate** la schimbarea persoanei sau a poziției camerei.
+
+Încearcă mișcările separat, apoi coboară sprâncenele, strânge pleoapele și ridică buza superioară simultan. Poți încreți nasul în loc să ridici buza. Dacă semnalele trec pragurile timp de cel puțin 300 ms (`DISCOMFORT_OVERLAP_S`), panoul afișează **Grimasă compatibilă cu disconfort**, regiunile și durata. Relaxează fața pentru a încheia episodul sau ieși din cadru pentru a-l întrerupe. Închiderea ochilor și deschiderea gurii oferă context. Un episod confirmat apare în `discomfort.event` din `/api/state`, iar ultimele opt episoade în `discomfort.recent_events`.
+
+| Marker | Sursa MediaPipe | Valoare afișată |
+|---|---|---|
+| AU4 · Sprâncene | `browDownLeft/Right` | Creșterea scorului mediu de coborâre față de repaus |
+| AU6 · Obraji | `cheekSquintLeft/Right` și deplasarea verticală a pomeților | Semnalul cel mai pronunțat față de propriul prag. Deplasarea se raportează la distanța dintre ochi |
+| AU7 · Pleoape | `eyeSquintLeft/Right` | Creșterea scorului mediu de strângere activă |
+| AU9 · Nas | `noseSneerLeft/Right` și ridicarea aripilor nazale față de puntea nazală | Semnalul cel mai pronunțat față de propriul prag. Ridicarea se măsoară ca procent din distanța dintre ochi și se folosește ca aproximare a mișcării asociate încrețirii |
+| AU10 · Buza superioară | `mouthUpperUpLeft/Right` | Creșterea scorului mediu de ridicare a buzei |
+| AU43 · Pleoape | EAR stânga și dreapta din `FaceResult` | Cea mai mică scădere relativă dintre cele două deschideri, activă de la 80% |
+| AU25–27 · Gură | MAR din `FaceResult` | Creșterea raportului deschidere/lățime față de repaus |
+
+Scorurile sunt aproximări ale mișcării. Fiecare scor are un prag de demo din `vision/discomfort.py`, ridicat dacă variația la repaus este mare. EAR și MAR folosesc distanțe normalizate, invariante la rotația în plan. Micșorarea EAR este raportată la ochii deschiși, fără un reper calibrat de ochi complet închiși. MediaPipe furnizează câte un `FaceResult` pe cadru, pe imaginea oglindită dacă `MIRROR=1`. Pentru coeficienții pereche folosim media, independent de oglindire. [Denumirile oficiale ale coeficienților MediaPipe](https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/tasks/cc/vision/face_landmarker/face_blendshapes_graph.cc)
+
+Panoul semnalează punctele regionale în afara imaginii, capul prea rotit, fața prea mică și valorile lipsă. Scorurile nu oferă confirmare separată a vizibilității în spatele ochelarilor sau al mâinii. Un gol de peste 250 ms întrerupe episodul. Acoperirea episodului se referă la continuitatea dovezilor din cadrele procesate, la rezoluția fluxului camerei. După cel puțin 2 s fără față se cere un nou reper. Co-pilotul primește durata și markerii evenimentului, fără pixeli, și poate face o verificare neutră cu șoferul.
 
 ### Demo script (≈2 min, for the jury)
 

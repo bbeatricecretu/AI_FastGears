@@ -36,11 +36,13 @@ at the next rest area, open a window, talk to the passenger). Pulse readings wit
 "primary_hazard" is what matters right now: talk about that one thing only and do not mix in
 other readings (e.g. no fatigue advice while the hazard is the phone). Only when it is null may
 you comment on slower trends such as yawns or tiredness.
+A discomfort_grimace event describes facial movement only. Keep any check-in neutral.
 Reply ONLY with JSON: {{"message": "...", "severity": "info|warning|alert", "reason": "<3-6 words>"}}"""
 
 CHAT_PROMPT = """You are FastGears, an in-car co-pilot talking with the driver or a passenger, in {language}.
 You see the live driver-monitoring state below. Answer in at most 2 short sentences, safety first.
-If the driver seems drowsy or distracted, gently say so. Plain text, no markdown."""
+If the driver seems drowsy or distracted, gently say so. Treat discomfort_grimace as a description of
+facial movement only. Never diagnose medical conditions. Plain text, no markdown."""
 
 
 class LLMClient(Protocol):
@@ -141,6 +143,12 @@ def compact_state(state: dict) -> dict:
     out["primary_hazard"] = loc["reason"] if loc else None   # one topic per message
     if p.get("bpm") and p.get("pulse_state") in ("tracking", "held"):
         out["pulse_bpm"] = p["bpm"]
+    event = (state.get("discomfort") or {}).get("event")
+    if event:
+        out["discomfort_grimace"] = {k: event[k] for k in ("duration_ms", "evidence", "coverage")}
+    finding = (state.get("driver_signals") or {}).get("finding")
+    if finding and finding not in ("no_combined_pattern", "partial_signals", "face_unavailable"):
+        out["biometric_finding"] = finding
     out["driving_minutes"] = round(state.get("uptime_s", 0) / 60, 1)
     return out
 
@@ -181,6 +189,7 @@ class Coach:
         self._pause_until = -1e9
         self._last_level = "ok"
         self._last_key = None
+        self._last_discomfort_id = None
         self.llm_errors = 0
         self.last_latency_ms: int | None = None
         threading.Thread(target=self._worker, name="coach", daemon=True).start()
@@ -221,6 +230,13 @@ class Coach:
         self._pending = (self._pending or changed) and level != "ok"   # waits for min_interval if needed
         due = now - self._last_llm >= (self.min_interval_s if self._pending else self.summary_every_s)
         self._last_key, self._last_level = key, level
+        event = (state.get("discomfort") or {}).get("event")
+        if event and event["id"] != self._last_discomfort_id and now - self._last_llm >= self.min_interval_s:
+            self._last_discomfort_id = event["id"]
+            if loc is None:
+                loc = {"message": "Are you comfortable? If needed, take a break when safe.",
+                       "severity": "info", "reason": "facial movement"}
+            due = True
         if due and now >= self._pause_until:
             self._last_llm = now
             self._pending = False
