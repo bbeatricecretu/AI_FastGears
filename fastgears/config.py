@@ -38,6 +38,16 @@ class Settings:
     models_dir: str = os.getenv("MODELS_DIR", str(ROOT / "models"))
     data_dir: str = os.getenv("DATA_DIR", str(ROOT / "data"))
 
+    synthetic: bool = _bool("FASTGEARS_SYNTHETIC", False)
+    pattern_window: float = max(1., float(os.getenv("PATTERN_WINDOW_S", "30")))
+    pattern_minimum: float = max(.01, float(os.getenv("PATTERN_MIN_S", ".45")))
+    pattern_recovery: float = max(.01, float(os.getenv("PATTERN_RECOVERY_S", ".25")))
+    pattern_growth: float = max(.01, float(os.getenv("PATTERN_GROWTH_S", ".25")))
+    alert_hold: float = max(.5, float(os.getenv("ALERT_HOLD_S", "4")))
+    pattern_count: int = max(2, min(32, int(os.getenv("PATTERN_COUNT", "3"))))
+    pattern_support: int = max(2, min(32, int(os.getenv("PATTERN_SUPPORT", "3"))))
+    pattern_cooldown: float = max(0., float(os.getenv("PATTERN_COOLDOWN_S", "12")))
+
     # detectors
     enable_rppg: bool = _bool("ENABLE_RPPG", True)
     enable_objects: bool = _bool("ENABLE_OBJECTS", True)

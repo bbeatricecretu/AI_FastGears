@@ -61,6 +61,22 @@
   #driver-alerts .m span { font-size: 14px; }
   #driver-alerts .m[data-active="true"] { border-color: var(--caution); }
   #driver-alert-details { margin: 0 0 8px; color: var(--caution); }
+  :root { --bg:#101215; --panel:#1a1d22; --accent:#59b7ff; --text:#f7f8fa; }
+  header { flex-wrap:wrap; background:#15171b; border-top:3px solid var(--accent); }
+  h1 { font-family:'Barlow Condensed','Segoe UI',sans-serif; }
+  #cluster { border-top:3px solid var(--accent); padding:20px; }
+  #alert-level { display:block; font:700 clamp(26px,4vw,52px)/1.15 'Barlow Condensed',sans-serif; }
+  #cluster[data-level="NORMAL"] #alert-level {color:var(--ok)}
+  #cluster[data-level="CAUTION"] #alert-level {color:var(--caution)}
+  #cluster[data-level="WARNING"] #alert-level {color:var(--danger)}
+  #history {grid-column:1/-1} .columns {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+  #history ul {padding-left:18px; max-height:240px; overflow:auto} #history li {margin-bottom:5px}
+  #diagnostics {grid-column:1/-1} #diagnostics summary{cursor:pointer;font-weight:600;margin:8px}
+  #diagnostics .card{margin:8px 0} #camera-label{color:var(--muted)}
+  .video img[hidden] {display:none}
+  header input[type=range] {width:76px;padding:0}
+  @media(min-width:1100px){main{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(270px,.85fr)}}
+  @media(max-width:720px){.columns{grid-template-columns:1fr} header{gap:8px} main{padding:8px}}
 </style>
 </head>
 <body>
@@ -70,26 +86,17 @@
   <span class="pill" id="fps">– fps</span>
   <span class="pill" id="llm">LLM –</span>
   <span class="spacer"></span>
+  <button id="enable">ENABLE AUDIO</button>
+  <label><input type="checkbox" id="sound" checked> Sound</label>
+  <label>Volume <input id="volume" type="range" min="0" max="1" step=".05" value=".65"></label>
+  <select id="lang" aria-label="Voice language"><option>en-US</option><option>ro-RO</option><option>de-DE</option></select>
+  <button id="full">Fullscreen</button>
   <button id="voice" class="on" title="Read co-pilot messages aloud">🔊 Voice on</button>
   <button id="recal" title="Look at the road for 5 s">Recalibrate</button>
 </header>
 <main>
   <section class="side">
-    <div class="card video"><img src="/video.mjpg" alt="Live camera with detections"></div>
-    <div class="card">
-      <h2>Last 2 minutes <span class="legend"><i style="background:var(--caution)"></i>drowsiness<i style="background:var(--accent)"></i>distraction<i style="background:var(--danger)"></i>pulse (bpm/2)</span></h2>
-      <canvas id="chart"></canvas>
-    </div>
-  </section>
-  <section class="side">
-    <div>
-      <div id="banner" class="ok">Calibrating…</div>
-      <div id="reasons"></div>
-    </div>
-    <div class="gauges">
-      <div class="card gauge"><small>Drowsiness</small><br><b id="g-drow">0</b><div class="bar"><i id="b-drow"></i></div></div>
-      <div class="card gauge"><small>Distraction</small><br><b id="g-dist">0</b><div class="bar"><i id="b-dist"></i></div></div>
-    </div>
+    <div class="card video"><h2>Driver camera</h2><p id="camera-label">Connecting</p><img id="driver-video" src="/video.mjpg" alt="Live camera with detections"></div>
     <div class="card">
       <h2>Detections</h2>
       <div class="grid">
@@ -107,7 +114,40 @@
         <div class="m" id="m-face"><small>Face</small><span>–</span></div>
       </div>
     </div>
-    <section class="card" id="driver-alerts" aria-labelledby="driver-alerts-title">
+    <div class="card">
+      <h2>Last 2 minutes <span class="legend"><i style="background:var(--caution)"></i>drowsiness<i style="background:var(--accent)"></i>distraction<i style="background:var(--danger)"></i>pulse (bpm/2)</span></h2>
+      <canvas id="chart"></canvas>
+    </div>
+  </section>
+  <section class="side">
+    <section class="card" id="cluster"><h2>Driver attention</h2><strong id="alert-level">Waiting</strong>
+      <h3 id="pattern-name"></h3><p id="pattern-evidence"></p><p id="guidance" role="status"></p></section>
+    <div>
+      <div id="banner" class="ok">Calibrating…</div>
+      <div id="reasons"></div>
+    </div>
+    <div class="gauges">
+      <div class="card gauge"><small>Drowsiness</small><br><b id="g-drow">0</b><div class="bar"><i id="b-drow"></i></div></div>
+      <div class="card gauge"><small>Distraction</small><br><b id="g-dist">0</b><div class="bar"><i id="b-dist"></i></div></div>
+    </div>
+  </section>
+  <section class="side">
+    <div class="card"><h2>Pattern recognition</h2><p id="recognition">Waiting for session</p></div>
+    <div class="card">
+      <h2>Co-pilot</h2><p id="explanation">Waiting for an observation</p>
+      <div id="feed"></div>
+      <form id="chat">
+        <input id="q" placeholder="Ask the co-pilot… (e.g. how am I doing?)" autocomplete="off">
+        <button type="button" id="mic" title="Speak">🎤</button>
+        <button>Send</button>
+      </form>
+    </div>
+  </section>
+  <section class="card" id="history"><h2>Session history</h2><p id="totals"></p>
+    <div class="columns"><div><h3>Detector episodes</h3><ul id="timeline"></ul></div>
+    <div><h3>Pattern occurrences</h3><ul id="matches"></ul></div><div><h3>Recent alerts</h3><ul id="warnings"></ul></div></div>
+  </section>
+  <details class="card" id="diagnostics"><summary>Detailed detector readings</summary>    <section class="card" id="driver-alerts" aria-labelledby="driver-alerts-title">
       <h2 id="driver-alerts-title">Alerte șofer</h2>
       <p id="driver-alert-details" role="status" hidden></p>
       <div class="grid">
@@ -170,66 +210,129 @@
       </ul>
       <p id="rgb-last" hidden></p>
     </div>
-    <div class="card">
-      <h2>Co-pilot</h2>
-      <div id="feed"></div>
-      <form id="chat">
-        <input id="q" placeholder="Ask the co-pilot… (e.g. how am I doing?)" autocomplete="off">
-        <button type="button" id="mic" title="Speak">🎤</button>
-        <button>Send</button>
-      </form>
-    </div>
-  </section>
+</details>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const set = (id, v, alert = false) => { const el = $(id); el.querySelector('span').textContent = v; el.classList.toggle('alert', !!alert); };
-let voice = true, lastSpoken = 0;
+let voice = true, audio, spokenPriority = 0, utterance, activeAlert, queuedVoice;
+const seen = new Set(), messageIds = new Set();
+function remember(ids,id) {
+  if (ids.has(id)) return false;
+  ids.add(id);
+  if (ids.size > 256) ids.delete(ids.values().next().value);
+  return true;
+}
+$('enable').onclick = async () => {
+  audio ||= new AudioContext();
+  await audio.resume();
+  $('enable').textContent = 'Audio enabled';
+};
+$('full').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 const hist = [];   // {t, drow, dist, bpm}
 
-$('voice').onclick = () => { voice = !voice; $('voice').classList.toggle('on', voice); $('voice').textContent = voice ? '🔊 Voice on' : '🔈 Voice off'; if (!voice) speechSynthesis.cancel(); };
+$('voice').onclick = () => { voice = !voice; $('voice').classList.toggle('on', voice); $('voice').textContent = voice ? '🔊 Voice on' : '🔈 Voice off'; if (!voice && window.speechSynthesis) { speechSynthesis.cancel(); spokenPriority=0; } };
 $('recal').onclick = () => fetch('/api/recalibrate', { method: 'POST' });
 
-function speak(m) {
-  if (!voice || !('speechSynthesis' in window)) return;
-  const now = Date.now();
-  if (m.severity === 'info' && now - lastSpoken < 4000) return;
-  if (m.severity === 'alert') speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(m.message);
-  u.rate = m.severity === 'alert' ? 1.15 : 1.0;
-  speechSynthesis.speak(u); lastSpoken = now;
+function playAlert(m) {
+  if (!remember(seen,m.id) || !audio || audio.state !== 'running') return;
+  const priority = m.severity === 'WARNING' ? 2 : 1;
+  if (priority < spokenPriority) return;
+  const volume = Number($('volume').value);
+  if ($('sound').checked) {
+    for (let i=0; i<priority; i++) {
+      const osc=audio.createOscillator(), gain=audio.createGain(), start=audio.currentTime+i*.18;
+      osc.frequency.value=priority===2 ? 880 : 660;
+      gain.gain.setValueAtTime(0,start);
+      gain.gain.linearRampToValueAtTime(volume*.16,start+.01);
+      gain.gain.linearRampToValueAtTime(0,start+.11);
+      osc.connect(gain); gain.connect(audio.destination); osc.start(start); osc.stop(start+.12);
+    }
+  }
+  clearTimeout(queuedVoice?.timer);
+  queuedVoice=null;
+  if (!voice || !window.speechSynthesis) return;
+  if (priority===1 && m.await_voice && !m.voice_message) {
+    queuedVoice={id:m.id, m, timer:setTimeout(()=>{queuedVoice=null; sayAlert(m,priority);},1400)};
+  } else sayAlert(m,priority);
+}
+function sayAlert(m,priority) {
+  if (!voice || priority<spokenPriority) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(m.voice_message || m.message);
+  spokenPriority = priority; utterance = u;
+  u.volume=Number($('volume').value); u.lang=$('lang').value;
+  u.onend = u.onerror = () => { if (utterance===u) spokenPriority=0; };
+  speechSynthesis.speak(u);
+}
+
+function renderMonitor(m, s) {
+  activeAlert=m.active;
+  const level=activeAlert?.severity || (s.attention?.level==='danger'?'WARNING':s.attention?.level==='caution'?'CAUTION':'NORMAL');
+  const observed=s.attention?.calibrated && s.attention?.face_present;
+  $('cluster').dataset.level=level;
+  $('alert-level').textContent=activeAlert || observed ? level : 'Waiting for driver';
+  $('pattern-name').textContent=activeAlert?.name || '';
+  $('pattern-evidence').textContent=activeAlert?.pattern_id ? activeAlert.explanation : '';
+  $('guidance').textContent=activeAlert?.message || '';
+  $('recognition').textContent=(s.synthetic?'SYNTHETIC DEVELOPMENT · ':'')+
+    (m.storage_error || m.dropped_batches ? 'History degraded · '+(m.storage_error || m.dropped_batches+' dropped batches') : 'Monitoring episodes');
+  $('totals').textContent=Math.floor(m.duration_s/60)+'m '+m.duration_s%60+'s · '+(m.counts.CAUTION||0)+' cautions · '+(m.counts.WARNING||0)+' warnings · '+(m.counts.patterns||0)+' patterns';
+  for (const [id,rows] of [['timeline',m.events],['matches',m.occurrences],['warnings',m.alerts]]) {
+    $(id).replaceChildren(...rows.slice(-10).reverse().map(row=>{
+      const li=document.createElement('li');
+      li.textContent=new Date(row.timestamp).toLocaleTimeString()+' · '+(row.name||row.type)+' · '+(row.duration!=null?row.duration+'s':row.severity);
+      return li;
+    }));
+  }
 }
 
 function addMsg(m) {
+  if (m.id && !remember(messageIds,m.id)) return;
+  if (!m.historical && queuedVoice && m.alert_id===queuedVoice.id && m.voice_message) {
+    clearTimeout(queuedVoice.timer);
+    sayAlert({...queuedVoice.m,voice_message:m.voice_message},1);
+    queuedVoice=null;
+  }
   const d = document.createElement('div');
   d.className = 'msg ' + (m.source === 'user' ? 'user' : (m.severity || 'info'));
   const when = new Date((m.t || Date.now() / 1000) * 1000).toLocaleTimeString();
-  d.innerHTML = `<small>${when} · ${m.source || ''}${m.reason ? ' · ' + m.reason : ''}</small>`;
+  const meta = document.createElement('small');
+  meta.textContent = [when,m.source,m.reason].filter(Boolean).join(' · ');
+  d.append(meta);
   d.appendChild(document.createTextNode(m.message));
   $('feed').prepend(d);
+  if (m.source !== 'user') $('explanation').textContent=m.source+' · '+m.message;
+  if (!m.historical && m.reason==='chat' && voice && audio?.state==='running' && !spokenPriority && !activeAlert && window.speechSynthesis) {
+    const u=new SpeechSynthesisUtterance(m.message); u.lang=$('lang').value; u.volume=Number($('volume').value);
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  }
   while ($('feed').children.length > 40) $('feed').lastChild.remove();
-  if (m.source !== 'user') speak(m);
+
 }
 
 function onState(s) {
   const a = s.attention || {}, p = s.pulse || {}, c = s.camera || {};
+  if (s.monitor) renderMonitor(s.monitor,s);
+  $('camera-label').textContent=s.synthetic?'Synthetic development input':c.connected?'Connected':'Camera offline';
+  $('driver-video').hidden=!c.connected;
   renderDriverAlerts(s);
   renderDriverSignals(s.driver_signals || {}, s);
   $('fps').textContent = c.connected ? `${c.fps ?? '–'} cam / ${c.proc_fps ?? '–'} proc fps` : 'no camera';
-  if (s.llm) $('llm').textContent = `LLM ${s.llm.provider}` + (s.llm.latency_ms ? ` · ${s.llm.latency_ms} ms` : '');
+  if (s.llm) $('llm').textContent = `${s.llm.provider} · ${s.llm.status}` + (s.llm.latency_ms ? ` · ${s.llm.latency_ms} ms` : '');
   const level = a.level || 'ok';
   $('banner').className = level;
   $('banner').textContent = !a.face_present && a.calibrated ? 'DRIVER NOT VISIBLE'
     : !a.calibrated ? 'Calibrating — look at the road' : level === 'ok' ? 'ATTENTIVE' : level === 'caution' ? 'CAUTION' : 'DANGER';
   $('reasons').textContent = (a.reasons || []).join(' · ');
-  const drow = Math.round(a.drowsiness || 0), dist = Math.round(a.distraction || 0);
+  const drow = a.face_present && a.drowsiness != null ? Math.round(a.drowsiness) : null, dist = a.face_present && a.distraction != null ? Math.round(a.distraction) : null;
   for (const [k, v] of [['drow', drow], ['dist', dist]]) {
-    $('g-' + k).textContent = v; const b = $('b-' + k);
-    b.style.width = v + '%'; b.style.background = v >= 70 ? 'var(--danger)' : v >= 40 ? 'var(--caution)' : 'var(--ok)';
+    $('g-' + k).textContent = v ?? '–'; const b = $('b-' + k);
+    b.style.width = (v || 0) + '%'; b.style.background = v >= 70 ? 'var(--danger)' : v >= 40 ? 'var(--caution)' : 'var(--ok)';
   }
-  set('m-looking', a.looking || '–', a.distracted);
-  set('m-eyes', a.eyes_closed ? `closed ${(a.eye_closed_s || 0).toFixed(1)}s` : 'open', a.microsleep);
-  set('m-phone', a.phone ? 'IN USE' : 'no', a.phone);
+  set('m-looking', a.face_present ? a.looking : '–', a.distracted);
+  set('m-eyes', !a.face_present ? '–' : a.eyes_closed ? `closed ${(a.eye_closed_s || 0).toFixed(1)}s` : 'open', a.microsleep);
+  set('m-phone', a.phone ? 'IN USE' : s.detectors?.objects && a.face_present ? 'no' : '–', a.phone);
   set('m-ear', a.ear != null ? a.ear.toFixed(2) : '–');
   set('m-perclos', a.perclos != null ? Math.round(a.perclos * 100) + '%' : '–', (a.perclos || 0) > 0.15);
   set('m-blinks', a.blinks_per_min != null ? Math.round(a.blinks_per_min) : '–');
@@ -479,12 +582,27 @@ function connect() {
   ws.onopen = () => { $('conn').textContent = 'live'; };
   ws.onclose = () => {
     $('conn').textContent = 'reconnecting…';
+    clearInterval(ping);
+    clearTimeout(queuedVoice?.timer); queuedVoice=null;
+    $('driver-video').hidden=true;
+    $('camera-label').textContent='Disconnected';
+    $('alert-level').textContent='Disconnected';
+    $('pattern-evidence').textContent=$('pattern-name').textContent=$('guidance').textContent='';
     renderDriverAlerts({});
     renderDriverSignals({finding: 'disconnected'});
     setTimeout(connect, 1000);
   };
-  ws.onmessage = e => { const m = JSON.parse(e.data); if (m.type === 'state') onState(m); else if (m.type === 'message') addMsg(m); };
-  setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
+  ws.onmessage = e => {
+    const m=JSON.parse(e.data);
+    if (m.type==='snapshot') {
+      for (const a of m.monitor.alerts || []) remember(seen,a.id);
+      for (const msg of m.messages) addMsg({...msg,historical:true});
+      onState({...m.state, monitor:m.monitor});
+    } else if (m.type==='state') onState(m);
+    else if (m.type==='message') addMsg(m);
+    else if (m.type==='alert') playAlert(m);
+  };
+  const ping=setInterval(() => ws.readyState === 1 && ws.send('ping'), 15000);
 }
 connect();
 

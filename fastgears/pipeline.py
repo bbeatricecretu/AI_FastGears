@@ -86,12 +86,14 @@ class Pipeline:
 
     def start(self) -> "Pipeline":
         self.camera.start()
-        threading.Thread(target=self._loop, name="pipeline", daemon=True).start()
+        self.worker = threading.Thread(target=self._loop, name="pipeline", daemon=True)
+        self.worker.start()
         return self
 
     def stop(self) -> None:
         self._stop.set()
         self.camera.stop()
+        self.worker.join()
         if self.objects:
             self.objects.stop_live()
 
@@ -152,7 +154,7 @@ class Pipeline:
                                           missing_reason="face_model_unavailable" if self.face is None else "face_not_visible")
         pulse = self.rppg.status() if self.rppg else {}
         state = {
-            "t": time.time(),
+            "t": time.time(), "sample_monotonic_s":t,
             "uptime_s": round(t - self._t0, 1),
             "status": "running",
             "attention": att,
@@ -195,7 +197,7 @@ class Pipeline:
         pulse = _jsonable(self.rppg.status()) if self.rppg else {}
         rgb_state = self._rgb_state(None, None, {}, t)
         with self._lock:
-            self._state = {**self._state, "status": "no camera" if not self.camera.connected else "waiting",
+            self._state = {**self._state, "sample_monotonic_s":t, "status": "no camera" if not self.camera.connected else "waiting",
                            "attention": attention,
                            **assistance,
                            "discomfort": gestures,
@@ -205,6 +207,10 @@ class Pipeline:
                            "face_box": None,
                            "face_regions": dict.fromkeys(FACE_REGION_CONTOURS),
                            "camera": {"connected": self.camera.connected}}
+
+        self._jpeg = None
+        if self.on_state:
+            self.on_state(self.state())
 
     def _rgb_state(self, frame, face, regions, t):
         if self.rgb:

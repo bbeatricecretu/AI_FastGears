@@ -17,7 +17,10 @@ def main() -> None:
     ap.add_argument("--rgb", action="store_true", help="enable experimental facial colour measurements")
     ap.add_argument("--rgb-reference", help="optional neutral patch x0,y0,x1,y1 (default: estimate light from forehead)")
     ap.add_argument("--rgb-overlay", action="store_true", help="show the RGB analysis masks and reference")
+    ap.add_argument("--synthetic", action="store_true", help="labeled development stream without a webcam")
     a = ap.parse_args()
+    if a.synthetic:
+        os.environ["FASTGEARS_SYNTHETIC"] = "1"
     # CLI overrides env, before config is imported
     if a.camera is not None:
         os.environ["CAMERA"] = a.camera
