@@ -154,6 +154,10 @@ Pentru observațiile experimentale de culoare facială, vezi [ghidul modulului R
 
 Panoul **Diagnosticele** afișează simultan pulsul estimat, semnele de somnolență, grimasa și schimbarea de culoare. Pornește cu `python -m fastgears --rgb` pentru a include culoarea și calibrează camera cu fața relaxată, în lumină stabilă.
 
+Panoul **Alerte șofer** urmărește separat oboseala și privirea, mâinile ridicate și telefonul în mână. FastGears fixează șoferul după cinci cadre și folosește fața acestuia pentru măsurători. Poți fixa partea în care se află prin `DRIVER_SEAT=left` sau `right` față de imaginea afișată. `ENABLE_HANDS=0` dezactivează detectorul de mâini. YOLO caută telefonul și în decupaje locale ale mâinilor. Pentru verificarea opțională cu Gemini Vision, `PHONE_VISION_CHECK=1` și o cheie Gemini permit trimiterea unui decupaj al mâinii către Gemini când YOLO nu confirmă telefonul.
+
+Pe Windows, poți selecta camera și după numele DirectShow cu `--camera "dshow:Camo"` dacă FFmpeg este disponibil. Configurația Camo prin index și `--camera-backend msmf` rămâne disponibilă.
+
 Tiparul de posibil preleșin cere reducerea activă a colorației obrajilor, o închidere a ochilor de cel puțin 0,5 s și un puls estimat sub 50 bpm cu semnal fiabil. Pragurile sunt euristici de demo. Detectorul de puls urmărește 45–180 bpm și folosește o fereastră de aproximativ 10 s, deci poate întârzia sau rata o scădere bruscă. Panoul oferă semnale orientative; validarea clinică a regulii rămâne deschisă.
 
 ```powershell

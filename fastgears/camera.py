@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import subprocess
 import threading
 import time
 
@@ -24,6 +25,7 @@ class Camera:
         self._seq = 0
         self._cond = threading.Condition()
         self._stop = threading.Event()
+        self._ffmpeg = None
         self.connected = False
         self.fps = 0.0
         self._thread = threading.Thread(target=self._loop, name="camera", daemon=True)
@@ -33,7 +35,56 @@ class Camera:
         return self
 
     def stop(self) -> None:
-        self._stop.set()
+        with self._cond:
+            self._stop.set()
+            if self._ffmpeg is not None:
+                self._ffmpeg.terminate()
+            self._cond.notify_all()
+
+    def _publish(self, frame, captured_at):
+        if self.mirror:
+            frame = cv2.flip(frame, 1)
+        with self._cond:
+            self._frame, self._seq = frame, self._seq + 1
+            self._frame_t = captured_at
+            self.connected = True
+            self._cond.notify_all()
+
+    def _named_directshow(self, device):
+        size = self.width * self.height * 3
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "dshow",
+                   "-video_size", f"{self.width}x{self.height}", "-framerate", "30",
+                   "-i", f"video={device}", "-an", "-threads:v", "1",
+                   "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
+        while not self._stop.is_set():
+            try:
+                with self._cond:
+                    if self._stop.is_set():
+                        return
+                    self._ffmpeg = process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                                             creationflags=subprocess.CREATE_NO_WINDOW)
+                count, started = 0, time.monotonic()
+                try:
+                    while not self._stop.is_set():
+                        raw = process.stdout.read(size)
+                        if len(raw) != size:
+                            break
+                        t = time.monotonic()
+                        self._publish(np.frombuffer(raw, np.uint8).reshape(self.height, self.width, 3), t)
+                        count += 1
+                        if t - started >= 2:
+                            self.fps, count, started = count / (t - started), 0, t
+                finally:
+                    with self._cond:
+                        self._ffmpeg = None
+                    process.terminate()
+                    process.wait()
+                    process.stdout.close()
+            except OSError:
+                log.exception("could not capture %r using FFmpeg", device)
+            self.connected = False
+            self.fps = 0.0
+            self._stop.wait(1)
 
     def _open(self) -> cv2.VideoCapture:
         if self.backend != "auto" and isinstance(self.source, int):
@@ -53,6 +104,9 @@ class Camera:
         return cap
 
     def _loop(self) -> None:
+        if platform.system() == "Windows" and isinstance(self.source, str) and self.source.startswith("dshow:"):
+            self._named_directshow(self.source[6:])
+            return
         is_file = not isinstance(self.source, int)
         while not self._stop.is_set():
             cap = self._open()
@@ -74,12 +128,7 @@ class Camera:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     break
-                if self.mirror:
-                    frame = cv2.flip(frame, 1)
-                with self._cond:
-                    self._frame, self._seq = frame, self._seq + 1
-                    self._frame_t = captured_at
-                    self._cond.notify_all()
+                self._publish(frame, captured_at)
                 n += 1
                 if time.monotonic() - t0 >= 2:
                     self.fps, n, t0 = n / (time.monotonic() - t0), 0, time.monotonic()

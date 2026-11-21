@@ -55,17 +55,6 @@ SECONDARY_MIN_SNR_DB = -3.5
 SECONDARY_MIN_POWER = 0.42
 MAX_TRACK_AGE_S = 5.0
 REGION_RASTER_SIDE = 40
-# Output filter (from main, on top of the regional estimate): head movement shifts the ROIs
-# over the skin and produces a fake peak, so a moving window must not change the reading.
-MOTION_GATE = 0.08          # window motion (eye-midpoint spread / eye distance) above this: reject
-SNR_GATE_DB = 0.0           # below 0 dB the pulse is weaker than the noise: reject
-SLEW_BPM_PER_S = 3.0        # the shown pulse changes at most this fast (a real heart rate is smooth)
-HOLD_MAX_S = 12.0           # keep the last good value this long while rejected, then "measuring"
-TRUSTED_METHODS = ("regional_consensus", "pooled")   # may drive the shown pulse
-STEP_GATE = 0.25            # eye-midpoint displacement within STEP_SPAN_S (x eye distance): a posture
-STEP_SPAN_S = 0.5           # jump; the window restarts after it so the pulse returns after MIN_WINDOW_S.
-                            # Measured over 0.5 s, not per sample: landmark ROIs follow the skin and
-                            # _remove_motion cancels smooth sway, only a jump corrupts the window.
 
 # forehead + two cheeks, relative to (cx, cy) in units of eye distance d
 BOXES = [(-0.55, -1.10, 0.55, -0.45),   # forehead, above the eyes
@@ -211,17 +200,6 @@ def _tracked_peak(freqs, power, history):
     return freqs[strongest]
 
 
-def _pooled_accepted(snr, bpm, region_bpms, need_agreement=False):
-    """Main's 0 dB gate for the pooled estimate, or down to SECONDARY_MIN_SNR_DB (mara's limit for
-    a peak shared by regions) when at least two face regions independently agree with it."""
-    if snr is None or not np.isfinite(snr):
-        return False
-    agree = sum(1 for b in region_bpms if b is not None and abs(b - bpm) <= REGION_AGREEMENT_BPM)
-    if snr >= SNR_GATE_DB and not need_agreement:
-        return True
-    return agree >= 2 and snr >= SECONDARY_MIN_SNR_DB
-
-
 def _display_provisional_bpm(recent):
     if len(recent) == 2 and abs(recent[-1] - recent[0]) > REGION_AGREEMENT_BPM:
         return recent[0]
@@ -331,9 +309,6 @@ class RPPG:
         self._history: deque = deque(maxlen=8)
         self._provisional_bpms: deque = deque(maxlen=3)
         self._last_consensus_t = None
-        self._accepted: deque = deque(maxlen=3)   # last accepted consensus estimates
-        self._shown: float | None = None          # filtered pulse shown to the user
-        self._shown_t = self._last_ok = 0.0
         self._result = _pulse_result(reason="face_not_visible")
         self._est_at = None          # wall-clock (monotonic) of last recompute
         self._est_sample_t = None
@@ -387,6 +362,11 @@ class RPPG:
         if exposure is not None and self._v4l2:
             self._maybe_gain(*exposure, t)
 
+    def reset(self) -> None:
+        """Discard pulse samples when recalibration can select a different driver."""
+        with self._lock:
+            self._reset_window("collecting")
+
     def _reset_window(self, reason):
         """Reset sampling state with the buffer lock held."""
         self._gen += 1
@@ -394,7 +374,6 @@ class RPPG:
         self._history.clear()
         self._provisional_bpms.clear()
         self._last_consensus_t = None
-        # the shown pulse survives a window reset: _filter holds it for HOLD_MAX_S
         self._next_t = self._est_at = self._est_sample_t = None
         self._result = _pulse_result(reason=reason)
 
@@ -475,19 +454,12 @@ class RPPG:
         if len(pts) < 2:
             return _pulse_result(reason="collecting")
         t_end = pts[-1][0]
-        arr = np.array([p for p in pts if p[0] >= t_end - WINDOW_S], dtype=float)
-        # a sudden head jump: keep only what came after the last movement (main's step gate)
-        back = np.searchsorted(arr[:, 0], arr[:, 0] - STEP_SPAN_S)
-        step = np.hypot(arr[:, 1] - arr[back, 1], arr[:, 2] - arr[back, 2]) / np.maximum(arr[:, 3], 1.0)
-        moved = np.nonzero(step > STEP_GATE)[0]
-        settling = len(moved) > 0
-        if settling:
-            arr = arr[moved[-1]:]
-        span = float(arr[-1, 0] - arr[0, 0]) if len(arr) > 1 else 0.0
+        pts = [p for p in pts if p[0] >= t_end - WINDOW_S]
+        span = pts[-1][0] - pts[0][0]
         base = _pulse_result(window_s=round(span, 1))
         if span < MIN_WINDOW_S:
-            return {**base, "reason": "settling" if settling else "collecting"}
-        pts = arr
+            return {**base, "reason": "collecting"}
+        arr = np.array(pts, dtype=float)
         ts = arr[:, 0]
         hz = (len(pts) - 1) / span
         max_gap = float(np.diff(ts).max())
@@ -557,15 +529,7 @@ class RPPG:
             snr = _spectral_snr(freqs, power, peak)
             if power.sum() <= 1e-12 or not np.isfinite(snr):
                 return base
-            # Main's original (validated) estimator: forehead + cheeks pooled before POS, accepted
-            # at SNR >= 0 dB. Pooling averages out per-region noise, so it still reads a small or
-            # backlit face whose regions are each too weak for a regional consensus. Not used when
-            # the regions clearly disagree, nor from a single region.
-            # when the regions "disagree" (one off) the pooled reading still needs two regions with it
-            pooled_ok = (not low_sample_rate and len(signals) >= 2
-                         and _pooled_accepted(snr, peak * 60, region_bpms,
-                                              need_agreement=base["reason"] == "regions_disagree"))
-            method = "pooled" if pooled_ok else "provisional"
+            method = "provisional"
         bpm = round(peak * 60)
         cxs, cys, ds = arr[:, 1], arr[:, 2], arr[:, 3]
         motion = float(np.sqrt(cxs.var() + cys.var()) / max(ds.mean(), 1.0))
@@ -576,8 +540,6 @@ class RPPG:
         if method == "provisional":
             trust.update(score=min(trust["score"], 39), label="unreliable")
             trust["reasons"].append("low sample rate" if low_sample_rate else "no qualified regional consensus")
-        elif method == "pooled":
-            trust["reasons"].append("pooled regions (each too weak alone)")
         elif any(secondary):
             trust["reasons"].append("shared secondary spectral peak")
             if trust["label"] == "reliable":
@@ -613,7 +575,7 @@ class RPPG:
                     return
                 if self._result["reason"] == "sampling_gap" and result["reason"] == "collecting":
                     result["reason"] = "sampling_gap"
-                if result["method"] in TRUSTED_METHODS:
+                if result["method"] == "regional_consensus":
                     self._history.append(result["bpm"])
                     self._last_consensus_t = pts[-1][0]
                     self._provisional_bpms.clear()
@@ -624,59 +586,17 @@ class RPPG:
                     result["bpm"] = _display_provisional_bpm(self._provisional_bpms)
                 else:
                     self._provisional_bpms.clear()
-                result.update(self._filter(result, pts[-1][0]))
                 self._est_sample_t = pts[-1][0]
                 self._result = result
         finally:
             self._est_lock.release()
-
-    def _filter(self, res: dict, now: float) -> dict:
-        """Main's output filter: gate by consensus/motion/SNR, median of the last accepted
-        windows, slew-limit, hold the last good value. `now` is the sample clock."""
-        bpm, snr, motion = res.get("bpm"), res.get("snr"), res.get("motion")
-        raw = res.get("raw_bpm", bpm)
-        why = None
-        if bpm is None:
-            why = "settling after movement" if res.get("reason") == "settling" else "no estimate"
-        elif res.get("method") not in TRUSTED_METHODS:
-            why = "no regional consensus"
-        elif motion is not None and motion > MOTION_GATE:
-            why = "head moving"
-        elif not _pooled_accepted(snr, bpm, res.get("regions_bpm") or []):
-            why = "weak signal"
-        if why is None:
-            self._accepted.append(bpm)
-            target = float(np.median(self._accepted))
-            if self._shown is None:
-                self._shown = target
-            else:
-                step = SLEW_BPM_PER_S * max(now - self._shown_t, ESTIMATE_EVERY_S)
-                self._shown += float(np.clip(target - self._shown, -step, step))
-            self._shown_t = self._last_ok = now
-            state = "tracking"
-        elif self._shown is not None and now - self._last_ok <= HOLD_MAX_S:
-            state = "held"
-        else:
-            self._shown = None
-            self._accepted.clear()
-            # nothing trusted yet: an indicative (provisional) reading is kept in bpm_raw only,
-            # it jumps too much to be shown as the pulse
-            state = "provisional" if bpm is not None else "measuring"
-            return {"bpm": None, "bpm_raw": raw, "pulse_state": state, "rejected": why}
-        return {"bpm": round(self._shown), "bpm_raw": raw, "pulse_state": state, "rejected": why}
 
     # ── outputs ───────────────────────────────────────────────────────
     def status(self) -> dict:
         """Thread-safe; recomputes at most once per second (lazily), otherwise cached."""
         self._refresh()
         with self._lock:
-            result = self._result
-            if (result.get("bpm") is None and self._shown is not None and self._last_frame_t is not None
-                    and self._last_frame_t - self._last_ok <= HOLD_MAX_S):
-                # face lost / window restarted: keep showing the last good pulse (main's hold)
-                result = {**result, "bpm": round(self._shown), "pulse_state": "held",
-                          "rejected": result.get("rejected") or result.get("reason")}
-            return {**result, "face": self._face is not None, "diag": dict(self._diag),
+            return {**self._result, "face": self._face is not None, "diag": dict(self._diag),
                     "sampled_monotonic_s": self._est_sample_t if self._face is not None else None}
 
     def rois(self) -> list[tuple[int, int, int, int]]:

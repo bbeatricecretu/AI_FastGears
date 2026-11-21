@@ -1,7 +1,6 @@
 """rPPG tests with synthetic frames (no camera)."""
 import sys
 from pathlib import Path
-
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,10 +9,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastgears.vision.rppg import (  # noqa: E402
-    RPPG, _display_provisional_bpm, _pooled_accepted, _region_pixels, pos_spectrum, trust_score,
+    RPPG, _display_provisional_bpm, _region_pixels, pos_spectrum, trust_score,
 )
 from fastgears.vision.face import (  # noqa: E402
-    FACE_REGION_CONTOURS, PULSE_REGIONS, FaceResult, face_region_contours,
+    FACE_REGION_CONTOURS, PULSE_REGIONS, FaceResult, FaceTracker, face_region_contours,
 )
 
 FACE = (160.0, 110.0, 60.0)   # ROIs: forehead y 44-83, cheeks y 131-167, all inside 240x320
@@ -82,40 +81,6 @@ def test_trust_score_sanity():
     assert "face too dark" in bad["reasons"] and "still settling" in bad["reasons"]
     over = trust_score(8.0, [72, 72, 72], 72, [72, 72, 72], 0.0, 230, 0.0)
     assert over["parts"]["exposure"] == 0.5 and "face overexposed" in over["reasons"]
-
-
-def test_filter_rejects_motion_holds_and_slew_limits():
-    r = RPPG()
-    good = lambda bpm: {"bpm": bpm, "snr": 5.0, "motion": 0.02, "method": "regional_consensus"}
-    assert r._filter(good(72), 100.0) == {"bpm": 72, "bpm_raw": 72, "pulse_state": "tracking", "rejected": None}
-    # head moving: a +30 BPM spike must not reach the user
-    out = r._filter({"bpm": 105, "snr": 3.0, "motion": 0.3, "method": "regional_consensus"}, 101.0)
-    assert out["bpm"] == 72 and out["pulse_state"] == "held" and out["rejected"] == "head moving"
-    out = r._filter({"bpm": 110, "snr": -2.0, "motion": 0.01, "method": "regional_consensus"}, 102.0)
-    assert out["bpm"] == 72 and out["rejected"] == "weak signal"
-    # real change is followed, but at most SLEW_BPM_PER_S per second (median of last 3 accepted)
-    r._filter(good(90), 103.0)
-    out = r._filter(good(90), 104.0)
-    assert 72 < out["bpm"] <= 72 + 3 * 4            # 4 s since the last good reading
-    # rejected for longer than HOLD_MAX_S: back to measuring
-    out = r._filter({"bpm": None}, 104.0 + 13)
-    assert out["bpm"] is None and out["pulse_state"] == "measuring"
-
-
-def test_filter_never_promotes_a_provisional_reading():
-    r = RPPG()
-    out = r._filter({"bpm": 80, "snr": 4.0, "motion": 0.01, "method": "provisional", "raw_bpm": 81}, 10.0)
-    assert out == {"bpm": None, "bpm_raw": 81, "pulse_state": "provisional", "rejected": "no regional consensus"}
-    r._filter({"bpm": 70, "snr": 4.0, "motion": 0.01, "method": "regional_consensus"}, 11.0)
-    out = r._filter({"bpm": 95, "snr": 4.0, "motion": 0.01, "method": "provisional"}, 12.0)
-    assert out["bpm"] == 70 and out["pulse_state"] == "held"
-
-
-def test_head_jump_restarts_the_window():
-    samples = np.array(list(_signals((72, 72, 72), seconds=10)))
-    samples[samples[:, 0] >= 6, 1] += 0.4 * FACE[2]       # 0.4 eye distances jump at t=6 s
-    result = RPPG()._estimate(samples.tolist(), {})
-    assert result["bpm"] is None and result["reason"] == "settling" and result["window_s"] < 6
 
 
 def _signals(rates, *, fps=20, seconds=10):
@@ -200,8 +165,7 @@ def test_loss_and_long_gap_invalidate_cached_estimate():
         rppg.update(frame, FACE, t)
     assert rppg.status()["bpm"] is not None
     rppg.update(None, None, t + 0.1)
-    lost = rppg.status()                       # estimate invalidated, last value only held
-    assert lost["reason"] == "face_not_visible" and lost["pulse_state"] == "held"
+    assert rppg.status()["bpm"] is None
     rppg.update(frame, FACE, t + 0.6)
     assert rppg.status()["reason"] == "sampling_gap"
 
@@ -232,6 +196,23 @@ def test_landmark_regions_mirror_and_reject_missing_points_independently():
     assert affected["mouth_inner"] is None and affected["mouth_outer"] and affected["nose"]
 
 
+def test_face_tracking_resize_keeps_original_pixel_coordinates():
+    tracker = FaceTracker.__new__(FaceTracker)
+    tracker._max_input_side = 768
+    tracker._last_ts = -1
+    tracker._mp = SimpleNamespace(ImageFormat=SimpleNamespace(SRGB=1), Image=lambda **kwargs: kwargs["data"])
+
+    def detect(image, timestamp):
+        assert image.shape == (432, 768, 3) and timestamp == 10
+        point = SimpleNamespace(x=0.25, y=0.75, z=-0.1)
+        return SimpleNamespace(face_landmarks=[[point] * 478], face_blendshapes=[],
+                               facial_transformation_matrixes=[])
+
+    tracker._landmarker = SimpleNamespace(detect_for_video=detect)
+    face = tracker.process(np.zeros((720, 1280, 3), np.uint8), 10)
+    np.testing.assert_allclose(face.landmarks_px[0], [320, 540, -128])
+
+
 def test_roi_masks_sample_two_cheeks_and_reject_clipped_forehead():
     rppg = RPPG()
     landmarks = _mesh()
@@ -251,83 +232,3 @@ def test_subpixel_region_sampling_has_stable_support_across_integer_boundaries()
     shifted, _ = _region_pixels(gradient, contour + (0.4, 0))
     assert len(first) == len(shifted)
     assert shifted.mean() - first.mean() == pytest.approx(1.2, abs=0.1)
-
-
-def test_pipeline_samples_the_pulse_on_every_camera_frame():
-    """The detector loop runs at ~8 fps; the pulse thread feeds every 30 fps camera frame
-    with the newest driver landmarks, so the estimator reaches a trusted reading."""
-    from fastgears.pipeline import RPPG_FACE_MAX_AGE_S, Pipeline
-
-    p = Pipeline.__new__(Pipeline)
-    import threading
-    p._rppg_lock = threading.Lock()
-    p.rppg = RPPG()
-    face = SimpleNamespace(eyes=FACE, landmarks_px=None)
-    frames = list(_frames(seconds=10.0))
-    for i, (frame, t) in enumerate(frames):
-        if i % 4 == 0:                                   # detector loop: every 4th frame (~8 fps)
-            p._rppg_face = (face, t)
-        p._feed_rppg(frame, t)
-    s = p.rppg.status()
-    assert s["fps"] >= 15 and s["method"] == "regional_consensus"
-    assert s["pulse_state"] == "tracking" and abs(s["bpm"] - 72) <= 3
-    # landmarks too old: the pulse thread treats the face as gone
-    frame, t = frames[-1]
-    p._rppg_face = (face, t + 1 - RPPG_FACE_MAX_AGE_S - 0.1)
-    p._feed_rppg(frame, t + 1)
-    assert p.rppg.status()["face"] is False
-
-
-def test_weak_regions_fall_back_to_main_pooled_estimate():
-    """Each region alone is below 0 dB (noise), pooled over three regions the pulse is clear:
-    main's original pooled estimator is accepted instead of showing nothing."""
-    rng = np.random.default_rng(3)
-    samples = np.array(list(_signals((72, 72, 72), seconds=10)))
-    samples[:, 4:13] += rng.normal(0, 2.2, samples[:, 4:13].shape)   # independent noise per region
-    result = RPPG()._estimate(samples.tolist(), {})
-    assert result["reason"] == "insufficient_regions", result["region_quality"]
-    assert result["method"] == "pooled" and abs(result["bpm"] - 72) <= 3 and result["snr"] >= 0
-    out = RPPG()._filter(result, 10.0)
-    assert out["pulse_state"] == "tracking" and out["bpm"] == result["bpm"]
-
-
-def test_shown_pulse_is_held_through_a_face_loss():
-    r = RPPG()
-    for frame, t in _frames(seconds=10.0):
-        r.update(frame, FACE, t)
-    first = r.status()
-    assert first["pulse_state"] == "tracking"
-    r.update(frame, None, t + 1.0)                       # face lost: window reset
-    held = r.status()
-    assert held["bpm"] == first["bpm"] and held["pulse_state"] == "held"
-    r.update(frame, None, t + 20.0)                      # longer than HOLD_MAX_S
-    assert r.status()["bpm"] is None
-
-
-@pytest.mark.parametrize("snr,bpm,regions,ok", [
-    (0.5, 72, [None, None, 90], True),      # main's 0 dB gate
-    (-1.1, 71, [70, 74, 65], True),         # weak, but two regions agree (live recording)
-    (-1.9, 70, [67, 73, 70], True),
-    (-5.1, 120, [45, 120, 90], False),      # too weak
-    (-2.3, 50, [74, 50, 79], False),        # only one region agrees: junk peak
-    (-5.2, 45, [73, 92, 62], False),
-])
-def test_pooled_gate_needs_snr_or_regional_agreement(snr, bpm, regions, ok):
-    assert _pooled_accepted(snr, bpm, regions) is ok
-
-
-def test_filter_accepts_the_weak_pooled_reading_it_was_given():
-    """Live bug: the estimator accepted 84 BPM (-1.1 dB, regions 83/77/87), the filter's
-    0 dB gate dropped it again."""
-    r = RPPG()
-    out = r._filter({"bpm": 84, "snr": -1.1, "motion": 0.069, "method": "pooled",
-                     "regions_bpm": [83, 77, 87]}, 10.0)
-    assert out["bpm"] == 84 and out["pulse_state"] == "tracking"
-    out = r._filter({"bpm": 120, "snr": -2.0, "motion": 0.02, "method": "pooled",
-                     "regions_bpm": [45, 120, 90]}, 11.0)
-    assert out["bpm"] == 84 and out["rejected"] == "weak signal"
-
-
-def test_disagreeing_regions_need_two_regions_behind_the_pooled_reading():
-    assert _pooled_accepted(2.0, 84, [83, 80, 122], need_agreement=True)
-    assert not _pooled_accepted(2.0, 70, [84, 103, 94], need_agreement=True)

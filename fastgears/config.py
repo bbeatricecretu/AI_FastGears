@@ -45,6 +45,7 @@ class Settings:
     yolo_model: str = os.getenv("YOLO_MODEL", "yolov8n.pt")
     yolo_every: int = int(os.getenv("YOLO_EVERY", "3"))
     driver_seat: str = os.getenv("DRIVER_SEAT", "left").lower()   # auto | left | right (as on screen)
+    enable_hands: bool = _bool("ENABLE_HANDS", True)
     calib_s: float = float(os.getenv("CALIBRATION_S", "5"))
     discomfort_overlap_s: float = float(os.getenv("DISCOMFORT_OVERLAP_S", "0.3"))
     enable_rgb: bool = _bool("ENABLE_RGB", False)
