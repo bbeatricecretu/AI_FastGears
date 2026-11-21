@@ -211,12 +211,14 @@ def _tracked_peak(freqs, power, history):
     return freqs[strongest]
 
 
-def _pooled_accepted(snr, bpm, region_bpms):
+def _pooled_accepted(snr, bpm, region_bpms, need_agreement=False):
     """Main's 0 dB gate for the pooled estimate, or down to SECONDARY_MIN_SNR_DB (mara's limit for
     a peak shared by regions) when at least two face regions independently agree with it."""
-    if snr >= SNR_GATE_DB:
-        return True
+    if snr is None or not np.isfinite(snr):
+        return False
     agree = sum(1 for b in region_bpms if b is not None and abs(b - bpm) <= REGION_AGREEMENT_BPM)
+    if snr >= SNR_GATE_DB and not need_agreement:
+        return True
     return agree >= 2 and snr >= SECONDARY_MIN_SNR_DB
 
 
@@ -559,8 +561,10 @@ class RPPG:
             # at SNR >= 0 dB. Pooling averages out per-region noise, so it still reads a small or
             # backlit face whose regions are each too weak for a regional consensus. Not used when
             # the regions clearly disagree, nor from a single region.
-            pooled_ok = (not low_sample_rate and base["reason"] == "insufficient_regions"
-                         and len(signals) >= 2 and _pooled_accepted(snr, peak * 60, region_bpms))
+            # when the regions "disagree" (one off) the pooled reading still needs two regions with it
+            pooled_ok = (not low_sample_rate and len(signals) >= 2
+                         and _pooled_accepted(snr, peak * 60, region_bpms,
+                                              need_agreement=base["reason"] == "regions_disagree"))
             method = "pooled" if pooled_ok else "provisional"
         bpm = round(peak * 60)
         cxs, cys, ds = arr[:, 1], arr[:, 2], arr[:, 3]
@@ -638,7 +642,7 @@ class RPPG:
             why = "no regional consensus"
         elif motion is not None and motion > MOTION_GATE:
             why = "head moving"
-        elif snr is None or snr < SNR_GATE_DB:
+        elif not _pooled_accepted(snr, bpm, res.get("regions_bpm") or []):
             why = "weak signal"
         if why is None:
             self._accepted.append(bpm)

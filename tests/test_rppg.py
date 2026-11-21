@@ -314,3 +314,20 @@ def test_shown_pulse_is_held_through_a_face_loss():
 ])
 def test_pooled_gate_needs_snr_or_regional_agreement(snr, bpm, regions, ok):
     assert _pooled_accepted(snr, bpm, regions) is ok
+
+
+def test_filter_accepts_the_weak_pooled_reading_it_was_given():
+    """Live bug: the estimator accepted 84 BPM (-1.1 dB, regions 83/77/87), the filter's
+    0 dB gate dropped it again."""
+    r = RPPG()
+    out = r._filter({"bpm": 84, "snr": -1.1, "motion": 0.069, "method": "pooled",
+                     "regions_bpm": [83, 77, 87]}, 10.0)
+    assert out["bpm"] == 84 and out["pulse_state"] == "tracking"
+    out = r._filter({"bpm": 120, "snr": -2.0, "motion": 0.02, "method": "pooled",
+                     "regions_bpm": [45, 120, 90]}, 11.0)
+    assert out["bpm"] == 84 and out["rejected"] == "weak signal"
+
+
+def test_disagreeing_regions_need_two_regions_behind_the_pooled_reading():
+    assert _pooled_accepted(2.0, 84, [83, 80, 122], need_agreement=True)
+    assert not _pooled_accepted(2.0, 70, [84, 103, 94], need_agreement=True)

@@ -35,6 +35,7 @@ class Pipeline:
         self.camera = Camera(settings.camera, settings.width, settings.height, settings.mirror,
                              backend=settings.camera_backend)
         self.face = self.rppg = self.objects = self.hands = self.vision = self.rgb = None
+        self.rppg_boxes = None
         self._hands: list = []
         self._phone_xy: tuple[float, float] | None = None   # where the driver's phone was last seen
         self._frame_i = 0
@@ -70,6 +71,7 @@ class Pipeline:
                 from .vision.rppg import RPPG
                 self.rppg = RPPG(device=self.s.camera if isinstance(self.s.camera, str)
                                  and self.s.camera.startswith("/dev/video") else None)
+                self.rppg_boxes = RPPG() if self.s.rppg_compare else None
             except Exception as e:
                 self.errors["rppg"] = str(e)
                 log.exception("rPPG unavailable")
@@ -224,6 +226,7 @@ class Pipeline:
             "rgb": rgb_state,
             "driver_signals": assess_driver(t, att, gestures, rgb_state, pulse),
             "pulse": _jsonable(pulse),
+            **({"pulse_boxes": _jsonable(self.rppg_boxes.status())} if self.rppg_boxes else {}),
             "objects": [d for d in dets if d.get("label") in ("cell phone", "person", "bottle", "cup", "book", "laptop")],
             "face_box": list(face.bbox) if face else None,
             "driver": self.driver.state.as_dict(),
@@ -267,6 +270,8 @@ class Pipeline:
             face = None
         self.rppg.update(frame, face.eyes if face else None, t,
                          landmarks=face.landmarks_px if face else None)
+        if getattr(self, "rppg_boxes", None):              # debug comparison: main's eye-based boxes
+            self.rppg_boxes.update(frame, face.eyes if face else None, t)
 
     def _publish_no_camera(self) -> None:
         t = time.monotonic()
