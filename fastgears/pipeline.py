@@ -21,7 +21,7 @@ from .vision.face import FACE_REGION_CONTOURS, PULSE_REGIONS, face_region_contou
 log = logging.getLogger("pipeline")
 
 COLORS = {"ok": (80, 200, 80), "caution": (0, 190, 255), "danger": (60, 60, 255)}
-PREVIEW_INTERVAL_S = 1 / 12
+PREVIEW_INTERVAL_S = 1 / 40     # live video: every camera frame (30 fps), not detector speed
 # The pulse estimator (main_final's, unchanged) needs >= 12 samples/s for a trusted reading and
 # >= 8 for any reading; the detector loop runs at ~6-8 fps on a laptop CPU. So the pulse is fed
 # every camera frame (~30 fps) from its own thread, using the driver's latest landmarks.
@@ -42,6 +42,9 @@ class Pipeline:
         self._load_detectors()
         self._jpeg: bytes | None = None
         self._last_preview_t: float | None = None
+        self._overlay: tuple | None = None     # newest detections, drawn onto every preview frame
+        self._overlay_lock = threading.Lock()
+        self._preview_threaded = False
         self._state: dict = {"attention": {}, "pulse": {}, "objects": [], "status": "starting"}
         self._lock = threading.Lock()
         self._rppg_face: tuple | None = None   # (driver FaceResult, its frame time) for the pulse thread
@@ -53,6 +56,8 @@ class Pipeline:
         self._recalibrate = threading.Event()
 
     def _load_detectors(self) -> None:
+        from .perf import tune
+        tune()                                     # fast cores, no thread fight (see perf.py)
         from .vision.attention import AttentionMonitor
         from .vision.discomfort import DiscomfortMonitor
         from .vision.driver import DriverLock
@@ -114,6 +119,10 @@ class Pipeline:
     def start(self) -> "Pipeline":
         self.camera.start()
         threading.Thread(target=self._loop, name="pipeline", daemon=True).start()
+        # RGB masks belong to the exact sampled frame: with them on, the detector loop draws the preview
+        self._preview_threaded = not (self.rgb and self.s.rgb_overlay)
+        if self._preview_threaded:
+            threading.Thread(target=self._preview_loop, name="preview", daemon=True).start()
         if self.rppg:
             self._rppg_threaded = True
             threading.Thread(target=self._rppg_loop, name="rppg", daemon=True).start()
@@ -137,6 +146,8 @@ class Pipeline:
 
     # ── loop ──────────────────────────────────────────────────────────
     def _loop(self) -> None:
+        from .perf import limit_threads
+        limit_threads()                                   # YOLO runs on this thread
         seq, n, t_fps = -1, 0, time.monotonic()
         last_ms = 0
         while not self._stop.is_set():
@@ -250,16 +261,39 @@ class Pipeline:
                           "hands": self.hands is not None, "phone_vision": self.vision is not None,
                           "objects": self.objects is not None, "errors": self.errors},
         }
+        overlay = (face, dets, att, pulse, regions, mine_hands, up, list(self.driver.state.passenger_boxes))
+        with self._overlay_lock:
+            self._overlay = overlay
         preview_due = self._last_preview_t is None or t - self._last_preview_t >= PREVIEW_INTERVAL_S
         masks_current = (not self.rgb or not self.s.rgb_overlay or not rgb_state.get("regions")
                          or rgb_state.get("sampled_monotonic_s") == t)
-        if preview_due and masks_current:
-            self._jpeg = self._draw(frame, face, dets, att, pulse, regions, mine_hands, up)
+        if not self._preview_threaded and preview_due and masks_current:
+            self._jpeg = self._draw(frame, *overlay)
             self._last_preview_t = t
         with self._lock:
             self._state = state
         if self.on_state:
             self.on_state(state)
+
+    def _preview_loop(self) -> None:
+        """Live video: every camera frame (up to 25 fps) with the newest detections drawn on it,
+        so the picture stays smooth while YOLO / MediaPipe run slower on the pipeline thread."""
+        seq, last = -1, 0.0
+        while not self._stop.is_set():
+            seq2, frame, t = self.camera.read_timed(seq, timeout=1.0)
+            if frame is None or t is None or seq2 == seq:
+                continue
+            seq = seq2
+            if t - last < PREVIEW_INTERVAL_S:
+                continue
+            last = t
+            with self._overlay_lock:
+                overlay = self._overlay
+            try:
+                self._jpeg = (self._draw(frame, *overlay) if overlay is not None
+                              else self._draw(frame, None, [], {}, {}))
+            except Exception:
+                log.exception("preview frame failed")
 
     def _rppg_loop(self) -> None:
         seq = -1
@@ -320,9 +354,10 @@ class Pipeline:
         return {"enabled": True, "lighting": "analysis_unavailable"} if self.s.enable_rgb else {}
 
     # ── overlay (what the jury sees live) ─────────────────────────────
-    def _draw(self, frame, face, dets, att, pulse, regions=None, hands=(), hands_free=()) -> bytes | None:
+    def _draw(self, frame, face, dets, att, pulse, regions=None, hands=(), hands_free=(),
+              passengers=None) -> bytes | None:
         img = frame.copy()
-        for b in self.driver.state.passenger_boxes:
+        for b in (self.driver.state.passenger_boxes if passengers is None else passengers):
             x0, y0, x1, y1 = map(int, b)
             cv2.rectangle(img, (x0, y0), (x1, y1), (150, 150, 150), 1)
             cv2.putText(img, "passenger (ignored)", (x0, max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,

@@ -147,5 +147,7 @@ class Camera:
     def read_timed(self, last_seq: int = -1, timeout: float = 1.0) -> tuple[int, np.ndarray | None, float | None]:
         """Return the latest frame with its monotonic arrival time at the capture thread."""
         with self._cond:
-            self._cond.wait_for(lambda: self._seq != last_seq or self._stop.is_set(), timeout=timeout)
+            # no frame yet counts as nothing new: callers block instead of spinning before the camera opens
+            self._cond.wait_for(lambda: (self._frame is not None and self._seq != last_seq)
+                                or self._stop.is_set(), timeout=timeout)
             return self._seq, self._frame, self._frame_t

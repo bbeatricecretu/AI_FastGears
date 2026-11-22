@@ -40,6 +40,7 @@ def main() -> None:
     if a.rgb_overlay:
         os.environ["RGB_OVERLAY"] = "1"
 
+    from . import perf  # noqa: F401  sets OMP_NUM_THREADS before torch is imported
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     import uvicorn
     from .config import settings
